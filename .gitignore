@@ -1,0 +1,39 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+data/db.sqlite
+data/tracks/
+data/previews/
+data/posts/
+
+logs/*.log
+.env
+.idea/
+.idea/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist/
+build/
+
+# Env / secrets
+.env
+
+# Runtime artifacts
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
