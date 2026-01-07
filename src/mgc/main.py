@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import argparse
 import json
+import sqlite3
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
@@ -140,9 +141,276 @@ def playlist_cmd(args) -> int:
     return 0
 
 
+
+def playlists_list_cmd(args) -> int:
+    from pathlib import Path
+    from mgc.db import DB
+
+    db_path = Path(args.db)
+    db = DB(db_path)
+    db.init()
+
+    # Direct SQL (avoids any helper mismatch)
+    with db.connect() as conn:
+        if args.slug:
+            rows = conn.execute(
+                """
+                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
+                FROM playlists
+                WHERE slug = ?
+                ORDER BY datetime(created_at) DESC, rowid DESC
+                LIMIT ?
+                """,
+                (args.slug, int(args.limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
+                FROM playlists
+                ORDER BY datetime(created_at) DESC, rowid DESC
+                LIMIT ?
+                """,
+                (int(args.limit),),
+            ).fetchall()
+
+    print(f"db: {db_path}  playlists_shown: {len(rows)}", flush=True)
+
+    if not rows:
+        print("No playlists found.", flush=True)
+        return 0
+
+    for r in rows:
+        minutes = round((r["total_duration_sec"] or 0) / 60.0, 2)
+        print(
+            f'{r["created_at"]}  id={r["id"]}  slug={r["slug"]}  context={r["context"]}  tracks={r["track_count"]}  minutes={minutes}',
+            flush=True,
+        )
+
+    return 0
+
+    db_path = Path(args.db)
+    db = DB(db_path)
+    db.init()
+
+    rows = db.list_playlists(slug=args.slug, limit=args.limit)
+    if not rows:
+        print("No playlists found.")
+        return 0
+
+    # Simple table-like output
+    for r in rows:
+        minutes = round((r.get("total_duration_sec") or 0) / 60.0, 2)
+        print(f'{r["created_at"]}  id={r["id"]}  slug={r["slug"]}  context={r.get("context")}  tracks={r.get("track_count")}  minutes={minutes}')
+
+    return 0
+
+
+def playlists_show_cmd(args) -> int:
+    from pathlib import Path
+    import json
+    from mgc.db import DB
+
+    db_path = Path(args.db)
+    db = DB(db_path)
+    db.init()
+
+    pl = db.get_playlist_with_items(args.id)
+    if not pl:
+        print("Playlist not found.")
+        return 1
+
+    minutes = round((pl.get("total_duration_sec") or 0) / 60.0, 2)
+    print(pl.get("name", "Playlist"))
+    print(f'created_at: {pl.get("created_at")}')
+    print(f'id: {pl.get("id")}')
+    print(f'slug: {pl.get("slug")}')
+    print(f'context: {pl.get("context")}')
+    print(f'tracks: {pl.get("track_count")}  minutes: {minutes}')
+    print(f'json_path: {pl.get("json_path")}')
+    print("")
+
+    # If the JSON exists, show filters/stats/dedupe (source of truth for analytics)
+    try:
+        with open(pl.get("json_path"), "r", encoding="utf-8") as f:
+            j = json.load(f)
+        filters = j.get("filters") or {}
+        stats = j.get("stats") or {}
+        dedupe = j.get("dedupe") or {}
+
+        print("filters:")
+        for k in ["context", "mood", "genre", "bpm_window", "target_minutes", "seed", "lookback_playlists"]:
+            if k in filters:
+                print(f"  {k}: {filters.get(k)}")
+
+        print("stats:")
+        for k in ["track_count", "unique_track_count", "duration_minutes", "avg_bpm", "bpm_min", "bpm_max"]:
+            if k in stats:
+                print(f"  {k}: {stats.get(k)}")
+
+        if dedupe:
+            print("dedupe:")
+            for k in ["requested_lookback", "excluded_count", "applied", "reason"]:
+                if k in dedupe:
+                    print(f"  {k}: {dedupe.get(k)}")
+
+        print("")
+    except Exception:
+        # Not fatal: still show items from DB
+        pass
+
+    print("items:")
+    for it in pl["items"]:
+        dur = int(it.get("duration_sec") or 0)
+        print(f'  {it.get("title")}  bpm={it.get("bpm")}  mood={it.get("mood")}  genre={it.get("genre")}  dur={dur}s  id={it.get("id")}')
+    return 0
+
+
+def playlists_list_cmd_v2(args) -> int:
+    from pathlib import Path
+    import sqlite3
+
+    db_path = Path(args.db).resolve() if getattr(args, "db", None) else Path("data/db.sqlite").resolve()
+
+    if not db_path.exists():
+        print("DB file not found.", flush=True)
+        return 1
+
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+    try:
+        if getattr(args, "slug", None):
+            rows = db.execute(
+                """
+                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
+                FROM playlists
+                WHERE slug = ?
+                ORDER BY datetime(created_at) DESC, rowid DESC
+                LIMIT ?
+                """,
+                (args.slug, int(args.limit)),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
+                FROM playlists
+                ORDER BY datetime(created_at) DESC, rowid DESC
+                LIMIT ?
+                """,
+                (int(args.limit),),
+            ).fetchall()
+
+        print(f"playlists_shown: {len(rows)}", flush=True)
+
+        for r in rows:
+            minutes = round((r["total_duration_sec"] or 0) / 60.0, 2)
+            print(f'{r["created_at"]}  id={r["id"]}  slug={r["slug"]}  context={r["context"]}  tracks={r["track_count"]}  minutes={minutes}', flush=True)
+
+        return 0
+    finally:
+        db.close()
+
+
+def playlists_show_cmd_v2(args) -> int:
+    from pathlib import Path
+    import sqlite3
+    import json
+
+    db_path = Path(args.db).resolve() if getattr(args, "db", None) else Path("data/db.sqlite").resolve()
+
+    if not db_path.exists():
+        print("DB file not found.", flush=True)
+        return 1
+
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+    try:
+        pl = db.execute("SELECT rowid, * FROM playlists WHERE id = ?", (args.id,)).fetchone()
+        if not pl:
+            print("Playlist not found.", flush=True)
+            return 1
+
+        pl = dict(pl)
+        items = db.execute(
+            """
+            SELECT pi.position, t.*
+            FROM playlist_items pi
+            JOIN tracks t ON t.id = pi.track_id
+            WHERE pi.playlist_id = ?
+            ORDER BY pi.position ASC
+            """,
+            (args.id,),
+        ).fetchall()
+
+        minutes = round((pl.get("total_duration_sec") or 0) / 60.0, 2)
+        print(pl.get("name", "Playlist"), flush=True)
+        print(f'created_at: {pl.get("created_at")}', flush=True)
+        print(f'id: {pl.get("id")}', flush=True)
+        print(f'slug: {pl.get("slug")}', flush=True)
+        print(f'context: {pl.get("context")}', flush=True)
+        print(f'tracks: {pl.get("track_count")}  minutes: {minutes}', flush=True)
+        print(f'json_path: {pl.get("json_path")}', flush=True)
+        print("", flush=True)
+
+        # Optional: show JSON-derived filters/stats if file exists
+        try:
+            jp = pl.get("json_path")
+            if jp:
+                j = json.loads(Path(jp).read_text(encoding="utf-8"))
+                filters = j.get("filters") or {}
+                stats = j.get("stats") or {}
+                dedupe = j.get("dedupe") or {}
+
+                print("filters:", flush=True)
+                for k in ["context", "mood", "genre", "bpm_window", "target_minutes", "seed", "lookback_playlists"]:
+                    if k in filters:
+                        print(f"  {k}: {filters.get(k)}", flush=True)
+
+                print("stats:", flush=True)
+                for k in ["track_count", "unique_track_count", "duration_minutes", "avg_bpm", "bpm_min", "bpm_max"]:
+                    if k in stats:
+                        print(f"  {k}: {stats.get(k)}", flush=True)
+
+                if dedupe:
+                    print("dedupe:", flush=True)
+                    for k in ["requested_lookback", "excluded_count", "applied", "reason"]:
+                        if k in dedupe:
+                            print(f"  {k}: {dedupe.get(k)}", flush=True)
+
+                print("", flush=True)
+        except Exception:
+            pass
+
+        print("items:", flush=True)
+        for r in items:
+            r = dict(r)
+            dur = int(r.get("duration_sec") or 0)
+            print(f'  {r.get("title")}  bpm={r.get("bpm")}  mood={r.get("mood")}  genre={r.get("genre")}  dur={dur}s  id={r.get("id")}', flush=True)
+
+        return 0
+    finally:
+        db.close()
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="mgc")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    # playlists: inspect saved playlist history
+    pg = sub.add_parser("playlists", help="Inspect saved playlists")
+    pgs = pg.add_subparsers(dest="playlists_cmd")
+    # Python argparse behavior differs across versions; enforce requirement manually in main() via handler selection.
+
+    pl_list = pgs.add_parser("list", help="List recent playlists")
+    pl_list.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    pl_list.add_argument("--limit", type=int, default=10, help="Max rows")
+    pl_list.add_argument("--slug", default=None, help="Filter by slug")
+    pl_list.set_defaults(func=playlists_list_cmd_v2)
+
+    pl_show = pgs.add_parser("show", help="Show playlist details")
+    pl_show.add_argument("id", help="Playlist id")
+    pl_show.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    pl_show.set_defaults(func=playlists_show_cmd_v2)
+
     sub.add_parser("run-daily", help="Run the daily generation → store → promote pipeline")
 
     p = sub.add_parser("playlist", help="Build an auto-playlist JSON from existing tracks")
@@ -158,12 +426,20 @@ def main() -> int:
     p.add_argument("--lookback", type=int, default=3, help="Avoid tracks used in last N playlists")
     p.set_defaults(func=playlist_cmd)
 
+
     args = parser.parse_args()
+
+    # Special-case: run-daily doesn't use set_defaults(func=...)
     if args.cmd == "run-daily":
         return run_daily()
-    if args.cmd == "playlist":
-        return args.func(args)
-    return 1
+
+    # Generic dispatch for all other subcommands
+    func = getattr(args, "func", None)
+    if callable(func):
+        return func(args)
+
+    parser.print_help()
+    return 2
 
 if __name__ == "__main__":
     raise SystemExit(main())
