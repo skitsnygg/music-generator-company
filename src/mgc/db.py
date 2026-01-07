@@ -26,6 +26,34 @@ CREATE TABLE IF NOT EXISTS marketing_posts (
   status TEXT NOT NULL,
   FOREIGN KEY(track_id) REFERENCES tracks(id)
 );
+
+
+CREATE TABLE IF NOT EXISTS playlists (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  context TEXT,
+  mood TEXT,
+  genre TEXT,
+  bpm_min INTEGER,
+  bpm_max INTEGER,
+  target_minutes INTEGER NOT NULL,
+  seed INTEGER NOT NULL,
+  track_count INTEGER NOT NULL,
+  total_duration_sec INTEGER NOT NULL,
+  json_path TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playlist_items (
+  playlist_id TEXT NOT NULL,
+  track_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (playlist_id, track_id),
+  FOREIGN KEY(track_id) REFERENCES tracks(id),
+  FOREIGN KEY(playlist_id) REFERENCES playlists(id)
+);
+
 """
 
 class DB:
@@ -42,6 +70,8 @@ class DB:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             conn.commit()
+
+        
 
     def insert_track(self, row: Dict[str, Any]) -> None:
         with self.connect() as conn:

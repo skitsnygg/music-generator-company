@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import argparse
 import json
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -60,18 +61,80 @@ def playlist_cmd(args) -> int:
     pl = build_playlist(
         db_path=db_path,
         name=args.name,
+        slug=args.slug,
         context=args.context,
         mood=args.mood,
         genre=args.genre,
         target_minutes=args.minutes,
         bpm_window=bpm_window,
         seed=args.seed,
+        lookback_playlists=args.lookback,
     )
+
+    # Dedupe UX: make it obvious when we had to fall back
+    dedupe = (pl.get("dedupe") or {})
+    if dedupe:
+        if dedupe.get("applied"):
+            print(f"dedupe applied (excluded {dedupe.get('excluded_count', 0)} tracks)")
+        else:
+            reason = dedupe.get("reason")
+            excl = dedupe.get("excluded_count", 0)
+            if reason == "not_enough_unique_tracks":
+                print(f"dedupe skipped: not enough unique tracks after excluding {excl}. Generate more tracks to avoid repeats.")
+            else:
+                print(f"dedupe skipped (excluded {excl}) reason={reason}")
 
     out_dir = data_dir / "playlists"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{args.slug}.json"
     out_path.write_text(json.dumps(pl, indent=2), encoding="utf-8")
+
+
+    # Persist playlist build (history + dedupe support)
+    db = DB(db_path)
+    db.init()
+
+    playlist_id = str(uuid.uuid4())
+    filters = pl.get("filters", {})
+    bpm_window = filters.get("bpm_window") or [None, None]
+    bpm_min, bpm_max = bpm_window[0], bpm_window[1]
+
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO playlists (
+                id, created_at, slug, name, context, mood, genre, bpm_min, bpm_max,
+                target_minutes, seed, track_count, total_duration_sec, json_path
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                playlist_id,
+                args.slug,
+                pl["name"],
+                filters.get("context"),
+                filters.get("mood"),
+                filters.get("genre"),
+                bpm_min,
+                bpm_max,
+                int(filters.get("target_minutes") or 0),
+                int(filters.get("seed") or 1),
+                int(pl["stats"]["track_count"]),
+                int(pl["stats"]["total_duration_sec"]),
+                str(out_path),
+            ),
+        )
+
+        for idx, item in enumerate(pl["items"]):
+            conn.execute(
+                """
+                INSERT INTO playlist_items (playlist_id, track_id, position)
+                VALUES (?, ?, ?)
+                """,
+                (playlist_id, item["track_id"], idx),
+            )
+
+        conn.commit()
+
 
     print(str(out_path))
     return 0
@@ -92,6 +155,7 @@ def main() -> int:
     p.add_argument("--bpm-min", dest="bpm_min", type=int, default=None)
     p.add_argument("--bpm-max", dest="bpm_max", type=int, default=None)
     p.add_argument("--seed", type=int, default=1, help="Shuffle seed")
+    p.add_argument("--lookback", type=int, default=3, help="Avoid tracks used in last N playlists")
     p.set_defaults(func=playlist_cmd)
 
     args = parser.parse_args()
