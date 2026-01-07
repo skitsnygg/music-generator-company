@@ -392,6 +392,120 @@ def playlists_show_cmd_v2(args) -> int:
     finally:
         db.close()
 
+
+
+def tracks_list_cmd(args) -> int:
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path(args.db).resolve()
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+
+    try:
+        where = []
+        params = []
+
+        if args.mood:
+            where.append("mood = ?")
+            params.append(args.mood)
+        if args.genre:
+            where.append("genre = ?")
+            params.append(args.genre)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        rows = db.execute(
+            f"""
+            SELECT id, created_at, title, mood, genre, bpm, duration_sec
+            FROM tracks
+            {where_sql}
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            """,
+            params + [int(args.limit)],
+        ).fetchall()
+
+        if not rows:
+            print("No tracks found.")
+            return 0
+
+        for r in rows:
+            dur = int(r["duration_sec"])
+            print(f'{r["created_at"]}  id={r["id"]}  "{r["title"]}"  mood={r["mood"]}  genre={r["genre"]}  bpm={r["bpm"]}  dur={dur}s')
+
+        return 0
+    finally:
+        db.close()
+
+
+def tracks_show_cmd(args) -> int:
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path(args.db).resolve()
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+
+    try:
+        r = db.execute("SELECT * FROM tracks WHERE id = ?", (args.id,)).fetchone()
+        if not r:
+            print("Track not found.")
+            return 1
+
+        r = dict(r)
+        print(r["title"])
+        for k in ["id", "created_at", "mood", "genre", "bpm", "duration_sec", "status"]:
+            print(f"{k}: {r.get(k)}")
+        print(f'preview_path: {r.get("preview_path")}')
+        print(f'full_path: {r.get("full_path")}')
+        return 0
+    finally:
+        db.close()
+
+
+def tracks_stats_cmd(args) -> int:
+    import sqlite3
+    from pathlib import Path
+    from collections import Counter
+
+    db_path = Path(args.db).resolve()
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+
+    try:
+        rows = db.execute("SELECT mood, genre, bpm, duration_sec FROM tracks").fetchall()
+        if not rows:
+            print("No tracks in library.")
+            return 0
+
+        moods = Counter()
+        genres = Counter()
+        bpms = []
+        durations = []
+
+        for r in rows:
+            moods[r["mood"]] += 1
+            genres[r["genre"]] += 1
+            bpms.append(int(r["bpm"]))
+            durations.append(int(r["duration_sec"]))
+
+        print(f"total_tracks: {len(rows)}")
+        print(f"avg_bpm: {int(sum(bpms) / len(bpms))}")
+        print(f"avg_duration_sec: {int(sum(durations) / len(durations))}")
+
+        print("moods:")
+        for k, v in moods.most_common():
+            print(f"  {k}: {v}")
+
+        print("genres:")
+        for k, v in genres.most_common():
+            print(f"  {k}: {v}")
+
+        return 0
+    finally:
+        db.close()
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="mgc")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -410,6 +524,27 @@ def main() -> int:
     pl_show.add_argument("id", help="Playlist id")
     pl_show.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
     pl_show.set_defaults(func=playlists_show_cmd_v2)
+
+    # tracks: inspect track library
+    tg = sub.add_parser("tracks", help="Inspect track library")
+    tgs = tg.add_subparsers(dest="tracks_cmd", required=True)
+
+    tl = tgs.add_parser("list", help="List tracks")
+    tl.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    tl.add_argument("--limit", type=int, default=20, help="Max rows")
+    tl.add_argument("--mood", default=None, help="Filter mood (exact match)")
+    tl.add_argument("--genre", default=None, help="Filter genre (exact match)")
+    tl.set_defaults(func=tracks_list_cmd)
+
+    ts = tgs.add_parser("show", help="Show track details")
+    ts.add_argument("id", help="Track id")
+    ts.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    ts.set_defaults(func=tracks_show_cmd)
+
+    tt = tgs.add_parser("stats", help="Track library stats")
+    tt.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    tt.set_defaults(func=tracks_stats_cmd)
+
 
     sub.add_parser("run-daily", help="Run the daily generation → store → promote pipeline")
 
