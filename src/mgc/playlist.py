@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter
+
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,18 @@ def build_playlist(
             )
             total += int(t.duration_sec)
 
+        # Summary stats (helps debug and feels more 'product')
+        bpms = [int(x["bpm"]) for x in items if x.get("bpm") is not None]
+        avg_bpm = int(round(sum(bpms) / len(bpms))) if bpms else None
+        bpm_min_used = min(bpms) if bpms else None
+        bpm_max_used = max(bpms) if bpms else None
+
+        mood_counts = Counter([x.get("mood") for x in items if x.get("mood")])
+        genre_counts = Counter([x.get("genre") for x in items if x.get("genre")])
+
+        unique_track_count = len({x["track_id"] for x in items})
+        duration_minutes = round(total / 60.0, 2)
+
         return {
             "name": name,
             "filters": {
@@ -266,7 +280,17 @@ def build_playlist(
                 "seed": seed,
                 "lookback_playlists": lookback_playlists,
             },
-            "stats": {"track_count": len(items), "total_duration_sec": total},
+            "stats": {
+                "track_count": len(items),
+                "unique_track_count": unique_track_count,
+                "total_duration_sec": total,
+                "duration_minutes": duration_minutes,
+                "avg_bpm": avg_bpm,
+                "bpm_min": bpm_min_used,
+                "bpm_max": bpm_max_used,
+                "mood_counts": dict(mood_counts),
+                "genre_counts": dict(genre_counts),
+            },
             "dedupe": dedupe,
             "items": items,
         }
