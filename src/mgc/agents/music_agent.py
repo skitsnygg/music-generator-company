@@ -83,7 +83,7 @@ class MusicAgent:
 
         if self.provider == "riffusion":
             full_path = self.storage.tracks_dir / f"{safe_base}.mp3"
-                        prompt = ctx['prompt']
+            prompt = "ambient electronic, minimal, steady rhythm, clean pads, focus music"
             res: RiffusionResult = self.riff.generate(
                 out_mp3=full_path,
                 title=title,
