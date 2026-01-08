@@ -630,50 +630,48 @@ def compute_diff(a_ids: List[str], b_ids: List[str]) -> Dict[str, Any]:
 
 def db_list_events(
     conn: sqlite3.Connection,
+    *,
     limit: int = 50,
     run_id: Optional[str] = None,
     event_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    where = []
+    where: List[str] = []
     params: List[Any] = []
 
     if run_id:
         where.append("run_id = ?")
-        params.append(run_id)
+        params.append(str(run_id))
     if event_type:
         where.append("event_type = ?")
-        params.append(event_type)
+        params.append(str(event_type))
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    sql = f"""
-    SELECT
-      id, occurred_at, run_id, source,
-      event_type, entity_type, entity_id, payload_json
-    FROM events
-    {where_sql}
-    ORDER BY occurred_at DESC
-    LIMIT ?
-    """
-    params.append(int(limit))
 
-    rows = conn.execute(sql, tuple(params)).fetchall()
+    rows = conn.execute(
+        f"""
+        SELECT id, occurred_at, run_id, source, event_type, entity_type, entity_id, payload_json
+        FROM events
+        {where_sql}
+        ORDER BY rowid DESC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    ).fetchall()
+
     out: List[Dict[str, Any]] = []
     for r in rows:
-        try:
-            payload = json.loads(str(r["payload_json"]))
-        except Exception:
-            payload = {}
-
+        d = dict(r)
+        # Keep payload_json as a string; CLI can choose to decode later.
         out.append(
             {
-                "id": str(r["id"]),
-                "occurred_at": str(r["occurred_at"]),
-                "run_id": str(r["run_id"]),
-                "source": str(r["source"]),
-                "event_type": str(r["event_type"]),
-                "entity_type": str(r["entity_type"]),
-                "entity_id": (str(r["entity_id"]) if r["entity_id"] is not None else None),
-                "payload": payload,
+                "id": str(d.get("id") or ""),
+                "occurred_at": str(d.get("occurred_at") or ""),
+                "run_id": str(d.get("run_id") or ""),
+                "source": str(d.get("source") or ""),
+                "event_type": str(d.get("event_type") or ""),
+                "entity_type": str(d.get("entity_type") or ""),
+                "entity_id": (str(d.get("entity_id")) if d.get("entity_id") is not None else None),
+                "payload_json": str(d.get("payload_json") or "{}"),
             }
         )
     return out
