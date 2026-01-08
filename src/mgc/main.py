@@ -20,6 +20,12 @@ from mgc.playlist import build_playlist
 from mgc.storage import StoragePaths
 
 
+def _open_db(db_path: str) -> sqlite3.Connection:
+    db = sqlite3.connect(str(Path(db_path).resolve()))
+    db.row_factory = sqlite3.Row
+    return db
+
+
 def run_daily(args=None) -> int:
     load_dotenv()
 
@@ -102,8 +108,8 @@ def playlist_cmd(args) -> int:
 
     playlist_id = str(uuid.uuid4())
     filters = pl.get("filters", {})
-    bpm_window = filters.get("bpm_window") or [None, None]
-    bpm_min, bpm_max = bpm_window[0], bpm_window[1]
+    bpm_window_list = filters.get("bpm_window") or [None, None]
+    bpm_min, bpm_max = bpm_window_list[0], bpm_window_list[1]
 
     with db.connect() as conn:
         conn.execute(
@@ -151,8 +157,7 @@ def playlists_list_cmd(args) -> int:
         print("DB file not found.", flush=True)
         return 1
 
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
+    db = _open_db(args.db)
     try:
         if getattr(args, "slug", None):
             rows = db.execute(
@@ -177,7 +182,6 @@ def playlists_list_cmd(args) -> int:
             ).fetchall()
 
         print(f"playlists_shown: {len(rows)}", flush=True)
-
         for r in rows:
             minutes = round((r["total_duration_sec"] or 0) / 60.0, 2)
             print(
@@ -196,8 +200,7 @@ def playlists_show_cmd(args) -> int:
         print("DB file not found.", flush=True)
         return 1
 
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
+    db = _open_db(args.db)
     try:
         pl = db.execute("SELECT rowid, * FROM playlists WHERE id = ?", (args.id,)).fetchone()
         if not pl:
@@ -226,7 +229,6 @@ def playlists_show_cmd(args) -> int:
         print(f'json_path: {pl.get("json_path")}', flush=True)
         print("", flush=True)
 
-        # Optional: show JSON-derived filters/stats if file exists
         try:
             jp = pl.get("json_path")
             if jp:
@@ -271,10 +273,7 @@ def playlists_show_cmd(args) -> int:
 
 
 def tracks_list_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
-
+    db = _open_db(args.db)
     try:
         where = []
         params = []
@@ -309,17 +308,13 @@ def tracks_list_cmd(args) -> int:
                 f'{r["created_at"]}  id={r["id"]}  "{r["title"]}"  '
                 f'mood={r["mood"]}  genre={r["genre"]}  bpm={r["bpm"]}  dur={dur}s'
             )
-
         return 0
     finally:
         db.close()
 
 
 def tracks_show_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
-
+    db = _open_db(args.db)
     try:
         r = db.execute("SELECT * FROM tracks WHERE id = ?", (args.id,)).fetchone()
         if not r:
@@ -338,10 +333,7 @@ def tracks_show_cmd(args) -> int:
 
 
 def tracks_stats_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
-
+    db = _open_db(args.db)
     try:
         rows = db.execute("SELECT mood, genre, bpm, duration_sec FROM tracks").fetchall()
         if not rows:
@@ -377,10 +369,7 @@ def tracks_stats_cmd(args) -> int:
 
 
 def tracks_open_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
-
+    db = _open_db(args.db)
     try:
         r = db.execute("SELECT id, preview_path, full_path FROM tracks WHERE id = ?", (args.id,)).fetchone()
         if not r:
@@ -390,11 +379,9 @@ def tracks_open_cmd(args) -> int:
         preview = r["preview_path"]
         full = r["full_path"]
 
-        use_full = bool(getattr(args, "full", False))
-        target = full if use_full else preview
-
+        target = full if bool(getattr(args, "full", False)) else preview
         if not target:
-            which = "full_path" if use_full else "preview_path"
+            which = "full_path" if bool(getattr(args, "full", False)) else "preview_path"
             print(f"No {which} for track {args.id}")
             return 1
 
@@ -459,9 +446,7 @@ def main() -> int:
     to = tgs.add_parser("open", help="Open a track audio file (preview or full)")
     to.add_argument("id", help="Track id")
     to.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    g = to.add_mutually_exclusive_group()
-    g.add_argument("--preview", action="store_true", help="Open preview_path (default)")
-    g.add_argument("--full", action="store_true", help="Open full_path")
+    to.add_argument("--full", action="store_true", help="Open full_path (default: preview_path)")
     to.set_defaults(func=tracks_open_cmd)
 
     # run-daily
