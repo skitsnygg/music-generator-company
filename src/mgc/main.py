@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -11,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -19,6 +18,8 @@ try:
     from mgc.logging_setup import setup_logging  # type: ignore
 except Exception:
     setup_logging = None  # type: ignore
+
+from mgc.analytics_cli import register_analytics_subcommand
 
 
 # ----------------------------
@@ -29,7 +30,7 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-def die(msg: str, code: int = 2) -> "NoReturn":
+def die(msg: str, code: int = 2) -> NoReturn:
     eprint(msg)
     raise SystemExit(code)
 
@@ -415,7 +416,9 @@ def db_tracks_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
     statuses = conn.execute("SELECT status, COUNT(*) AS n FROM tracks GROUP BY status ORDER BY n DESC").fetchall()
 
     bpm = conn.execute("SELECT MIN(bpm) AS min_bpm, MAX(bpm) AS max_bpm, AVG(bpm) AS avg_bpm FROM tracks").fetchone()
-    dur = conn.execute("SELECT MIN(duration_sec) AS min_dur, MAX(duration_sec) AS max_dur, AVG(duration_sec) AS avg_dur FROM tracks").fetchone()
+    dur = conn.execute(
+        "SELECT MIN(duration_sec) AS min_dur, MAX(duration_sec) AS max_dur, AVG(duration_sec) AS avg_dur FROM tracks"
+    ).fetchone()
 
     return {
         "total_tracks": int(total),
@@ -831,8 +834,8 @@ def playlists_export_cmd(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps({"exported": out_paths, "run_ids": run_ids}, indent=2, ensure_ascii=False))
         else:
-            for p in out_paths:
-                print(p)
+            for pth in out_paths:
+                print(pth)
             if run_ids:
                 print("Recorded runs:")
                 for rid in run_ids:
@@ -851,16 +854,25 @@ def playlists_history_cmd(args: argparse.Namespace) -> int:
         runs = db_list_playlist_runs(conn, args.playlist_id, limit=args.limit)
         if runs:
             if args.json:
-                print(json.dumps([{
-                    "kind": "run",
-                    "id": r.id,
-                    "created_at": r.created_at,
-                    "playlist_id": r.playlist_id,
-                    "seed": r.seed,
-                    "track_count": len(r.track_ids),
-                    "export_path": r.export_path,
-                    "notes": r.notes,
-                } for r in runs], indent=2, ensure_ascii=False))
+                print(
+                    json.dumps(
+                        [
+                            {
+                                "kind": "run",
+                                "id": r.id,
+                                "created_at": r.created_at,
+                                "playlist_id": r.playlist_id,
+                                "seed": r.seed,
+                                "track_count": len(r.track_ids),
+                                "export_path": r.export_path,
+                                "notes": r.notes,
+                            }
+                            for r in runs
+                        ],
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
                 return 0
 
             for i, r in enumerate(runs, 1):
@@ -875,15 +887,24 @@ def playlists_history_cmd(args: argparse.Namespace) -> int:
         peers = db_list_playlists_by_slug(conn, pl.slug, limit=args.limit)
 
         if args.json:
-            print(json.dumps([{
-                "kind": "playlist",
-                "id": p.id,
-                "created_at": p.created_at,
-                "playlist_id": p.id,
-                "seed": p.seed,
-                "track_count": len(db_playlist_track_ids(conn, p.id)),
-                "slug": p.slug,
-            } for p in peers], indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    [
+                        {
+                            "kind": "playlist",
+                            "id": p.id,
+                            "created_at": p.created_at,
+                            "playlist_id": p.id,
+                            "seed": p.seed,
+                            "track_count": len(db_playlist_track_ids(conn, p.id)),
+                            "slug": p.slug,
+                        }
+                        for p in peers
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
 
         print("(no recorded runs in playlist_runs; showing implicit history from playlists table by slug)")
@@ -909,12 +930,18 @@ def playlists_diff_cmd(args: argparse.Namespace) -> int:
         b_dur = db_duration_for_tracks(conn, b.track_ids)
 
         if args.json:
-            print(json.dumps({
-                "a": a.__dict__,
-                "b": b.__dict__,
-                "duration_sec": {"a": a_dur, "b": b_dur, "delta": (b_dur - a_dur)},
-                "diff": diff,
-            }, indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {
+                        "a": a.__dict__,
+                        "b": b.__dict__,
+                        "duration_sec": {"a": a_dur, "b": b_dur, "delta": (b_dur - a_dur)},
+                        "diff": diff,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
 
         print(f"A: {a.kind.upper()} {a.id}  created={a.created_at}  seed={a.seed}  tracks={len(a.track_ids)}")
@@ -1082,6 +1109,9 @@ def build_parser() -> argparse.ArgumentParser:
     tt = tgs.add_parser("stats", help="Track library stats")
     tt.add_argument("--db", default="data/db.sqlite")
     tt.set_defaults(func=tracks_stats_cmd)
+
+    # analytics (REGISTERED IN THE RIGHT PLACE)
+    register_analytics_subcommand(sub)
 
     return p
 
