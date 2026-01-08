@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import platform
 import sqlite3
 import subprocess
+import sys
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -103,6 +105,7 @@ def playlist_cmd(args) -> int:
     out_path = out_dir / f"{args.slug}.json"
     out_path.write_text(json.dumps(pl, indent=2), encoding="utf-8")
 
+    # Persist playlist build (history + dedupe support)
     db = DB(db_path)
     db.init()
 
@@ -182,6 +185,7 @@ def playlists_list_cmd(args) -> int:
             ).fetchall()
 
         print(f"playlists_shown: {len(rows)}", flush=True)
+
         for r in rows:
             minutes = round((r["total_duration_sec"] or 0) / 60.0, 2)
             print(
@@ -229,6 +233,7 @@ def playlists_show_cmd(args) -> int:
         print(f'json_path: {pl.get("json_path")}', flush=True)
         print("", flush=True)
 
+        # Optional: show JSON-derived filters/stats if file exists
         try:
             jp = pl.get("json_path")
             if jp:
@@ -272,6 +277,38 @@ def playlists_show_cmd(args) -> int:
         db.close()
 
 
+def playlists_open_cmd(args) -> int:
+    db = _open_db(args.db)
+    try:
+        r = db.execute("SELECT json_path FROM playlists WHERE id = ?", (args.id,)).fetchone()
+        if not r:
+            print("Playlist not found.")
+            return 1
+
+        jp = r["json_path"]
+        if not jp:
+            print("No json_path stored for this playlist.")
+            return 1
+
+        p = Path(jp)
+        if not p.exists():
+            print(f"File not found on disk: {p}")
+            return 1
+
+        system = platform.system().lower()
+        if system == "darwin":
+            subprocess.check_call(["open", str(p)])
+        elif system == "windows":
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        else:
+            subprocess.check_call(["xdg-open", str(p)])
+
+        print(f"Opened: {p}")
+        return 0
+    finally:
+        db.close()
+
+
 def tracks_list_cmd(args) -> int:
     db = _open_db(args.db)
     try:
@@ -308,6 +345,7 @@ def tracks_list_cmd(args) -> int:
                 f'{r["created_at"]}  id={r["id"]}  "{r["title"]}"  '
                 f'mood={r["mood"]}  genre={r["genre"]}  bpm={r["bpm"]}  dur={dur}s'
             )
+
         return 0
     finally:
         db.close()
@@ -342,8 +380,8 @@ def tracks_stats_cmd(args) -> int:
 
         moods = Counter()
         genres = Counter()
-        bpms = []
-        durations = []
+        bpms: list[int] = []
+        durations: list[int] = []
 
         for r in rows:
             moods[r["mood"]] += 1
@@ -368,24 +406,30 @@ def tracks_stats_cmd(args) -> int:
         db.close()
 
 
+def _track_pick_path(db: sqlite3.Connection, track_id: str, use_full: bool) -> Path | None:
+    r = db.execute("SELECT preview_path, full_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    if not r:
+        return None
+    target = r["full_path"] if use_full else r["preview_path"]
+    if not target:
+        return None
+    return Path(str(target))
+
+
 def tracks_open_cmd(args) -> int:
     db = _open_db(args.db)
     try:
-        r = db.execute("SELECT id, preview_path, full_path FROM tracks WHERE id = ?", (args.id,)).fetchone()
-        if not r:
-            print("Track not found.")
-            return 1
-
-        preview = r["preview_path"]
-        full = r["full_path"]
-
-        target = full if bool(getattr(args, "full", False)) else preview
-        if not target:
-            which = "full_path" if bool(getattr(args, "full", False)) else "preview_path"
+        use_full = bool(getattr(args, "full", False))
+        p = _track_pick_path(db, args.id, use_full)
+        if p is None:
+            r = db.execute("SELECT id FROM tracks WHERE id = ?", (args.id,)).fetchone()
+            if not r:
+                print("Track not found.")
+                return 1
+            which = "full_path" if use_full else "preview_path"
             print(f"No {which} for track {args.id}")
             return 1
 
-        p = Path(target)
         if not p.exists():
             print(f"File not found on disk: {p}")
             return 1
@@ -399,6 +443,97 @@ def tracks_open_cmd(args) -> int:
             subprocess.check_call(["xdg-open", str(p)])
 
         print(f"Opened: {p}")
+        return 0
+    finally:
+        db.close()
+
+
+def tracks_reveal_cmd(args) -> int:
+    db = _open_db(args.db)
+    try:
+        use_full = bool(getattr(args, "full", False))
+        p = _track_pick_path(db, args.id, use_full)
+        if p is None:
+            r = db.execute("SELECT id FROM tracks WHERE id = ?", (args.id,)).fetchone()
+            if not r:
+                print("Track not found.")
+                return 1
+            which = "full_path" if use_full else "preview_path"
+            print(f"No {which} for track {args.id}")
+            return 1
+
+        if not p.exists():
+            print(f"File not found on disk: {p}")
+            return 1
+
+        system = platform.system().lower()
+        if system == "darwin":
+            subprocess.check_call(["open", "-R", str(p)])
+        elif system == "windows":
+            subprocess.check_call(["explorer", f"/select,{str(p.resolve())}"])
+        else:
+            subprocess.check_call(["xdg-open", str(p.parent)])
+
+        print(f"Revealed: {p}")
+        return 0
+    finally:
+        db.close()
+
+
+def tracks_export_cmd(args) -> int:
+    """
+    Export tracks to stdout.
+    - default: CSV
+    - --json: JSON
+    """
+    db = _open_db(args.db)
+    try:
+        rows = db.execute(
+            """
+            SELECT id, created_at, title, mood, genre, bpm, duration_sec, status, preview_path, full_path
+            FROM tracks
+            ORDER BY datetime(created_at) DESC
+            """
+        ).fetchall()
+
+        if bool(getattr(args, "json", False)):
+            out = []
+            for r in rows:
+                d = dict(r)
+                out.append(d)
+            print(json.dumps({"tracks": out}, indent=2))
+            return 0
+
+        w = csv.writer(sys.stdout)
+        w.writerow(
+            [
+                "id",
+                "created_at",
+                "title",
+                "mood",
+                "genre",
+                "bpm",
+                "duration_sec",
+                "status",
+                "preview_path",
+                "full_path",
+            ]
+        )
+        for r in rows:
+            w.writerow(
+                [
+                    r["id"],
+                    r["created_at"],
+                    r["title"],
+                    r["mood"],
+                    r["genre"],
+                    r["bpm"],
+                    r["duration_sec"],
+                    r["status"],
+                    r["preview_path"],
+                    r["full_path"],
+                ]
+            )
         return 0
     finally:
         db.close()
@@ -422,6 +557,11 @@ def main() -> int:
     pl_show.add_argument("id", help="Playlist id")
     pl_show.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
     pl_show.set_defaults(func=playlists_show_cmd)
+
+    pl_open = pgs.add_parser("open", help="Open playlist JSON file")
+    pl_open.add_argument("id", help="Playlist id")
+    pl_open.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    pl_open.set_defaults(func=playlists_open_cmd)
 
     # tracks: inspect track library
     tg = sub.add_parser("tracks", help="Inspect track library")
@@ -448,6 +588,17 @@ def main() -> int:
     to.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
     to.add_argument("--full", action="store_true", help="Open full_path (default: preview_path)")
     to.set_defaults(func=tracks_open_cmd)
+
+    tr = tgs.add_parser("reveal", help="Reveal a track file in your file manager (preview or full)")
+    tr.add_argument("id", help="Track id")
+    tr.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    tr.add_argument("--full", action="store_true", help="Reveal full_path (default: preview_path)")
+    tr.set_defaults(func=tracks_reveal_cmd)
+
+    te = tgs.add_parser("export", help="Export tracks (CSV to stdout by default)")
+    te.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    te.add_argument("--json", action="store_true", help="Output JSON instead of CSV")
+    te.set_defaults(func=tracks_export_cmd)
 
     # run-daily
     rd = sub.add_parser("run-daily", help="Run the daily generation → store → promote pipeline")
