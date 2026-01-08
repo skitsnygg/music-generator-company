@@ -309,6 +309,44 @@ def playlists_open_cmd(args) -> int:
         db.close()
 
 
+def playlists_reveal_cmd(args) -> int:
+    """
+    Reveal the playlist JSON file in the system file manager.
+    - macOS: open -R <file>
+    - Windows: explorer /select,<file>
+    - Linux: open containing folder (xdg-open <dir>)
+    """
+    db = _open_db(args.db)
+    try:
+        r = db.execute("SELECT json_path FROM playlists WHERE id = ?", (args.id,)).fetchone()
+        if not r:
+            print("Playlist not found.")
+            return 1
+
+        jp = r["json_path"]
+        if not jp:
+            print("No json_path stored for this playlist.")
+            return 1
+
+        p = Path(jp)
+        if not p.exists():
+            print(f"File not found on disk: {p}")
+            return 1
+
+        system = platform.system().lower()
+        if system == "darwin":
+            subprocess.check_call(["open", "-R", str(p)])
+        elif system == "windows":
+            subprocess.check_call(["explorer", f"/select,{str(p.resolve())}"])
+        else:
+            subprocess.check_call(["xdg-open", str(p.parent)])
+
+        print(f"Revealed: {p}")
+        return 0
+    finally:
+        db.close()
+
+
 def tracks_list_cmd(args) -> int:
     db = _open_db(args.db)
     try:
@@ -497,10 +535,7 @@ def tracks_export_cmd(args) -> int:
         ).fetchall()
 
         if bool(getattr(args, "json", False)):
-            out = []
-            for r in rows:
-                d = dict(r)
-                out.append(d)
+            out = [dict(r) for r in rows]
             print(json.dumps({"tracks": out}, indent=2))
             return 0
 
@@ -562,6 +597,11 @@ def main() -> int:
     pl_open.add_argument("id", help="Playlist id")
     pl_open.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
     pl_open.set_defaults(func=playlists_open_cmd)
+
+    pl_reveal = pgs.add_parser("reveal", help="Reveal playlist JSON in your file manager")
+    pl_reveal.add_argument("id", help="Playlist id")
+    pl_reveal.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    pl_reveal.set_defaults(func=playlists_reveal_cmd)
 
     # tracks: inspect track library
     tg = sub.add_parser("tracks", help="Inspect track library")
