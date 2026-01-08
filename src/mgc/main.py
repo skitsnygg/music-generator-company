@@ -1,13 +1,41 @@
 #!/usr/bin/env python3
+"""
+mgc CLI — Playlists export/push/smoke + Tracks commands (DB-accurate)
+
+Adds:
+- tracks list
+- tracks show
+- tracks stats
+
+Your DB schema (confirmed):
+tracks(
+  id TEXT pk,
+  created_at TEXT notnull,
+  title TEXT notnull,
+  mood TEXT notnull,
+  genre TEXT notnull,
+  bpm INTEGER notnull,
+  duration_sec REAL notnull,
+  full_path TEXT notnull,
+  preview_path TEXT notnull,
+  status TEXT notnull
+)
+
+Existing kept:
+- db schema
+- playlists list/reveal/export/push
+- smoke
+
+Drop-in target: src/mgc/main.py
+"""
+
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sqlite3
 import sys
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,10 +78,6 @@ def read_json_file(path: Path) -> Dict[str, Any]:
 def write_json_file(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def ensure_requests() -> Any:
@@ -111,6 +135,20 @@ class PlaylistRow:
     track_count: int
     total_duration_sec: int
     json_path: str
+
+
+@dataclass(frozen=True)
+class TrackRow:
+    id: str
+    created_at: str
+    title: str
+    mood: str
+    genre: str
+    bpm: int
+    duration_sec: float
+    full_path: str
+    preview_path: str
+    status: str
 
 
 def db_list_playlists(conn: sqlite3.Connection, limit: int) -> List[PlaylistRow]:
@@ -173,10 +211,6 @@ def db_get_playlist(conn: sqlite3.Connection, playlist_id: str) -> PlaylistRow:
 
 
 def resolve_json_path(json_path: str) -> Path:
-    """
-    json_path in DB might be relative (repo root) or absolute.
-    We resolve relative paths against current working directory.
-    """
     p = Path(json_path)
     if p.is_absolute():
         return p
@@ -184,10 +218,6 @@ def resolve_json_path(json_path: str) -> Path:
 
 
 def db_build_playlist_json(conn: sqlite3.Connection, pl: PlaylistRow) -> Dict[str, Any]:
-    """
-    Build a full playlist JSON using:
-      playlists + playlist_items + tracks
-    """
     sql = """
     SELECT
       pi.position,
@@ -241,6 +271,127 @@ def db_build_playlist_json(conn: sqlite3.Connection, pl: PlaylistRow) -> Dict[st
         "json_path": pl.json_path,
         "tracks": tracks,
         "built_from_db_at": now_iso(),
+    }
+
+
+def db_list_tracks(
+    conn: sqlite3.Connection,
+    limit: int,
+    mood: Optional[str],
+    genre: Optional[str],
+    status: Optional[str],
+    bpm_min: Optional[int],
+    bpm_max: Optional[int],
+    q: Optional[str],
+) -> List[TrackRow]:
+    where: List[str] = []
+    params: List[Any] = []
+
+    if mood:
+        where.append("mood = ?")
+        params.append(mood)
+    if genre:
+        where.append("genre = ?")
+        params.append(genre)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if bpm_min is not None:
+        where.append("bpm >= ?")
+        params.append(int(bpm_min))
+    if bpm_max is not None:
+        where.append("bpm <= ?")
+        params.append(int(bpm_max))
+    if q:
+        where.append("title LIKE ?")
+        params.append(f"%{q}%")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+    SELECT id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status
+    FROM tracks
+    {where_sql}
+    ORDER BY created_at DESC
+    LIMIT ?
+    """
+    params.append(int(limit))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    out: List[TrackRow] = []
+    for r in rows:
+        out.append(
+            TrackRow(
+                id=str(r["id"]),
+                created_at=str(r["created_at"]),
+                title=str(r["title"]),
+                mood=str(r["mood"]),
+                genre=str(r["genre"]),
+                bpm=int(r["bpm"]),
+                duration_sec=float(r["duration_sec"]),
+                full_path=str(r["full_path"]),
+                preview_path=str(r["preview_path"]),
+                status=str(r["status"]),
+            )
+        )
+    return out
+
+
+def db_get_track(conn: sqlite3.Connection, track_id: str) -> TrackRow:
+    sql = """
+    SELECT id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status
+    FROM tracks
+    WHERE id = ?
+    LIMIT 1
+    """
+    r = conn.execute(sql, (track_id,)).fetchone()
+    if not r:
+        die(f"Track not found: {track_id}")
+    return TrackRow(
+        id=str(r["id"]),
+        created_at=str(r["created_at"]),
+        title=str(r["title"]),
+        mood=str(r["mood"]),
+        genre=str(r["genre"]),
+        bpm=int(r["bpm"]),
+        duration_sec=float(r["duration_sec"]),
+        full_path=str(r["full_path"]),
+        preview_path=str(r["preview_path"]),
+        status=str(r["status"]),
+    )
+
+
+def db_tracks_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
+    total = conn.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()["n"]
+
+    # mood counts
+    moods = conn.execute(
+        "SELECT mood, COUNT(*) AS n FROM tracks GROUP BY mood ORDER BY n DESC"
+    ).fetchall()
+    genres = conn.execute(
+        "SELECT genre, COUNT(*) AS n FROM tracks GROUP BY genre ORDER BY n DESC"
+    ).fetchall()
+    statuses = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM tracks GROUP BY status ORDER BY n DESC"
+    ).fetchall()
+
+    bpm = conn.execute("SELECT MIN(bpm) AS min_bpm, MAX(bpm) AS max_bpm, AVG(bpm) AS avg_bpm FROM tracks").fetchone()
+    dur = conn.execute("SELECT MIN(duration_sec) AS min_dur, MAX(duration_sec) AS max_dur, AVG(duration_sec) AS avg_dur FROM tracks").fetchone()
+
+    return {
+        "total_tracks": int(total),
+        "moods": [{"mood": str(r["mood"]), "count": int(r["n"])} for r in moods],
+        "genres": [{"genre": str(r["genre"]), "count": int(r["n"])} for r in genres],
+        "statuses": [{"status": str(r["status"]), "count": int(r["n"])} for r in statuses],
+        "bpm": {
+            "min": int(bpm["min_bpm"]) if bpm["min_bpm"] is not None else None,
+            "max": int(bpm["max_bpm"]) if bpm["max_bpm"] is not None else None,
+            "avg": float(bpm["avg_bpm"]) if bpm["avg_bpm"] is not None else None,
+        },
+        "duration_sec": {
+            "min": float(dur["min_dur"]) if dur["min_dur"] is not None else None,
+            "max": float(dur["max_dur"]) if dur["max_dur"] is not None else None,
+            "avg": float(dur["avg_dur"]) if dur["avg_dur"] is not None else None,
+        },
     }
 
 
@@ -360,7 +511,6 @@ def playlists_reveal_cmd(args: argparse.Namespace) -> int:
             print(json.dumps(obj, indent=2, ensure_ascii=False))
             return 0
 
-        # Fallback: build from DB if json_path missing
         obj = db_build_playlist_json(conn, pl)
         print(json.dumps(obj, indent=2, ensure_ascii=False))
         return 0
@@ -368,41 +518,7 @@ def playlists_reveal_cmd(args: argparse.Namespace) -> int:
         conn.close()
 
 
-def playlists_export_cmd(args: argparse.Namespace) -> int:
-    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
-    conn = sqlite_connect(args.db)
-    try:
-        if args.id:
-            pl = db_get_playlist(conn, args.id)
-            out_path = export_one_playlist(conn, pl, export_dir, build=args.build)
-            print(str(out_path))
-            return 0
-
-        pls = db_list_playlists(conn, limit=args.limit)
-        if not pls:
-            die("No playlists found to export.")
-
-        out_paths: List[str] = []
-        for pl in pls:
-            out_path = export_one_playlist(conn, pl, export_dir, build=args.build)
-            out_paths.append(str(out_path))
-
-        if args.json:
-            print(json.dumps({"exported": out_paths}, indent=2, ensure_ascii=False))
-        else:
-            for p in out_paths:
-                print(p)
-        return 0
-    finally:
-        conn.close()
-
-
 def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: Path, build: bool) -> Path:
-    """
-    Export strategy:
-    - if --build: build JSON from DB and write it
-    - else: copy json_path file into export dir (preferred), falling back to build-from-db if file missing
-    """
     export_dir.mkdir(parents=True, exist_ok=True)
     out_path = export_dir / export_filename(pl.id, pl.slug)
 
@@ -414,7 +530,6 @@ def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: P
 
     src = resolve_json_path(pl.json_path)
     if src.exists():
-        # Normalize output: keep original content, but add minimal metadata if missing
         obj = read_json_file(src)
         if isinstance(obj, dict):
             obj.setdefault("id", pl.id)
@@ -422,15 +537,42 @@ def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: P
             obj.setdefault("exported_at", now_iso())
             write_json_file(out_path, obj)
         else:
-            # If it's not a dict for some reason, just copy bytes
             out_path.write_bytes(src.read_bytes())
         return out_path
 
-    # fallback if file doesn't exist
     obj = db_build_playlist_json(conn, pl)
     obj.setdefault("exported_at", now_iso())
     write_json_file(out_path, obj)
     return out_path
+
+
+def playlists_export_cmd(args: argparse.Namespace) -> int:
+    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
+    conn = sqlite_connect(args.db)
+    try:
+        if args.id:
+            pl = db_get_playlist(conn, args.id)
+            out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+            print(str(out_path))
+            return 0
+
+        pls = db_list_playlists(conn, limit=args.limit)
+        if not pls:
+            die("No playlists found to export.")
+
+        out_paths: List[str] = []
+        for pl in pls:
+            out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+            out_paths.append(str(out_path))
+
+        if args.json:
+            print(json.dumps({"exported": out_paths}, indent=2, ensure_ascii=False))
+        else:
+            for p in out_paths:
+                print(p)
+        return 0
+    finally:
+        conn.close()
 
 
 def playlists_push_cmd(args: argparse.Namespace) -> int:
@@ -499,10 +641,6 @@ def playlists_push_cmd(args: argparse.Namespace) -> int:
 
 
 def smoke_cmd(args: argparse.Namespace) -> int:
-    """
-    DB smoke:
-      latest playlist -> export -> validate -> optional push (dry-run by default)
-    """
     export_dir = Path(args.export_dir) if args.export_dir else default_export_dir()
     dry_run = not bool(args.no_dry_run)
 
@@ -554,6 +692,59 @@ def smoke_cmd(args: argparse.Namespace) -> int:
             print("Push: skipped (no targets)")
 
     return 0 if out["ok"] else 3
+
+
+# -------- tracks commands --------
+
+def tracks_list_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        rows = db_list_tracks(
+            conn,
+            limit=args.limit,
+            mood=args.mood,
+            genre=args.genre,
+            status=args.status,
+            bpm_min=args.bpm_min,
+            bpm_max=args.bpm_max,
+            q=args.q,
+        )
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps([r.__dict__ for r in rows], indent=2, ensure_ascii=False))
+        return 0
+
+    if not rows:
+        print("(no tracks)")
+        return 0
+
+    for i, t in enumerate(rows, 1):
+        print(f"{i:>2}. {t.id}  {t.title}  mood={t.mood} genre={t.genre} bpm={t.bpm} dur={t.duration_sec:.1f}s status={t.status}")
+    return 0
+
+
+def tracks_show_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        t = db_get_track(conn, args.id)
+    finally:
+        conn.close()
+
+    print(json.dumps(t.__dict__, indent=2, ensure_ascii=False))
+    return 0
+
+
+def tracks_stats_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        stats = db_tracks_stats(conn)
+    finally:
+        conn.close()
+
+    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    return 0
 
 
 # ----------------------------
@@ -630,6 +821,31 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--webhook-timeout", type=int, default=20)
     sm.add_argument("--no-dry-run", action="store_true")
     sm.set_defaults(func=smoke_cmd)
+
+    # tracks
+    tg = sub.add_parser("tracks", help="Track library")
+    tgs = tg.add_subparsers(dest="tracks_cmd", required=True)
+
+    tl = tgs.add_parser("list", help="List tracks")
+    tl.add_argument("--db", default="data/db.sqlite")
+    tl.add_argument("--limit", type=int, default=20)
+    tl.add_argument("--mood", default=None)
+    tl.add_argument("--genre", default=None)
+    tl.add_argument("--status", default=None)
+    tl.add_argument("--bpm-min", type=int, default=None)
+    tl.add_argument("--bpm-max", type=int, default=None)
+    tl.add_argument("--q", default=None, help="Title substring search")
+    tl.add_argument("--json", action="store_true")
+    tl.set_defaults(func=tracks_list_cmd)
+
+    ts = tgs.add_parser("show", help="Show track details")
+    ts.add_argument("id")
+    ts.add_argument("--db", default="data/db.sqlite")
+    ts.set_defaults(func=tracks_show_cmd)
+
+    tt = tgs.add_parser("stats", help="Track library stats")
+    tt.add_argument("--db", default="data/db.sqlite")
+    tt.set_defaults(func=tracks_stats_cmd)
 
     return p
 
