@@ -677,3 +677,12 @@ def db_list_events(
             }
         )
     return out
+
+def _sum_duration_sec(obj: Dict[str, Any]) -> int:
+    total = 0.0
+    for t in (obj.get("tracks") or []):
+        try:
+            total += float(t.get("duration_sec") or 0.0)
+        except Exception:
+            pass
+    return int(round(total))

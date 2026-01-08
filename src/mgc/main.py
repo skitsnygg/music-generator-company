@@ -19,6 +19,7 @@ except Exception:
 
 from mgc.analytics_cli import register_analytics_subcommand
 from mgc.events import EventContext, EventWriter, new_run_id
+from mgc.rebuild_cli import register_rebuild_subcommand
 from mgc.db_helpers import (
     NotFoundError,
     PlaylistRow,
@@ -30,7 +31,7 @@ from mgc.db_helpers import (
     db_get_playlist,
     db_get_track,
     db_insert_playlist_run,
-    db_list_events,  # <-- FIX: import events helper
+    db_list_events,
     db_list_playlist_runs,
     db_list_playlists,
     db_list_playlists_by_slug,
@@ -95,8 +96,10 @@ def cmd_name(args: argparse.Namespace) -> str:
         parts.append(str(args.tracks_cmd))
     if getattr(args, "analytics_cmd", None):
         parts.append(str(args.analytics_cmd))
-    if getattr(args, "events_cmd", None):  # <-- FIX: include events subcommand in command name
+    if getattr(args, "events_cmd", None):
         parts.append(str(args.events_cmd))
+    if getattr(args, "rebuild_cmd", None):
+        parts.append(str(args.rebuild_cmd))
     return " ".join(parts) if parts else "unknown"
 
 
@@ -150,7 +153,6 @@ def _jsonable(x: Any) -> Any:
 
 
 def args_payload(args: argparse.Namespace) -> Dict[str, Any]:
-    # IMPORTANT: argparse stores the handler function at args.func; exclude it for determinism.
     d = vars(args).copy()
     d.pop("func", None)
     return _jsonable(d)
@@ -237,9 +239,9 @@ def push_webhook(src_path: Path, url: str, timeout_s: int, dry_run: bool) -> Pus
 # playlist export helpers
 # ----------------------------
 
-def export_one_playlist(conn, pl: PlaylistRow, export_dir: Path, build: bool) -> Path:
-    export_dir.mkdir(parents=True, exist_ok=True)
-    out_path = export_dir / export_filename(pl.id, pl.slug)
+def export_one_playlist(conn, pl: PlaylistRow, hookup_export_dir: Path, build: bool) -> Path:
+    hookup_export_dir.mkdir(parents=True, exist_ok=True)
+    out_path = hookup_export_dir / export_filename(pl.id, pl.slug)
 
     if build:
         obj = db_build_playlist_json(conn, pl, built_at=now_iso())
@@ -782,8 +784,6 @@ def playlists_diff_cmd(args: argparse.Namespace) -> int:
         conn.close()
 
 
-# -------- tracks commands --------
-
 def tracks_list_cmd(args: argparse.Namespace) -> int:
     run_id = new_run_id()
     conn = sqlite_connect(args.db)
@@ -915,10 +915,6 @@ def tracks_stats_cmd(args: argparse.Namespace) -> int:
         conn.close()
 
 
-# ----------------------------
-# CLI
-# ----------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mgc", description="mgc CLI")
     p.add_argument("--env", default=".env", help="Path to .env (default: .env)")
@@ -1015,6 +1011,9 @@ def build_parser() -> argparse.ArgumentParser:
     el.add_argument("--type", dest="event_type", default=None)
     el.add_argument("--json", action="store_true")
     el.set_defaults(func=events_list_cmd)
+
+    # rebuild
+    register_rebuild_subcommand(sub)
 
     return p
 

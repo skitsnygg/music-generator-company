@@ -159,6 +159,12 @@ class EventContext:
     source: str  # e.g. "cli"
 
 
+@dataclass(frozen=True)
+class EventContext:
+    run_id: str
+    source: str  # e.g. "cli"
+
+
 class EventWriter:
     def __init__(self, conn: sqlite3.Connection, ctx: EventContext):
         self.conn = conn
@@ -179,7 +185,16 @@ class EventWriter:
 
         self.conn.execute(
             """
-            INSERT INTO events (id, occurred_at, run_id, source, event_type, entity_type, entity_id, payload_json)
+            INSERT INTO events (
+                id,
+                occurred_at,
+                run_id,
+                source,
+                event_type,
+                entity_type,
+                entity_id,
+                payload_json
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -193,4 +208,9 @@ class EventWriter:
                 canonical_json(payload),
             ),
         )
+
+        # Auto-commit unless caller controls a transaction
+        if not getattr(self.conn, "in_transaction", False):
+            self.conn.commit()
+
         return event_id
