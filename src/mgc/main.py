@@ -1,737 +1,652 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
-import csv
+import hashlib
 import json
 import os
-import platform
 import sqlite3
-import subprocess
 import sys
 import uuid
-from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-from mgc.agents.marketing_agent import MarketingAgent
-from mgc.agents.music_agent import MusicAgent
-from mgc.db import DB
-from mgc.logging_setup import setup_logging
-from mgc.playlist import build_playlist
-from mgc.storage import StoragePaths
+try:
+    from mgc.logging_setup import setup_logging  # type: ignore
+except Exception:
+    setup_logging = None  # type: ignore
 
 
-def _open_db(db_path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(str(Path(db_path).resolve()))
-    db.row_factory = sqlite3.Row
-    return db
+# ----------------------------
+# basic utils
+# ----------------------------
+
+def eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
 
 
-def run_daily(args=None) -> int:
-    load_dotenv()
-
-    db_path = Path(os.getenv("MGC_DB_PATH", "./data/db.sqlite"))
-    data_dir = Path(os.getenv("MGC_DATA_DIR", "./data"))
-    log_dir = Path(os.getenv("MGC_LOG_DIR", "./logs"))
-
-    logger = setup_logging(log_dir)
-    logger.info("Starting daily pipeline")
-
-    db = DB(db_path)
-    db.init()
-
-    storage = StoragePaths(data_dir)
-    storage.ensure()
-
-    music = MusicAgent(storage=storage)
-    marketing = MarketingAgent(storage=storage)
-
-    track = music.run_daily()
-    db.insert_track(music.to_db_row(track))
-    logger.info(f"Generated track: {track.title}")
-    logger.info(f"Full: {track.full_path}")
-    logger.info(f"Preview: {track.preview_path}")
-
-    posts = marketing.plan_posts(track)
-    for p in posts:
-        db.insert_post(p)
-    logger.info(f"Planned {len(posts)} marketing posts (JSON files in data/posts/)")
-
-    logger.info("Daily pipeline complete")
-    return 0
+def die(msg: str, code: int = 2) -> "NoReturn":
+    eprint(msg)
+    raise SystemExit(code)
 
 
-def playlist_cmd(args) -> int:
-    load_dotenv()
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    db_path = Path(os.getenv("MGC_DB_PATH", "./data/db.sqlite"))
-    data_dir = Path(os.getenv("MGC_DATA_DIR", "./data"))
 
-    bpm_window = None
-    if args.bpm_min is not None or args.bpm_max is not None:
-        bpm_window = (args.bpm_min or 0, args.bpm_max or 999)
+def read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        die(f"JSON file not found: {path}")
+    except json.JSONDecodeError as ex:
+        die(f"Invalid JSON in {path}: {ex}")
 
-    pl = build_playlist(
-        db_path=db_path,
-        name=args.name,
-        slug=args.slug,
-        context=args.context,
-        mood=args.mood,
-        genre=args.genre,
-        target_minutes=args.minutes,
-        bpm_window=bpm_window,
-        seed=args.seed,
-        lookback_playlists=args.lookback,
+
+def write_json_file(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def ensure_requests() -> Any:
+    try:
+        import requests  # type: ignore
+        return requests
+    except Exception:
+        die("Missing dependency: requests. Install with: pip install requests")
+
+
+# ----------------------------
+# export layout
+# ----------------------------
+
+def default_export_dir() -> Path:
+    return Path(os.environ.get("MGC_PLAYLISTS_DIR", "data/playlists"))
+
+
+def safe_slug(s: str) -> str:
+    s = s.strip()
+    out = "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_")).strip("-_")
+    return out
+
+
+def export_filename(playlist_id: str, slug: Optional[str] = None) -> str:
+    if slug:
+        return f"{safe_slug(slug)}_{playlist_id}.json"
+    return f"{playlist_id}.json"
+
+
+# ----------------------------
+# DB access (your schema)
+# ----------------------------
+
+def sqlite_connect(db_path: str) -> sqlite3.Connection:
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as ex:
+        die(f"Failed to open SQLite DB at {db_path}: {ex}")
+
+
+@dataclass(frozen=True)
+class PlaylistRow:
+    id: str
+    created_at: str
+    slug: str
+    name: str
+    context: Optional[str]
+    mood: Optional[str]
+    genre: Optional[str]
+    target_minutes: int
+    seed: int
+    track_count: int
+    total_duration_sec: int
+    json_path: str
+
+
+def db_list_playlists(conn: sqlite3.Connection, limit: int) -> List[PlaylistRow]:
+    sql = """
+    SELECT
+      id, created_at, slug, name, context, mood, genre,
+      target_minutes, seed, track_count, total_duration_sec, json_path
+    FROM playlists
+    ORDER BY created_at DESC
+    LIMIT ?
+    """
+    rows = conn.execute(sql, (limit,)).fetchall()
+    out: List[PlaylistRow] = []
+    for r in rows:
+        out.append(
+            PlaylistRow(
+                id=str(r["id"]),
+                created_at=str(r["created_at"]),
+                slug=str(r["slug"]),
+                name=str(r["name"]),
+                context=(str(r["context"]) if r["context"] is not None else None),
+                mood=(str(r["mood"]) if r["mood"] is not None else None),
+                genre=(str(r["genre"]) if r["genre"] is not None else None),
+                target_minutes=int(r["target_minutes"]),
+                seed=int(r["seed"]),
+                track_count=int(r["track_count"]),
+                total_duration_sec=int(r["total_duration_sec"]),
+                json_path=str(r["json_path"]),
+            )
+        )
+    return out
+
+
+def db_get_playlist(conn: sqlite3.Connection, playlist_id: str) -> PlaylistRow:
+    sql = """
+    SELECT
+      id, created_at, slug, name, context, mood, genre,
+      target_minutes, seed, track_count, total_duration_sec, json_path
+    FROM playlists
+    WHERE id = ?
+    LIMIT 1
+    """
+    r = conn.execute(sql, (playlist_id,)).fetchone()
+    if not r:
+        die(f"Playlist not found: {playlist_id}")
+    return PlaylistRow(
+        id=str(r["id"]),
+        created_at=str(r["created_at"]),
+        slug=str(r["slug"]),
+        name=str(r["name"]),
+        context=(str(r["context"]) if r["context"] is not None else None),
+        mood=(str(r["mood"]) if r["mood"] is not None else None),
+        genre=(str(r["genre"]) if r["genre"] is not None else None),
+        target_minutes=int(r["target_minutes"]),
+        seed=int(r["seed"]),
+        track_count=int(r["track_count"]),
+        total_duration_sec=int(r["total_duration_sec"]),
+        json_path=str(r["json_path"]),
     )
 
-    dedupe = (pl.get("dedupe") or {})
-    if dedupe:
-        if dedupe.get("applied"):
-            print(f"dedupe applied (excluded {dedupe.get('excluded_count', 0)} tracks)")
-        else:
-            reason = dedupe.get("reason")
-            excl = dedupe.get("excluded_count", 0)
-            if reason == "not_enough_unique_tracks":
-                print(
-                    f"dedupe skipped: not enough unique tracks after excluding {excl}. "
-                    f"Generate more tracks to avoid repeats."
-                )
-            else:
-                print(f"dedupe skipped (excluded {excl}) reason={reason}")
 
-    out_dir = data_dir / "playlists"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{args.slug}.json"
-    out_path.write_text(json.dumps(pl, indent=2), encoding="utf-8")
+def resolve_json_path(json_path: str) -> Path:
+    """
+    json_path in DB might be relative (repo root) or absolute.
+    We resolve relative paths against current working directory.
+    """
+    p = Path(json_path)
+    if p.is_absolute():
+        return p
+    return Path.cwd() / p
 
-    # Persist playlist build (history + dedupe support)
-    db = DB(db_path)
-    db.init()
 
-    playlist_id = str(uuid.uuid4())
-    filters = pl.get("filters", {})
-    bpm_window_list = filters.get("bpm_window") or [None, None]
-    bpm_min, bpm_max = bpm_window_list[0], bpm_window_list[1]
+def db_build_playlist_json(conn: sqlite3.Connection, pl: PlaylistRow) -> Dict[str, Any]:
+    """
+    Build a full playlist JSON using:
+      playlists + playlist_items + tracks
+    """
+    sql = """
+    SELECT
+      pi.position,
+      t.id AS track_id,
+      t.title,
+      t.mood,
+      t.genre,
+      t.bpm,
+      t.duration_sec,
+      t.full_path,
+      t.preview_path,
+      t.status,
+      t.created_at
+    FROM playlist_items pi
+    JOIN tracks t ON t.id = pi.track_id
+    WHERE pi.playlist_id = ?
+    ORDER BY pi.position ASC
+    """
+    rows = conn.execute(sql, (pl.id,)).fetchall()
 
-    with db.connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO playlists (
-                id, created_at, slug, name, context, mood, genre, bpm_min, bpm_max,
-                target_minutes, seed, track_count, total_duration_sec, json_path
-            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                playlist_id,
-                args.slug,
-                pl["name"],
-                filters.get("context"),
-                filters.get("mood"),
-                filters.get("genre"),
-                bpm_min,
-                bpm_max,
-                int(filters.get("target_minutes") or 0),
-                int(filters.get("seed") or 1),
-                int(pl["stats"]["track_count"]),
-                int(pl["stats"]["total_duration_sec"]),
-                str(out_path),
-            ),
+    tracks: List[Dict[str, Any]] = []
+    for r in rows:
+        tracks.append(
+            {
+                "id": str(r["track_id"]),
+                "title": str(r["title"]),
+                "mood": str(r["mood"]),
+                "genre": str(r["genre"]),
+                "bpm": int(r["bpm"]),
+                "duration_sec": float(r["duration_sec"]),
+                "full_path": str(r["full_path"]),
+                "preview_path": str(r["preview_path"]),
+                "status": str(r["status"]),
+                "created_at": str(r["created_at"]),
+                "position": int(r["position"]),
+            }
         )
 
-        for idx, item in enumerate(pl["items"]):
-            conn.execute(
-                """
-                INSERT INTO playlist_items (playlist_id, track_id, position)
-                VALUES (?, ?, ?)
-                """,
-                (playlist_id, item["track_id"], idx),
-            )
+    return {
+        "id": pl.id,
+        "created_at": pl.created_at,
+        "slug": pl.slug,
+        "name": pl.name,
+        "context": pl.context,
+        "mood": pl.mood,
+        "genre": pl.genre,
+        "target_minutes": pl.target_minutes,
+        "seed": pl.seed,
+        "track_count": pl.track_count,
+        "total_duration_sec": pl.total_duration_sec,
+        "json_path": pl.json_path,
+        "tracks": tracks,
+        "built_from_db_at": now_iso(),
+    }
 
-        conn.commit()
 
-    print(str(out_path))
+# ----------------------------
+# validation
+# ----------------------------
+
+def validate_playlist_json(obj: Dict[str, Any]) -> Tuple[bool, str]:
+    if not isinstance(obj, dict):
+        return False, "playlist JSON is not an object"
+    tracks = obj.get("tracks")
+    if not isinstance(tracks, list):
+        return False, "missing tracks[] list"
+    if len(tracks) == 0:
+        return False, "tracks[] is empty"
+    return True, "ok"
+
+
+# ----------------------------
+# push targets
+# ----------------------------
+
+@dataclass
+class PushResult:
+    target: str
+    ok: bool
+    detail: str
+
+
+def push_local(src_path: Path, dst_dir: Path, overwrite: bool, dry_run: bool) -> PushResult:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_path = dst_dir / src_path.name
+
+    if dst_path.exists() and not overwrite:
+        return PushResult("local", True, f"Skipped (exists): {dst_path}")
+
+    if dry_run:
+        return PushResult("local", True, f"Dry-run copy to: {dst_path}")
+
+    dst_path.write_bytes(src_path.read_bytes())
+    return PushResult("local", True, f"Copied to: {dst_path}")
+
+
+def push_webhook(src_path: Path, url: str, timeout_s: int, dry_run: bool) -> PushResult:
+    requests = ensure_requests()
+    payload = read_json_file(src_path)
+    headers = {"Content-Type": "application/json", "User-Agent": "mgc-cli/1.0"}
+
+    if dry_run:
+        return PushResult("webhook", True, f"Dry-run POST to: {url}")
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+        if 200 <= int(resp.status_code) < 300:
+            return PushResult("webhook", True, f"POST {resp.status_code}: {url}")
+        return PushResult("webhook", False, f"POST {resp.status_code}: {resp.text[:400]}")
+    except Exception as ex:
+        return PushResult("webhook", False, f"POST failed: {ex}")
+
+
+# ----------------------------
+# commands
+# ----------------------------
+
+def db_schema_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = [r["name"] for r in cur.fetchall()]
+        for t in tables:
+            print(t)
+            info = conn.execute(f"PRAGMA table_info({t})").fetchall()
+            for r in info:
+                name = r["name"]
+                ctype = r["type"] or ""
+                pk = " pk" if r["pk"] else ""
+                nn = " notnull" if r["notnull"] else ""
+                print(f"  - {name} {ctype}{pk}{nn}")
+        return 0
+    finally:
+        conn.close()
+
+
+def playlists_list_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        pls = db_list_playlists(conn, limit=args.limit)
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps([pl.__dict__ for pl in pls], indent=2, ensure_ascii=False))
+        return 0
+
+    if not pls:
+        print("(no playlists)")
+        return 0
+
+    for i, pl in enumerate(pls, 1):
+        print(f"{i:>2}. {pl.id}  {pl.slug}  {pl.created_at}  tracks={pl.track_count}  json_path={pl.json_path}")
     return 0
 
 
-def playlists_list_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    if not db_path.exists():
-        print("DB file not found.", flush=True)
-        return 1
-
-    db = _open_db(args.db)
+def playlists_reveal_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
     try:
-        if getattr(args, "slug", None):
-            rows = db.execute(
-                """
-                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
-                FROM playlists
-                WHERE slug = ?
-                ORDER BY datetime(created_at) DESC, rowid DESC
-                LIMIT ?
-                """,
-                (args.slug, int(args.limit)),
-            ).fetchall()
-        else:
-            rows = db.execute(
-                """
-                SELECT rowid, id, created_at, slug, context, name, track_count, total_duration_sec, json_path
-                FROM playlists
-                ORDER BY datetime(created_at) DESC, rowid DESC
-                LIMIT ?
-                """,
-                (int(args.limit),),
-            ).fetchall()
+        pl = db_get_playlist(conn, args.id)
 
-        print(f"playlists_shown: {len(rows)}", flush=True)
+        if args.build:
+            obj = db_build_playlist_json(conn, pl)
+            print(json.dumps(obj, indent=2, ensure_ascii=False))
+            return 0
 
-        for r in rows:
-            minutes = round((r["total_duration_sec"] or 0) / 60.0, 2)
-            print(
-                f'{r["created_at"]}  id={r["id"]}  slug={r["slug"]}  '
-                f'context={r["context"]}  tracks={r["track_count"]}  minutes={minutes}',
-                flush=True,
-            )
+        jp = resolve_json_path(pl.json_path)
+        if jp.exists():
+            obj = read_json_file(jp)
+            print(json.dumps(obj, indent=2, ensure_ascii=False))
+            return 0
+
+        # Fallback: build from DB if json_path missing
+        obj = db_build_playlist_json(conn, pl)
+        print(json.dumps(obj, indent=2, ensure_ascii=False))
         return 0
     finally:
-        db.close()
+        conn.close()
 
 
-def playlists_show_cmd(args) -> int:
-    db_path = Path(args.db).resolve()
-    if not db_path.exists():
-        print("DB file not found.", flush=True)
-        return 1
-
-    db = _open_db(args.db)
+def playlists_export_cmd(args: argparse.Namespace) -> int:
+    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
+    conn = sqlite_connect(args.db)
     try:
-        pl = db.execute("SELECT rowid, * FROM playlists WHERE id = ?", (args.id,)).fetchone()
-        if not pl:
-            print("Playlist not found.", flush=True)
-            return 1
+        if args.id:
+            pl = db_get_playlist(conn, args.id)
+            out_path = export_one_playlist(conn, pl, export_dir, build=args.build)
+            print(str(out_path))
+            return 0
 
-        pl = dict(pl)
-        items = db.execute(
-            """
-            SELECT pi.position, t.*
-            FROM playlist_items pi
-            JOIN tracks t ON t.id = pi.track_id
-            WHERE pi.playlist_id = ?
-            ORDER BY pi.position ASC
-            """,
-            (args.id,),
-        ).fetchall()
+        pls = db_list_playlists(conn, limit=args.limit)
+        if not pls:
+            die("No playlists found to export.")
 
-        minutes = round((pl.get("total_duration_sec") or 0) / 60.0, 2)
-        print(pl.get("name", "Playlist"), flush=True)
-        print(f'created_at: {pl.get("created_at")}', flush=True)
-        print(f'id: {pl.get("id")}', flush=True)
-        print(f'slug: {pl.get("slug")}', flush=True)
-        print(f'context: {pl.get("context")}', flush=True)
-        print(f'tracks: {pl.get("track_count")}  minutes: {minutes}', flush=True)
-        print(f'json_path: {pl.get("json_path")}', flush=True)
-        print("", flush=True)
+        out_paths: List[str] = []
+        for pl in pls:
+            out_path = export_one_playlist(conn, pl, export_dir, build=args.build)
+            out_paths.append(str(out_path))
 
-        # Optional: show JSON-derived filters/stats if file exists
+        if args.json:
+            print(json.dumps({"exported": out_paths}, indent=2, ensure_ascii=False))
+        else:
+            for p in out_paths:
+                print(p)
+        return 0
+    finally:
+        conn.close()
+
+
+def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: Path, build: bool) -> Path:
+    """
+    Export strategy:
+    - if --build: build JSON from DB and write it
+    - else: copy json_path file into export dir (preferred), falling back to build-from-db if file missing
+    """
+    export_dir.mkdir(parents=True, exist_ok=True)
+    out_path = export_dir / export_filename(pl.id, pl.slug)
+
+    if build:
+        obj = db_build_playlist_json(conn, pl)
+        obj.setdefault("exported_at", now_iso())
+        write_json_file(out_path, obj)
+        return out_path
+
+    src = resolve_json_path(pl.json_path)
+    if src.exists():
+        # Normalize output: keep original content, but add minimal metadata if missing
+        obj = read_json_file(src)
+        if isinstance(obj, dict):
+            obj.setdefault("id", pl.id)
+            obj.setdefault("slug", pl.slug)
+            obj.setdefault("exported_at", now_iso())
+            write_json_file(out_path, obj)
+        else:
+            # If it's not a dict for some reason, just copy bytes
+            out_path.write_bytes(src.read_bytes())
+        return out_path
+
+    # fallback if file doesn't exist
+    obj = db_build_playlist_json(conn, pl)
+    obj.setdefault("exported_at", now_iso())
+    write_json_file(out_path, obj)
+    return out_path
+
+
+def playlists_push_cmd(args: argparse.Namespace) -> int:
+    export_dir = Path(args.export_dir) if args.export_dir else default_export_dir()
+
+    if args.file:
+        src_path = Path(args.file)
+        if not src_path.exists():
+            die(f"Source file not found: {src_path}")
+    elif args.id:
+        conn = sqlite_connect(args.db)
         try:
-            jp = pl.get("json_path")
-            if jp:
-                j = json.loads(Path(jp).read_text(encoding="utf-8"))
-                filters = j.get("filters") or {}
-                stats = j.get("stats") or {}
-                dedupe = j.get("dedupe") or {}
+            pl = db_get_playlist(conn, args.id)
+            src_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+        finally:
+            conn.close()
+    else:
+        die("Provide --id PLAYLIST_ID or --file path.json")
 
-                print("filters:", flush=True)
-                for k in ["context", "mood", "genre", "bpm_window", "target_minutes", "seed", "lookback_playlists"]:
-                    if k in filters:
-                        print(f"  {k}: {filters.get(k)}", flush=True)
+    results: List[PushResult] = []
 
-                print("stats:", flush=True)
-                for k in ["track_count", "unique_track_count", "duration_minutes", "avg_bpm", "bpm_min", "bpm_max"]:
-                    if k in stats:
-                        print(f"  {k}: {stats.get(k)}", flush=True)
+    if args.local_dir:
+        results.append(
+            push_local(
+                src_path=src_path,
+                dst_dir=Path(args.local_dir),
+                overwrite=bool(args.overwrite),
+                dry_run=bool(args.dry_run),
+            )
+        )
 
-                if dedupe:
-                    print("dedupe:", flush=True)
-                    for k in ["requested_lookback", "excluded_count", "applied", "reason"]:
-                        if k in dedupe:
-                            print(f"  {k}: {dedupe.get(k)}", flush=True)
+    webhook_url = args.webhook_url or os.environ.get("MGC_WEBHOOK_URL")
+    if args.webhook and not webhook_url:
+        die("Webhook enabled but no URL provided. Use --webhook-url or set MGC_WEBHOOK_URL.")
 
-                print("", flush=True)
+    if args.webhook:
+        results.append(
+            push_webhook(
+                src_path=src_path,
+                url=str(webhook_url),
+                timeout_s=int(args.webhook_timeout),
+                dry_run=bool(args.dry_run),
+            )
+        )
+
+    if not results:
+        die("No push targets selected. Use --local-dir and/or --webhook.")
+
+    ok_all = all(r.ok for r in results)
+    out = {
+        "source": str(src_path),
+        "dry_run": bool(args.dry_run),
+        "results": [r.__dict__ for r in results],
+        "ok": ok_all,
+    }
+
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    else:
+        print(f"Source: {src_path}")
+        for r in results:
+            status = "OK" if r.ok else "FAIL"
+            print(f"- {r.target}: {status} — {r.detail}")
+
+    return 0 if ok_all else 3
+
+
+def smoke_cmd(args: argparse.Namespace) -> int:
+    """
+    DB smoke:
+      latest playlist -> export -> validate -> optional push (dry-run by default)
+    """
+    export_dir = Path(args.export_dir) if args.export_dir else default_export_dir()
+    dry_run = not bool(args.no_dry_run)
+
+    conn = sqlite_connect(args.db)
+    try:
+        pls = db_list_playlists(conn, limit=1)
+        if not pls:
+            die("Smoke failed: no playlists found in DB.")
+        pl = pls[0]
+        out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+    finally:
+        conn.close()
+
+    obj = read_json_file(out_path)
+    ok, msg = validate_playlist_json(obj)
+    if not ok:
+        die(f"Smoke validation failed: {msg}")
+
+    results: List[PushResult] = []
+    if args.local_dir:
+        results.append(push_local(out_path, Path(args.local_dir), overwrite=True, dry_run=dry_run))
+
+    webhook_url = args.webhook_url or os.environ.get("MGC_WEBHOOK_URL")
+    if args.webhook and not webhook_url:
+        die("Smoke webhook enabled but no URL provided. Use --webhook-url or set MGC_WEBHOOK_URL.")
+
+    if args.webhook:
+        results.append(push_webhook(out_path, str(webhook_url), timeout_s=int(args.webhook_timeout), dry_run=dry_run))
+
+    out = {
+        "exported": str(out_path),
+        "validated": True,
+        "dry_run": dry_run,
+        "push_results": [r.__dict__ for r in results],
+        "ok": all(r.ok for r in results) if results else True,
+    }
+
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    else:
+        print(f"Exported: {out_path}")
+        print(f"Validated: {msg}")
+        if results:
+            print(f"Push dry-run: {dry_run}")
+            for r in results:
+                status = "OK" if r.ok else "FAIL"
+                print(f"- {r.target}: {status} — {r.detail}")
+        else:
+            print("Push: skipped (no targets)")
+
+    return 0 if out["ok"] else 3
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="mgc", description="mgc CLI")
+    p.add_argument("--env", default=".env", help="Path to .env (default: .env)")
+    p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # db
+    dbg = sub.add_parser("db", help="DB utilities")
+    dbs = dbg.add_subparsers(dest="db_cmd", required=True)
+
+    db_schema = dbs.add_parser("schema", help="Print tables + columns")
+    db_schema.add_argument("--db", default="data/db.sqlite")
+    db_schema.set_defaults(func=db_schema_cmd)
+
+    # playlists
+    pg = sub.add_parser("playlists", help="Playlist operations")
+    pgs = pg.add_subparsers(dest="playlists_cmd", required=True)
+
+    pl_list = pgs.add_parser("list", help="List playlists")
+    pl_list.add_argument("--db", default="data/db.sqlite")
+    pl_list.add_argument("--limit", type=int, default=20)
+    pl_list.add_argument("--json", action="store_true")
+    pl_list.set_defaults(func=playlists_list_cmd)
+
+    pl_rev = pgs.add_parser("reveal", help="Reveal playlist JSON by reading playlists.json_path (or build from DB)")
+    pl_rev.add_argument("id")
+    pl_rev.add_argument("--db", default="data/db.sqlite")
+    pl_rev.add_argument("--build", action="store_true", help="Build JSON from DB joins instead of reading json_path")
+    pl_rev.set_defaults(func=playlists_reveal_cmd)
+
+    pl_exp = pgs.add_parser("export", help="Export playlists to JSON files")
+    pl_exp.add_argument("--db", default="data/db.sqlite")
+    pl_exp.add_argument("--id", default=None, help="Export a specific playlist ID")
+    pl_exp.add_argument("--limit", type=int, default=20, help="Export latest N (if --id not set)")
+    pl_exp.add_argument("--out-dir", default=None, help="Export directory (default: data/playlists or MGC_PLAYLISTS_DIR)")
+    pl_exp.add_argument("--json", action="store_true", help="Output JSON summary")
+    pl_exp.add_argument("--build", action="store_true", help="Build JSON from DB joins instead of reading json_path")
+    pl_exp.set_defaults(func=playlists_export_cmd)
+
+    pl_push = pgs.add_parser("push", help="Push an exported playlist JSON to targets")
+    pl_push.add_argument("--db", default="data/db.sqlite")
+    pl_push.add_argument("--id", default=None, help="Playlist ID to export+push")
+    pl_push.add_argument("--file", default=None, help="Existing exported playlist JSON file to push")
+    pl_push.add_argument("--export-dir", default=None, help="Where to export when using --id (default: data/playlists)")
+    pl_push.add_argument("--build", action="store_true", help="Build JSON from DB joins instead of reading json_path")
+    pl_push.add_argument("--dry-run", action="store_true")
+    pl_push.add_argument("--json", action="store_true")
+
+    pl_push.add_argument("--local-dir", default=None, help="Copy JSON into this directory")
+    pl_push.add_argument("--overwrite", action="store_true", help="Overwrite local file if it exists")
+
+    pl_push.add_argument("--webhook", action="store_true", help="Enable webhook push")
+    pl_push.add_argument("--webhook-url", default=None, help="Webhook URL (or env MGC_WEBHOOK_URL)")
+    pl_push.add_argument("--webhook-timeout", type=int, default=20)
+    pl_push.set_defaults(func=playlists_push_cmd)
+
+    # smoke
+    sm = sub.add_parser("smoke", help="DB smoke: latest playlist -> export -> validate -> push")
+    sm.add_argument("--db", default="data/db.sqlite")
+    sm.add_argument("--export-dir", default=None)
+    sm.add_argument("--build", action="store_true", help="Build JSON from DB joins instead of reading json_path")
+    sm.add_argument("--json", action="store_true")
+
+    sm.add_argument("--local-dir", default=None)
+    sm.add_argument("--webhook", action="store_true")
+    sm.add_argument("--webhook-url", default=None)
+    sm.add_argument("--webhook-timeout", type=int, default=20)
+    sm.add_argument("--no-dry-run", action="store_true")
+    sm.set_defaults(func=smoke_cmd)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    load_dotenv(args.env)
+
+    if setup_logging:
+        try:
+            setup_logging(level=args.log_level)
         except Exception:
             pass
 
-        print("items:", flush=True)
-        for r in items:
-            r = dict(r)
-            dur = int(r.get("duration_sec") or 0)
-            print(
-                f'  {r.get("title")}  bpm={r.get("bpm")}  mood={r.get("mood")}  '
-                f'genre={r.get("genre")}  dur={dur}s  id={r.get("id")}',
-                flush=True,
-            )
-
-        return 0
-    finally:
-        db.close()
-
-
-def playlists_open_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        r = db.execute("SELECT json_path FROM playlists WHERE id = ?", (args.id,)).fetchone()
-        if not r:
-            print("Playlist not found.")
-            return 1
-
-        jp = r["json_path"]
-        if not jp:
-            print("No json_path stored for this playlist.")
-            return 1
-
-        p = Path(jp)
-        if not p.exists():
-            print(f"File not found on disk: {p}")
-            return 1
-
-        system = platform.system().lower()
-        if system == "darwin":
-            subprocess.check_call(["open", str(p)])
-        elif system == "windows":
-            os.startfile(str(p))  # type: ignore[attr-defined]
-        else:
-            subprocess.check_call(["xdg-open", str(p)])
-
-        print(f"Opened: {p}")
-        return 0
-    finally:
-        db.close()
-
-
-def playlists_reveal_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        r = db.execute("SELECT json_path FROM playlists WHERE id = ?", (args.id,)).fetchone()
-        if not r:
-            print("Playlist not found.")
-            return 1
-
-        jp = r["json_path"]
-        if not jp:
-            print("No json_path stored for this playlist.")
-            return 1
-
-        p = Path(jp)
-        if not p.exists():
-            print(f"File not found on disk: {p}")
-            return 1
-
-        system = platform.system().lower()
-        if system == "darwin":
-            subprocess.check_call(["open", "-R", str(p)])
-        elif system == "windows":
-            subprocess.check_call(["explorer", f"/select,{str(p.resolve())}"])
-        else:
-            subprocess.check_call(["xdg-open", str(p.parent)])
-
-        print(f"Revealed: {p}")
-        return 0
-    finally:
-        db.close()
-
-
-def playlists_export_cmd(args) -> int:
-    """
-    Export playlists to stdout.
-    - default: CSV
-    - --json: JSON
-    """
-    db = _open_db(args.db)
-    try:
-        rows = db.execute(
-            """
-            SELECT
-              id, created_at, slug, name, context, mood, genre,
-              bpm_min, bpm_max, target_minutes, seed,
-              track_count, total_duration_sec, json_path
-            FROM playlists
-            ORDER BY datetime(created_at) DESC
-            """
-        ).fetchall()
-
-        if bool(getattr(args, "json", False)):
-            out = [dict(r) for r in rows]
-            print(json.dumps({"playlists": out}, indent=2))
-            return 0
-
-        w = csv.writer(sys.stdout)
-        w.writerow(
-            [
-                "id",
-                "created_at",
-                "slug",
-                "name",
-                "context",
-                "mood",
-                "genre",
-                "bpm_min",
-                "bpm_max",
-                "target_minutes",
-                "seed",
-                "track_count",
-                "total_duration_sec",
-                "json_path",
-            ]
-        )
-        for r in rows:
-            w.writerow(
-                [
-                    r["id"],
-                    r["created_at"],
-                    r["slug"],
-                    r["name"],
-                    r["context"],
-                    r["mood"],
-                    r["genre"],
-                    r["bpm_min"],
-                    r["bpm_max"],
-                    r["target_minutes"],
-                    r["seed"],
-                    r["track_count"],
-                    r["total_duration_sec"],
-                    r["json_path"],
-                ]
-            )
-        return 0
-    finally:
-        db.close()
-
-
-def tracks_list_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        where = []
-        params = []
-
-        if args.mood:
-            where.append("mood = ?")
-            params.append(args.mood)
-        if args.genre:
-            where.append("genre = ?")
-            params.append(args.genre)
-
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
-        rows = db.execute(
-            f"""
-            SELECT id, created_at, title, mood, genre, bpm, duration_sec
-            FROM tracks
-            {where_sql}
-            ORDER BY datetime(created_at) DESC
-            LIMIT ?
-            """,
-            params + [int(args.limit)],
-        ).fetchall()
-
-        if not rows:
-            print("No tracks found.")
-            return 0
-
-        for r in rows:
-            dur = int(r["duration_sec"])
-            print(
-                f'{r["created_at"]}  id={r["id"]}  "{r["title"]}"  '
-                f'mood={r["mood"]}  genre={r["genre"]}  bpm={r["bpm"]}  dur={dur}s'
-            )
-
-        return 0
-    finally:
-        db.close()
-
-
-def tracks_show_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        r = db.execute("SELECT * FROM tracks WHERE id = ?", (args.id,)).fetchone()
-        if not r:
-            print("Track not found.")
-            return 1
-
-        r = dict(r)
-        print(r.get("title") or "Track")
-        for k in ["id", "created_at", "mood", "genre", "bpm", "duration_sec", "status"]:
-            print(f"{k}: {r.get(k)}")
-        print(f'preview_path: {r.get("preview_path")}')
-        print(f'full_path: {r.get("full_path")}')
-        return 0
-    finally:
-        db.close()
-
-
-def tracks_stats_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        rows = db.execute("SELECT mood, genre, bpm, duration_sec FROM tracks").fetchall()
-        if not rows:
-            print("No tracks in library.")
-            return 0
-
-        moods = Counter()
-        genres = Counter()
-        bpms: list[int] = []
-        durations: list[int] = []
-
-        for r in rows:
-            moods[r["mood"]] += 1
-            genres[r["genre"]] += 1
-            bpms.append(int(r["bpm"]))
-            durations.append(int(r["duration_sec"]))
-
-        print(f"total_tracks: {len(rows)}")
-        print(f"avg_bpm: {int(sum(bpms) / len(bpms))}")
-        print(f"avg_duration_sec: {int(sum(durations) / len(durations))}")
-
-        print("moods:")
-        for k, v in moods.most_common():
-            print(f"  {k}: {v}")
-
-        print("genres:")
-        for k, v in genres.most_common():
-            print(f"  {k}: {v}")
-
-        return 0
-    finally:
-        db.close()
-
-
-def _track_pick_path(db: sqlite3.Connection, track_id: str, use_full: bool) -> Path | None:
-    r = db.execute("SELECT preview_path, full_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
-    if not r:
-        return None
-    target = r["full_path"] if use_full else r["preview_path"]
-    if not target:
-        return None
-    return Path(str(target))
-
-
-def tracks_open_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        use_full = bool(getattr(args, "full", False))
-        p = _track_pick_path(db, args.id, use_full)
-        if p is None:
-            r = db.execute("SELECT id FROM tracks WHERE id = ?", (args.id,)).fetchone()
-            if not r:
-                print("Track not found.")
-                return 1
-            which = "full_path" if use_full else "preview_path"
-            print(f"No {which} for track {args.id}")
-            return 1
-
-        if not p.exists():
-            print(f"File not found on disk: {p}")
-            return 1
-
-        system = platform.system().lower()
-        if system == "darwin":
-            subprocess.check_call(["open", str(p)])
-        elif system == "windows":
-            os.startfile(str(p))  # type: ignore[attr-defined]
-        else:
-            subprocess.check_call(["xdg-open", str(p)])
-
-        print(f"Opened: {p}")
-        return 0
-    finally:
-        db.close()
-
-
-def tracks_reveal_cmd(args) -> int:
-    db = _open_db(args.db)
-    try:
-        use_full = bool(getattr(args, "full", False))
-        p = _track_pick_path(db, args.id, use_full)
-        if p is None:
-            r = db.execute("SELECT id FROM tracks WHERE id = ?", (args.id,)).fetchone()
-            if not r:
-                print("Track not found.")
-                return 1
-            which = "full_path" if use_full else "preview_path"
-            print(f"No {which} for track {args.id}")
-            return 1
-
-        if not p.exists():
-            print(f"File not found on disk: {p}")
-            return 1
-
-        system = platform.system().lower()
-        if system == "darwin":
-            subprocess.check_call(["open", "-R", str(p)])
-        elif system == "windows":
-            subprocess.check_call(["explorer", f"/select,{str(p.resolve())}"])
-        else:
-            subprocess.check_call(["xdg-open", str(p.parent)])
-
-        print(f"Revealed: {p}")
-        return 0
-    finally:
-        db.close()
-
-
-def tracks_export_cmd(args) -> int:
-    """
-    Export tracks to stdout.
-    - default: CSV
-    - --json: JSON
-    """
-    db = _open_db(args.db)
-    try:
-        rows = db.execute(
-            """
-            SELECT id, created_at, title, mood, genre, bpm, duration_sec, status, preview_path, full_path
-            FROM tracks
-            ORDER BY datetime(created_at) DESC
-            """
-        ).fetchall()
-
-        if bool(getattr(args, "json", False)):
-            out = [dict(r) for r in rows]
-            print(json.dumps({"tracks": out}, indent=2))
-            return 0
-
-        w = csv.writer(sys.stdout)
-        w.writerow(
-            [
-                "id",
-                "created_at",
-                "title",
-                "mood",
-                "genre",
-                "bpm",
-                "duration_sec",
-                "status",
-                "preview_path",
-                "full_path",
-            ]
-        )
-        for r in rows:
-            w.writerow(
-                [
-                    r["id"],
-                    r["created_at"],
-                    r["title"],
-                    r["mood"],
-                    r["genre"],
-                    r["bpm"],
-                    r["duration_sec"],
-                    r["status"],
-                    r["preview_path"],
-                    r["full_path"],
-                ]
-            )
-        return 0
-    finally:
-        db.close()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(prog="mgc")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    # playlists: inspect saved playlist history
-    pg = sub.add_parser("playlists", help="Inspect saved playlists")
-    pgs = pg.add_subparsers(dest="playlists_cmd", required=True)
-
-    pl_list = pgs.add_parser("list", help="List recent playlists")
-    pl_list.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    pl_list.add_argument("--limit", type=int, default=10, help="Max rows")
-    pl_list.add_argument("--slug", default=None, help="Filter by slug")
-    pl_list.set_defaults(func=playlists_list_cmd)
-
-    pl_show = pgs.add_parser("show", help="Show playlist details")
-    pl_show.add_argument("id", help="Playlist id")
-    pl_show.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    pl_show.set_defaults(func=playlists_show_cmd)
-
-    pl_open = pgs.add_parser("open", help="Open playlist JSON file")
-    pl_open.add_argument("id", help="Playlist id")
-    pl_open.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    pl_open.set_defaults(func=playlists_open_cmd)
-
-    pl_reveal = pgs.add_parser("reveal", help="Reveal playlist JSON in your file manager")
-    pl_reveal.add_argument("id", help="Playlist id")
-    pl_reveal.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    pl_reveal.set_defaults(func=playlists_reveal_cmd)
-
-    pl_export = pgs.add_parser("export", help="Export playlists (CSV to stdout by default)")
-    pl_export.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    pl_export.add_argument("--json", action="store_true", help="Output JSON instead of CSV")
-    pl_export.set_defaults(func=playlists_export_cmd)
-
-    # tracks: inspect track library
-    tg = sub.add_parser("tracks", help="Inspect track library")
-    tgs = tg.add_subparsers(dest="tracks_cmd", required=True)
-
-    tl = tgs.add_parser("list", help="List tracks")
-    tl.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    tl.add_argument("--limit", type=int, default=20, help="Max rows")
-    tl.add_argument("--mood", default=None, help="Filter mood (exact match)")
-    tl.add_argument("--genre", default=None, help="Filter genre (exact match)")
-    tl.set_defaults(func=tracks_list_cmd)
-
-    ts = tgs.add_parser("show", help="Show track details")
-    ts.add_argument("id", help="Track id")
-    ts.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    ts.set_defaults(func=tracks_show_cmd)
-
-    tt = tgs.add_parser("stats", help="Track library stats")
-    tt.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    tt.set_defaults(func=tracks_stats_cmd)
-
-    to = tgs.add_parser("open", help="Open a track audio file (preview or full)")
-    to.add_argument("id", help="Track id")
-    to.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    to.add_argument("--full", action="store_true", help="Open full_path (default: preview_path)")
-    to.set_defaults(func=tracks_open_cmd)
-
-    tr = tgs.add_parser("reveal", help="Reveal a track file in your file manager (preview or full)")
-    tr.add_argument("id", help="Track id")
-    tr.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    tr.add_argument("--full", action="store_true", help="Reveal full_path (default: preview_path)")
-    tr.set_defaults(func=tracks_reveal_cmd)
-
-    te = tgs.add_parser("export", help="Export tracks (CSV to stdout by default)")
-    te.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-    te.add_argument("--json", action="store_true", help="Output JSON instead of CSV")
-    te.set_defaults(func=tracks_export_cmd)
-
-    # run-daily
-    rd = sub.add_parser("run-daily", help="Run the daily generation → store → promote pipeline")
-    rd.set_defaults(func=run_daily)
-
-    # playlist builder
-    p = sub.add_parser("playlist", help="Build an auto-playlist JSON from existing tracks")
-    p.add_argument("--name", default="Auto Playlist", help="Playlist display name")
-    p.add_argument("--slug", default="auto_playlist", help="Filename slug (no extension)")
-    p.add_argument("--context", default=None, help="Preset context: focus|workout|sleep")
-    p.add_argument("--mood", default=None, help="Filter mood (exact match)")
-    p.add_argument("--genre", default=None, help="Filter genre (exact match)")
-    p.add_argument("--minutes", type=int, default=20, help="Target playlist length in minutes")
-    p.add_argument("--bpm-min", dest="bpm_min", type=int, default=None)
-    p.add_argument("--bpm-max", dest="bpm_max", type=int, default=None)
-    p.add_argument("--seed", type=int, default=1, help="Shuffle seed")
-    p.add_argument("--lookback", type=int, default=3, help="Avoid tracks used in last N playlists")
-    p.set_defaults(func=playlist_cmd)
-
-    args = parser.parse_args()
-
-    func = getattr(args, "func", None)
-    if callable(func):
-        return func(args)
-
-    parser.print_help()
-    return 2
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
