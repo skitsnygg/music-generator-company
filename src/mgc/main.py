@@ -4,9 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +18,30 @@ except Exception:
     setup_logging = None  # type: ignore
 
 from mgc.analytics_cli import register_analytics_subcommand
+from mgc.events import EventContext, EventWriter, new_run_id
+from mgc.db_helpers import (
+    NotFoundError,
+    PlaylistRow,
+    ResolvedRef,
+    TrackRow,
+    compute_diff,
+    db_build_playlist_json,
+    db_duration_for_tracks,
+    db_get_playlist,
+    db_get_track,
+    db_insert_playlist_run,
+    db_list_events,  # <-- FIX: import events helper
+    db_list_playlist_runs,
+    db_list_playlists,
+    db_list_playlists_by_slug,
+    db_list_tracks,
+    db_playlist_track_ids,
+    db_tracks_stats,
+    ensure_playlist_runs_table,
+    resolve_ref,
+    resolve_json_path,
+    sqlite_connect,
+)
 
 
 # ----------------------------
@@ -61,6 +83,79 @@ def ensure_requests() -> Any:
         die("Missing dependency: requests. Install with: pip install requests")
 
 
+def cmd_name(args: argparse.Namespace) -> str:
+    parts: List[str] = []
+    if getattr(args, "cmd", None):
+        parts.append(str(args.cmd))
+    if getattr(args, "db_cmd", None):
+        parts.append(str(args.db_cmd))
+    if getattr(args, "playlists_cmd", None):
+        parts.append(str(args.playlists_cmd))
+    if getattr(args, "tracks_cmd", None):
+        parts.append(str(args.tracks_cmd))
+    if getattr(args, "analytics_cmd", None):
+        parts.append(str(args.analytics_cmd))
+    if getattr(args, "events_cmd", None):  # <-- FIX: include events subcommand in command name
+        parts.append(str(args.events_cmd))
+    return " ".join(parts) if parts else "unknown"
+
+
+def events_list_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        rows = db_list_events(
+            conn,
+            limit=args.limit,
+            run_id=args.run_id,
+            event_type=args.event_type,
+        )
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+
+    if not rows:
+        print("(no events)")
+        return 0
+
+    for r in rows:
+        ts = r["occurred_at"]
+        et = r["event_type"]
+        ent = f"{r['entity_type']}:{r['entity_id']}" if r["entity_id"] else r["entity_type"]
+        print(f"{ts}  {et:<28}  {ent}  run={r['run_id']}")
+    return 0
+
+
+def _jsonable(x: Any) -> Any:
+    if x is None or isinstance(x, (str, int, float, bool)):
+        return x
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, dict):
+        out: Dict[str, Any] = {}
+        for k, v in x.items():
+            if k == "func":
+                continue
+            out[str(k)] = _jsonable(v)
+        return out
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, (set, frozenset)):
+        return sorted([_jsonable(v) for v in x])
+    if callable(x):
+        return getattr(x, "__name__", "<callable>")
+    return str(x)
+
+
+def args_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    # IMPORTANT: argparse stores the handler function at args.func; exclude it for determinism.
+    d = vars(args).copy()
+    d.pop("func", None)
+    return _jsonable(d)
+
+
 # ----------------------------
 # export layout
 # ----------------------------
@@ -79,555 +174,6 @@ def export_filename(playlist_id: str, slug: Optional[str] = None) -> str:
     if slug:
         return f"{safe_slug(slug)}_{playlist_id}.json"
     return f"{playlist_id}.json"
-
-
-# ----------------------------
-# DB access (your schema)
-# ----------------------------
-
-def sqlite_connect(db_path: str) -> sqlite3.Connection:
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception as ex:
-        die(f"Failed to open SQLite DB at {db_path}: {ex}")
-
-
-def ensure_playlist_runs_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS playlist_runs (
-          id TEXT PRIMARY KEY,
-          created_at TEXT NOT NULL,
-          playlist_id TEXT NOT NULL,
-          seed INTEGER,
-          track_ids_json TEXT NOT NULL,
-          export_path TEXT,
-          notes TEXT
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_playlist_runs_playlist_id ON playlist_runs(playlist_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_playlist_runs_created_at ON playlist_runs(created_at)")
-    conn.commit()
-
-
-@dataclass(frozen=True)
-class PlaylistRow:
-    id: str
-    created_at: str
-    slug: str
-    name: str
-    context: Optional[str]
-    mood: Optional[str]
-    genre: Optional[str]
-    target_minutes: int
-    seed: int
-    track_count: int
-    total_duration_sec: int
-    json_path: str
-
-
-@dataclass(frozen=True)
-class TrackRow:
-    id: str
-    created_at: str
-    title: str
-    mood: str
-    genre: str
-    bpm: int
-    duration_sec: float
-    full_path: str
-    preview_path: str
-    status: str
-
-
-@dataclass(frozen=True)
-class PlaylistRunRow:
-    id: str
-    created_at: str
-    playlist_id: str
-    seed: Optional[int]
-    track_ids: List[str]
-    export_path: Optional[str]
-    notes: Optional[str]
-
-
-def db_list_playlists(conn: sqlite3.Connection, limit: int) -> List[PlaylistRow]:
-    sql = """
-    SELECT
-      id, created_at, slug, name, context, mood, genre,
-      target_minutes, seed, track_count, total_duration_sec, json_path
-    FROM playlists
-    ORDER BY created_at DESC
-    LIMIT ?
-    """
-    rows = conn.execute(sql, (limit,)).fetchall()
-    out: List[PlaylistRow] = []
-    for r in rows:
-        out.append(
-            PlaylistRow(
-                id=str(r["id"]),
-                created_at=str(r["created_at"]),
-                slug=str(r["slug"]),
-                name=str(r["name"]),
-                context=(str(r["context"]) if r["context"] is not None else None),
-                mood=(str(r["mood"]) if r["mood"] is not None else None),
-                genre=(str(r["genre"]) if r["genre"] is not None else None),
-                target_minutes=int(r["target_minutes"]),
-                seed=int(r["seed"]),
-                track_count=int(r["track_count"]),
-                total_duration_sec=int(r["total_duration_sec"]),
-                json_path=str(r["json_path"]),
-            )
-        )
-    return out
-
-
-def db_get_playlist(conn: sqlite3.Connection, playlist_id: str) -> PlaylistRow:
-    sql = """
-    SELECT
-      id, created_at, slug, name, context, mood, genre,
-      target_minutes, seed, track_count, total_duration_sec, json_path
-    FROM playlists
-    WHERE id = ?
-    LIMIT 1
-    """
-    r = conn.execute(sql, (playlist_id,)).fetchone()
-    if not r:
-        die(f"Playlist not found: {playlist_id}")
-    return PlaylistRow(
-        id=str(r["id"]),
-        created_at=str(r["created_at"]),
-        slug=str(r["slug"]),
-        name=str(r["name"]),
-        context=(str(r["context"]) if r["context"] is not None else None),
-        mood=(str(r["mood"]) if r["mood"] is not None else None),
-        genre=(str(r["genre"]) if r["genre"] is not None else None),
-        target_minutes=int(r["target_minutes"]),
-        seed=int(r["seed"]),
-        track_count=int(r["track_count"]),
-        total_duration_sec=int(r["total_duration_sec"]),
-        json_path=str(r["json_path"]),
-    )
-
-
-def db_list_playlists_by_slug(conn: sqlite3.Connection, slug: str, limit: int) -> List[PlaylistRow]:
-    sql = """
-    SELECT
-      id, created_at, slug, name, context, mood, genre,
-      target_minutes, seed, track_count, total_duration_sec, json_path
-    FROM playlists
-    WHERE slug = ?
-    ORDER BY created_at DESC
-    LIMIT ?
-    """
-    rows = conn.execute(sql, (slug, int(limit))).fetchall()
-    out: List[PlaylistRow] = []
-    for r in rows:
-        out.append(
-            PlaylistRow(
-                id=str(r["id"]),
-                created_at=str(r["created_at"]),
-                slug=str(r["slug"]),
-                name=str(r["name"]),
-                context=(str(r["context"]) if r["context"] is not None else None),
-                mood=(str(r["mood"]) if r["mood"] is not None else None),
-                genre=(str(r["genre"]) if r["genre"] is not None else None),
-                target_minutes=int(r["target_minutes"]),
-                seed=int(r["seed"]),
-                track_count=int(r["track_count"]),
-                total_duration_sec=int(r["total_duration_sec"]),
-                json_path=str(r["json_path"]),
-            )
-        )
-    return out
-
-
-def resolve_json_path(json_path: str) -> Path:
-    p = Path(json_path)
-    if p.is_absolute():
-        return p
-    return Path.cwd() / p
-
-
-def db_playlist_track_ids(conn: sqlite3.Connection, playlist_id: str) -> List[str]:
-    rows = conn.execute(
-        """
-        SELECT track_id
-        FROM playlist_items
-        WHERE playlist_id = ?
-        ORDER BY position ASC
-        """,
-        (playlist_id,),
-    ).fetchall()
-    return [str(r["track_id"]) for r in rows]
-
-
-def db_build_playlist_json(conn: sqlite3.Connection, pl: PlaylistRow) -> Dict[str, Any]:
-    sql = """
-    SELECT
-      pi.position,
-      t.id AS track_id,
-      t.title,
-      t.mood,
-      t.genre,
-      t.bpm,
-      t.duration_sec,
-      t.full_path,
-      t.preview_path,
-      t.status,
-      t.created_at
-    FROM playlist_items pi
-    JOIN tracks t ON t.id = pi.track_id
-    WHERE pi.playlist_id = ?
-    ORDER BY pi.position ASC
-    """
-    rows = conn.execute(sql, (pl.id,)).fetchall()
-
-    tracks: List[Dict[str, Any]] = []
-    for r in rows:
-        tracks.append(
-            {
-                "id": str(r["track_id"]),
-                "title": str(r["title"]),
-                "mood": str(r["mood"]),
-                "genre": str(r["genre"]),
-                "bpm": int(r["bpm"]),
-                "duration_sec": float(r["duration_sec"]),
-                "full_path": str(r["full_path"]),
-                "preview_path": str(r["preview_path"]),
-                "status": str(r["status"]),
-                "created_at": str(r["created_at"]),
-                "position": int(r["position"]),
-            }
-        )
-
-    return {
-        "id": pl.id,
-        "created_at": pl.created_at,
-        "slug": pl.slug,
-        "name": pl.name,
-        "context": pl.context,
-        "mood": pl.mood,
-        "genre": pl.genre,
-        "target_minutes": pl.target_minutes,
-        "seed": pl.seed,
-        "track_count": pl.track_count,
-        "total_duration_sec": pl.total_duration_sec,
-        "json_path": pl.json_path,
-        "tracks": tracks,
-        "built_from_db_at": now_iso(),
-    }
-
-
-def db_list_tracks(
-    conn: sqlite3.Connection,
-    limit: int,
-    mood: Optional[str],
-    genre: Optional[str],
-    status: Optional[str],
-    bpm_min: Optional[int],
-    bpm_max: Optional[int],
-    q: Optional[str],
-) -> List[TrackRow]:
-    where: List[str] = []
-    params: List[Any] = []
-
-    if mood:
-        where.append("mood = ?")
-        params.append(mood)
-    if genre:
-        where.append("genre = ?")
-        params.append(genre)
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    if bpm_min is not None:
-        where.append("bpm >= ?")
-        params.append(int(bpm_min))
-    if bpm_max is not None:
-        where.append("bpm <= ?")
-        params.append(int(bpm_max))
-    if q:
-        where.append("title LIKE ?")
-        params.append(f"%{q}%")
-
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    sql = f"""
-    SELECT id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status
-    FROM tracks
-    {where_sql}
-    ORDER BY created_at DESC
-    LIMIT ?
-    """
-    params.append(int(limit))
-
-    rows = conn.execute(sql, tuple(params)).fetchall()
-    out: List[TrackRow] = []
-    for r in rows:
-        out.append(
-            TrackRow(
-                id=str(r["id"]),
-                created_at=str(r["created_at"]),
-                title=str(r["title"]),
-                mood=str(r["mood"]),
-                genre=str(r["genre"]),
-                bpm=int(r["bpm"]),
-                duration_sec=float(r["duration_sec"]),
-                full_path=str(r["full_path"]),
-                preview_path=str(r["preview_path"]),
-                status=str(r["status"]),
-            )
-        )
-    return out
-
-
-def db_get_track(conn: sqlite3.Connection, track_id: str) -> TrackRow:
-    sql = """
-    SELECT id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status
-    FROM tracks
-    WHERE id = ?
-    LIMIT 1
-    """
-    r = conn.execute(sql, (track_id,)).fetchone()
-    if not r:
-        die(f"Track not found: {track_id}")
-    return TrackRow(
-        id=str(r["id"]),
-        created_at=str(r["created_at"]),
-        title=str(r["title"]),
-        mood=str(r["mood"]),
-        genre=str(r["genre"]),
-        bpm=int(r["bpm"]),
-        duration_sec=float(r["duration_sec"]),
-        full_path=str(r["full_path"]),
-        preview_path=str(r["preview_path"]),
-        status=str(r["status"]),
-    )
-
-
-def db_tracks_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
-    total = conn.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()["n"]
-
-    moods = conn.execute("SELECT mood, COUNT(*) AS n FROM tracks GROUP BY mood ORDER BY n DESC").fetchall()
-    genres = conn.execute("SELECT genre, COUNT(*) AS n FROM tracks GROUP BY genre ORDER BY n DESC").fetchall()
-    statuses = conn.execute("SELECT status, COUNT(*) AS n FROM tracks GROUP BY status ORDER BY n DESC").fetchall()
-
-    bpm = conn.execute("SELECT MIN(bpm) AS min_bpm, MAX(bpm) AS max_bpm, AVG(bpm) AS avg_bpm FROM tracks").fetchone()
-    dur = conn.execute(
-        "SELECT MIN(duration_sec) AS min_dur, MAX(duration_sec) AS max_dur, AVG(duration_sec) AS avg_dur FROM tracks"
-    ).fetchone()
-
-    return {
-        "total_tracks": int(total),
-        "moods": [{"mood": str(r["mood"]), "count": int(r["n"])} for r in moods],
-        "genres": [{"genre": str(r["genre"]), "count": int(r["n"])} for r in genres],
-        "statuses": [{"status": str(r["status"]), "count": int(r["n"])} for r in statuses],
-        "bpm": {
-            "min": int(bpm["min_bpm"]) if bpm["min_bpm"] is not None else None,
-            "max": int(bpm["max_bpm"]) if bpm["max_bpm"] is not None else None,
-            "avg": float(bpm["avg_bpm"]) if bpm["avg_bpm"] is not None else None,
-        },
-        "duration_sec": {
-            "min": float(dur["min_dur"]) if dur["min_dur"] is not None else None,
-            "max": float(dur["max_dur"]) if dur["max_dur"] is not None else None,
-            "avg": float(dur["avg_dur"]) if dur["avg_dur"] is not None else None,
-        },
-    }
-
-
-def db_duration_for_tracks(conn: sqlite3.Connection, track_ids: List[str]) -> float:
-    if not track_ids:
-        return 0.0
-    total = 0.0
-    chunk_size = 900
-    for i in range(0, len(track_ids), chunk_size):
-        chunk = track_ids[i : i + chunk_size]
-        qmarks = ",".join(["?"] * len(chunk))
-        row = conn.execute(
-            f"SELECT SUM(duration_sec) AS s FROM tracks WHERE id IN ({qmarks})",
-            tuple(chunk),
-        ).fetchone()
-        total += float(row["s"] or 0.0)
-    return total
-
-
-# ----------------------------
-# playlist_runs
-# ----------------------------
-
-def db_record_playlist_run(
-    conn: sqlite3.Connection,
-    playlist_id: str,
-    seed: Optional[int],
-    track_ids: List[str],
-    export_path: Optional[Path],
-    notes: Optional[str],
-) -> str:
-    ensure_playlist_runs_table(conn)
-    run_id = str(uuid.uuid4())
-    conn.execute(
-        """
-        INSERT INTO playlist_runs (id, created_at, playlist_id, seed, track_ids_json, export_path, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            now_iso(),
-            playlist_id,
-            int(seed) if seed is not None else None,
-            json.dumps(track_ids, ensure_ascii=False),
-            str(export_path) if export_path is not None else None,
-            notes,
-        ),
-    )
-    conn.commit()
-    return run_id
-
-
-def db_list_playlist_runs(conn: sqlite3.Connection, playlist_id: str, limit: int) -> List[PlaylistRunRow]:
-    ensure_playlist_runs_table(conn)
-    rows = conn.execute(
-        """
-        SELECT id, created_at, playlist_id, seed, track_ids_json, export_path, notes
-        FROM playlist_runs
-        WHERE playlist_id = ?
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (playlist_id, int(limit)),
-    ).fetchall()
-
-    out: List[PlaylistRunRow] = []
-    for r in rows:
-        try:
-            track_ids = json.loads(str(r["track_ids_json"]))
-            if not isinstance(track_ids, list):
-                track_ids = []
-            track_ids = [str(x) for x in track_ids]
-        except Exception:
-            track_ids = []
-
-        out.append(
-            PlaylistRunRow(
-                id=str(r["id"]),
-                created_at=str(r["created_at"]),
-                playlist_id=str(r["playlist_id"]),
-                seed=(int(r["seed"]) if r["seed"] is not None else None),
-                track_ids=track_ids,
-                export_path=(str(r["export_path"]) if r["export_path"] is not None else None),
-                notes=(str(r["notes"]) if r["notes"] is not None else None),
-            )
-        )
-    return out
-
-
-def db_get_playlist_run(conn: sqlite3.Connection, run_id: str) -> Optional[PlaylistRunRow]:
-    ensure_playlist_runs_table(conn)
-    r = conn.execute(
-        """
-        SELECT id, created_at, playlist_id, seed, track_ids_json, export_path, notes
-        FROM playlist_runs
-        WHERE id = ?
-        LIMIT 1
-        """,
-        (run_id,),
-    ).fetchone()
-    if not r:
-        return None
-
-    try:
-        track_ids = json.loads(str(r["track_ids_json"]))
-        if not isinstance(track_ids, list):
-            track_ids = []
-        track_ids = [str(x) for x in track_ids]
-    except Exception:
-        track_ids = []
-
-    return PlaylistRunRow(
-        id=str(r["id"]),
-        created_at=str(r["created_at"]),
-        playlist_id=str(r["playlist_id"]),
-        seed=(int(r["seed"]) if r["seed"] is not None else None),
-        track_ids=track_ids,
-        export_path=(str(r["export_path"]) if r["export_path"] is not None else None),
-        notes=(str(r["notes"]) if r["notes"] is not None else None),
-    )
-
-
-# ----------------------------
-# history/diff helpers
-# ----------------------------
-
-@dataclass(frozen=True)
-class ResolvedRef:
-    kind: str  # "run" or "playlist"
-    id: str    # run_id or playlist_id
-    created_at: str
-    playlist_id: str
-    seed: Optional[int]
-    track_ids: List[str]
-
-
-def resolve_ref(conn: sqlite3.Connection, ref: str) -> ResolvedRef:
-    """
-    Accept either:
-    - playlist_runs.id (run id)
-    - playlists.id (playlist id)
-    """
-    run = db_get_playlist_run(conn, ref)
-    if run is not None:
-        return ResolvedRef(
-            kind="run",
-            id=run.id,
-            created_at=run.created_at,
-            playlist_id=run.playlist_id,
-            seed=run.seed,
-            track_ids=run.track_ids,
-        )
-
-    # fallback to playlists table (playlist id)
-    pl = db_get_playlist(conn, ref)
-    track_ids = db_playlist_track_ids(conn, pl.id)
-    return ResolvedRef(
-        kind="playlist",
-        id=pl.id,
-        created_at=pl.created_at,
-        playlist_id=pl.id,
-        seed=pl.seed,
-        track_ids=track_ids,
-    )
-
-
-def compute_diff(a_ids: List[str], b_ids: List[str]) -> Dict[str, Any]:
-    a_set = set(a_ids)
-    b_set = set(b_ids)
-
-    added = [tid for tid in b_ids if tid not in a_set]
-    removed = [tid for tid in a_ids if tid not in b_set]
-
-    a_pos = {tid: i for i, tid in enumerate(a_ids)}
-    b_pos = {tid: i for i, tid in enumerate(b_ids)}
-    moved: List[Dict[str, Any]] = []
-    for tid in b_ids:
-        if tid in a_pos and tid in b_pos and a_pos[tid] != b_pos[tid]:
-            moved.append({"track_id": tid, "from": a_pos[tid], "to": b_pos[tid]})
-
-    return {
-        "added": added,
-        "removed": removed,
-        "moved": moved,
-        "counts": {
-            "a": len(a_ids),
-            "b": len(b_ids),
-            "added": len(added),
-            "removed": len(removed),
-            "moved": len(moved),
-            "same_set": len(a_set & b_set),
-        },
-    }
 
 
 # ----------------------------
@@ -688,77 +234,15 @@ def push_webhook(src_path: Path, url: str, timeout_s: int, dry_run: bool) -> Pus
 
 
 # ----------------------------
-# commands
+# playlist export helpers
 # ----------------------------
 
-def db_schema_cmd(args: argparse.Namespace) -> int:
-    conn = sqlite_connect(args.db)
-    try:
-        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        tables = [r["name"] for r in cur.fetchall()]
-        for t in tables:
-            print(t)
-            info = conn.execute(f"PRAGMA table_info({t})").fetchall()
-            for r in info:
-                name = r["name"]
-                ctype = r["type"] or ""
-                pk = " pk" if r["pk"] else ""
-                nn = " notnull" if r["notnull"] else ""
-                print(f"  - {name} {ctype}{pk}{nn}")
-        return 0
-    finally:
-        conn.close()
-
-
-def playlists_list_cmd(args: argparse.Namespace) -> int:
-    conn = sqlite_connect(args.db)
-    try:
-        pls = db_list_playlists(conn, limit=args.limit)
-    finally:
-        conn.close()
-
-    if args.json:
-        print(json.dumps([pl.__dict__ for pl in pls], indent=2, ensure_ascii=False))
-        return 0
-
-    if not pls:
-        print("(no playlists)")
-        return 0
-
-    for i, pl in enumerate(pls, 1):
-        print(f"{i:>2}. {pl.id}  {pl.slug}  {pl.created_at}  tracks={pl.track_count}  json_path={pl.json_path}")
-    return 0
-
-
-def playlists_reveal_cmd(args: argparse.Namespace) -> int:
-    conn = sqlite_connect(args.db)
-    try:
-        pl = db_get_playlist(conn, args.id)
-
-        if args.build:
-            obj = db_build_playlist_json(conn, pl)
-            print(json.dumps(obj, indent=2, ensure_ascii=False))
-            return 0
-
-        jp = resolve_json_path(pl.json_path)
-        if jp.exists():
-            obj = read_json_file(jp)
-            print(json.dumps(obj, indent=2, ensure_ascii=False))
-            return 0
-
-        obj = db_build_playlist_json(conn, pl)
-        print(json.dumps(obj, indent=2, ensure_ascii=False))
-        return 0
-    finally:
-        conn.close()
-
-
-def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: Path, build: bool) -> Path:
+def export_one_playlist(conn, pl: PlaylistRow, export_dir: Path, build: bool) -> Path:
     export_dir.mkdir(parents=True, exist_ok=True)
     out_path = export_dir / export_filename(pl.id, pl.slug)
 
     if build:
-        obj = db_build_playlist_json(conn, pl)
+        obj = db_build_playlist_json(conn, pl, built_at=now_iso())
         obj.setdefault("exported_at", now_iso())
         write_json_file(out_path, obj)
         return out_path
@@ -775,14 +259,15 @@ def export_one_playlist(conn: sqlite3.Connection, pl: PlaylistRow, export_dir: P
             out_path.write_bytes(src.read_bytes())
         return out_path
 
-    obj = db_build_playlist_json(conn, pl)
+    obj = db_build_playlist_json(conn, pl, built_at=now_iso())
     obj.setdefault("exported_at", now_iso())
     write_json_file(out_path, obj)
     return out_path
 
 
 def maybe_record_run(
-    conn: sqlite3.Connection,
+    conn,
+    ew: Optional[EventWriter],
     pl: PlaylistRow,
     export_path: Path,
     record: bool,
@@ -790,10 +275,13 @@ def maybe_record_run(
 ) -> Optional[str]:
     if not record:
         return None
+
     ensure_playlist_runs_table(conn)
     track_ids = db_playlist_track_ids(conn, pl.id)
-    return db_record_playlist_run(
+
+    rid = db_insert_playlist_run(
         conn=conn,
+        created_at=now_iso(),
         playlist_id=pl.id,
         seed=pl.seed,
         track_ids=track_ids,
@@ -801,38 +289,259 @@ def maybe_record_run(
         notes=notes,
     )
 
+    if ew:
+        ew.emit(
+            "playlist.run_recorded",
+            "playlist",
+            pl.id,
+            {
+                "playlist_id": pl.id,
+                "slug": pl.slug,
+                "run_id": rid,
+                "seed": pl.seed,
+                "track_count": len(track_ids),
+                "export_path": str(export_path),
+                "notes": notes,
+            },
+            occurred_at=now_iso(),
+        )
+    return rid
 
-def playlists_export_cmd(args: argparse.Namespace) -> int:
-    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
+
+# ----------------------------
+# commands
+# ----------------------------
+
+def db_schema_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
     try:
-        if args.id:
-            pl = db_get_playlist(conn, args.id)
-            out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
-            run_id = maybe_record_run(conn, pl, out_path, record=not args.no_record, notes=args.notes)
-            if args.json:
-                print(json.dumps({"exported": str(out_path), "run_id": run_id}, indent=2, ensure_ascii=False))
-            else:
-                print(str(out_path))
-                if run_id:
-                    print(f"Recorded run: {run_id}")
-            return 0
+        with conn:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = [r["name"] for r in cur.fetchall()]
+            for t in tables:
+                print(t)
+                info = conn.execute(f"PRAGMA table_info({t})").fetchall()
+                for r in info:
+                    name = r["name"]
+                    ctype = r["type"] or ""
+                    pk = " pk" if r["pk"] else ""
+                    nn = " notnull" if r["notnull"] else ""
+                    print(f"  - {name} {ctype}{pk}{nn}")
 
-        pls = db_list_playlists(conn, limit=args.limit)
-        if not pls:
-            die("No playlists found to export.")
+        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+        return 0
 
-        out_paths: List[str] = []
-        run_ids: List[str] = []
-        for pl in pls:
-            out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
-            out_paths.append(str(out_path))
-            rid = maybe_record_run(conn, pl, out_path, record=not args.no_record, notes=args.notes)
-            if rid:
-                run_ids.append(rid)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
+    finally:
+        conn.close()
+
+
+def playlists_list_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
+    conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
+    try:
+        with conn:
+            pls = db_list_playlists(conn, limit=args.limit)
 
         if args.json:
-            print(json.dumps({"exported": out_paths, "run_ids": run_ids}, indent=2, ensure_ascii=False))
+            print(json.dumps([pl.__dict__ for pl in pls], indent=2, ensure_ascii=False))
+        else:
+            if not pls:
+                print("(no playlists)")
+            else:
+                for i, pl in enumerate(pls, 1):
+                    print(f"{i:>2}. {pl.id}  {pl.slug}  {pl.created_at}  tracks={pl.track_count}  json_path={pl.json_path}")
+
+        ew.emit(
+            "system.command_completed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": True, "result_count": len(pls)},
+            occurred_at=now_iso(),
+        )
+        return 0
+
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
+    finally:
+        conn.close()
+
+
+def playlists_reveal_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
+    conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
+    try:
+        with conn:
+            pl = db_get_playlist(conn, args.id)
+
+            if args.build:
+                obj = db_build_playlist_json(conn, pl, built_at=now_iso())
+                print(json.dumps(obj, indent=2, ensure_ascii=False))
+                ew.emit(
+                    "playlist.built_from_db",
+                    "playlist",
+                    pl.id,
+                    {"playlist_id": pl.id, "slug": pl.slug, "track_count": len(obj.get("tracks", []))},
+                    occurred_at=now_iso(),
+                )
+                ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+                return 0
+
+            jp = resolve_json_path(pl.json_path)
+            if jp.exists():
+                obj = read_json_file(jp)
+                print(json.dumps(obj, indent=2, ensure_ascii=False))
+                ew.emit(
+                    "playlist.revealed",
+                    "playlist",
+                    pl.id,
+                    {"playlist_id": pl.id, "slug": pl.slug, "source": "json_path", "path": str(jp)},
+                    occurred_at=now_iso(),
+                )
+                ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+                return 0
+
+            obj = db_build_playlist_json(conn, pl, built_at=now_iso())
+            print(json.dumps(obj, indent=2, ensure_ascii=False))
+            ew.emit(
+                "playlist.revealed",
+                "playlist",
+                pl.id,
+                {"playlist_id": pl.id, "slug": pl.slug, "source": "db_build"},
+                occurred_at=now_iso(),
+            )
+            ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+            return 0
+
+    except NotFoundError as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        die(str(e), 2)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
+    finally:
+        conn.close()
+
+
+def playlists_export_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
+    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
+
+    conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
+    try:
+        out_paths: List[str] = []
+        run_ids: List[str] = []
+
+        with conn:
+            if args.id:
+                pl = db_get_playlist(conn, args.id)
+                out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+                out_paths.append(str(out_path))
+
+                ew.emit(
+                    "playlist.exported",
+                    "playlist",
+                    pl.id,
+                    {"playlist_id": pl.id, "slug": pl.slug, "export_path": str(out_path), "build": bool(args.build), "out_dir": str(export_dir)},
+                    occurred_at=now_iso(),
+                )
+
+                rid = maybe_record_run(conn, ew, pl, out_path, record=not args.no_record, notes=args.notes)
+                if rid:
+                    run_ids.append(rid)
+
+            else:
+                pls = db_list_playlists(conn, limit=args.limit)
+                if not pls:
+                    die("No playlists found to export.")
+
+                for pl in pls:
+                    out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
+                    out_paths.append(str(out_path))
+
+                    ew.emit(
+                        "playlist.exported",
+                        "playlist",
+                        pl.id,
+                        {"playlist_id": pl.id, "slug": pl.slug, "export_path": str(out_path), "build": bool(args.build), "out_dir": str(export_dir)},
+                        occurred_at=now_iso(),
+                    )
+
+                    rid = maybe_record_run(conn, ew, pl, out_path, record=not args.no_record, notes=args.notes)
+                    if rid:
+                        run_ids.append(rid)
+
+        if args.json:
+            payload: Dict[str, Any] = {"exported": out_paths}
+            if args.id:
+                payload["run_id"] = (run_ids[0] if run_ids else None)
+            else:
+                payload["run_ids"] = run_ids
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             for pth in out_paths:
                 print(pth)
@@ -840,94 +549,176 @@ def playlists_export_cmd(args: argparse.Namespace) -> int:
                 print("Recorded runs:")
                 for rid in run_ids:
                     print(f"  {rid}")
+
+        ew.emit(
+            "system.command_completed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": True, "exported_count": len(out_paths), "recorded_runs": len(run_ids)},
+            occurred_at=now_iso(),
+        )
         return 0
+
+    except NotFoundError as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        die(str(e), 2)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
 
 
 def playlists_history_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
-    try:
-        ensure_playlist_runs_table(conn)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
 
-        # First: explicit runs
-        runs = db_list_playlist_runs(conn, args.playlist_id, limit=args.limit)
-        if runs:
-            if args.json:
+    try:
+        with conn:
+            ensure_playlist_runs_table(conn)
+
+            runs = db_list_playlist_runs(conn, args.playlist_id, limit=args.limit)
+            if runs:
+                if args.json:
+                    print(
+                        json.dumps(
+                            [
+                                {
+                                    "kind": "run",
+                                    "id": r.id,
+                                    "created_at": r.created_at,
+                                    "playlist_id": r.playlist_id,
+                                    "seed": r.seed,
+                                    "track_count": len(r.track_ids),
+                                    "export_path": r.export_path,
+                                    "notes": r.notes,
+                                }
+                                for r in runs
+                            ],
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    for i, r in enumerate(runs, 1):
+                        ep = r.export_path or ""
+                        notes = (r.notes or "").strip()
+                        notes_s = (notes[:60] + "…") if len(notes) > 60 else notes
+                        print(f"{i:>2}. RUN {r.id}  {r.created_at}  seed={r.seed}  tracks={len(r.track_ids)}  {ep}  {notes_s}")
+
+                ew.emit(
+                    "system.command_completed",
+                    "system",
+                    None,
+                    {"command": cmd_name(args), "ok": True, "mode": "playlist_runs", "count": len(runs)},
+                    occurred_at=now_iso(),
+                )
+                return 0
+
+            pl = db_get_playlist(conn, args.playlist_id)
+            peers = db_list_playlists_by_slug(conn, pl.slug, limit=args.limit)
+
+        if args.json:
+            with conn:
                 print(
                     json.dumps(
                         [
                             {
-                                "kind": "run",
-                                "id": r.id,
-                                "created_at": r.created_at,
-                                "playlist_id": r.playlist_id,
-                                "seed": r.seed,
-                                "track_count": len(r.track_ids),
-                                "export_path": r.export_path,
-                                "notes": r.notes,
+                                "kind": "playlist",
+                                "id": p.id,
+                                "created_at": p.created_at,
+                                "playlist_id": p.id,
+                                "seed": p.seed,
+                                "track_count": len(db_playlist_track_ids(conn, p.id)),
+                                "slug": p.slug,
                             }
-                            for r in runs
+                            for p in peers
                         ],
                         indent=2,
                         ensure_ascii=False,
                     )
                 )
-                return 0
+        else:
+            print("(no recorded runs in playlist_runs; showing implicit history from playlists table by slug)")
+            with conn:
+                for i, p in enumerate(peers, 1):
+                    tc = len(db_playlist_track_ids(conn, p.id))
+                    print(f"{i:>2}. PL  {p.id}  {p.created_at}  seed={p.seed}  tracks={tc}  slug={p.slug}")
 
-            for i, r in enumerate(runs, 1):
-                ep = r.export_path or ""
-                notes = (r.notes or "").strip()
-                notes_s = (notes[:60] + "…") if len(notes) > 60 else notes
-                print(f"{i:>2}. RUN {r.id}  {r.created_at}  seed={r.seed}  tracks={len(r.track_ids)}  {ep}  {notes_s}")
-            return 0
-
-        # Fallback: implicit runs by slug
-        pl = db_get_playlist(conn, args.playlist_id)
-        peers = db_list_playlists_by_slug(conn, pl.slug, limit=args.limit)
-
-        if args.json:
-            print(
-                json.dumps(
-                    [
-                        {
-                            "kind": "playlist",
-                            "id": p.id,
-                            "created_at": p.created_at,
-                            "playlist_id": p.id,
-                            "seed": p.seed,
-                            "track_count": len(db_playlist_track_ids(conn, p.id)),
-                            "slug": p.slug,
-                        }
-                        for p in peers
-                    ],
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-            return 0
-
-        print("(no recorded runs in playlist_runs; showing implicit history from playlists table by slug)")
-        for i, p in enumerate(peers, 1):
-            tc = len(db_playlist_track_ids(conn, p.id))
-            print(f"{i:>2}. PL  {p.id}  {p.created_at}  seed={p.seed}  tracks={tc}  slug={p.slug}")
+        ew.emit(
+            "system.command_completed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": True, "mode": "slug_history", "count": len(peers)},
+            occurred_at=now_iso(),
+        )
         return 0
+
+    except NotFoundError as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        die(str(e), 2)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
 
 
 def playlists_diff_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
     try:
-        ensure_playlist_runs_table(conn)
+        with conn:
+            ensure_playlist_runs_table(conn)
 
-        a = resolve_ref(conn, args.a)
-        b = resolve_ref(conn, args.b)
+            a: ResolvedRef = resolve_ref(conn, args.a)
+            b: ResolvedRef = resolve_ref(conn, args.b)
 
-        diff = compute_diff(a.track_ids, b.track_ids)
+            diff = compute_diff(a.track_ids, b.track_ids)
 
-        a_dur = db_duration_for_tracks(conn, a.track_ids)
-        b_dur = db_duration_for_tracks(conn, b.track_ids)
+            a_dur = db_duration_for_tracks(conn, a.track_ids)
+            b_dur = db_duration_for_tracks(conn, b.track_ids)
 
         if args.json:
             print(
@@ -942,31 +733,51 @@ def playlists_diff_cmd(args: argparse.Namespace) -> int:
                     ensure_ascii=False,
                 )
             )
-            return 0
+        else:
+            print(f"A: {a.kind.upper()} {a.id}  created={a.created_at}  seed={a.seed}  tracks={len(a.track_ids)}")
+            print(f"B: {b.kind.upper()} {b.id}  created={b.created_at}  seed={b.seed}  tracks={len(b.track_ids)}")
+            print(f"Duration: A={a_dur:.1f}s  B={b_dur:.1f}s  Δ={(b_dur - a_dur):+.1f}s")
+            print(f"Added:   {len(diff['added'])}")
+            print(f"Removed: {len(diff['removed'])}")
+            print(f"Moved:   {len(diff['moved'])}")
 
-        print(f"A: {a.kind.upper()} {a.id}  created={a.created_at}  seed={a.seed}  tracks={len(a.track_ids)}")
-        print(f"B: {b.kind.upper()} {b.id}  created={b.created_at}  seed={b.seed}  tracks={len(b.track_ids)}")
-        print(f"Duration: A={a_dur:.1f}s  B={b_dur:.1f}s  Δ={(b_dur - a_dur):+.1f}s")
-        print(f"Added:   {len(diff['added'])}")
-        print(f"Removed: {len(diff['removed'])}")
-        print(f"Moved:   {len(diff['moved'])}")
+            if args.verbose:
+                if diff["added"]:
+                    print("\nADDED:")
+                    for tid in diff["added"]:
+                        print(f"  + {tid}")
+                if diff["removed"]:
+                    print("\nREMOVED:")
+                    for tid in diff["removed"]:
+                        print(f"  - {tid}")
+                if diff["moved"]:
+                    print("\nMOVED:")
+                    for m in diff["moved"][:200]:
+                        print(f"  ~ {m['track_id']}  {m['from']} -> {m['to']}")
+                    if len(diff["moved"]) > 200:
+                        print(f"  ... ({len(diff['moved']) - 200} more)")
 
-        if args.verbose:
-            if diff["added"]:
-                print("\nADDED:")
-                for tid in diff["added"]:
-                    print(f"  + {tid}")
-            if diff["removed"]:
-                print("\nREMOVED:")
-                for tid in diff["removed"]:
-                    print(f"  - {tid}")
-            if diff["moved"]:
-                print("\nMOVED:")
-                for m in diff["moved"][:200]:
-                    print(f"  ~ {m['track_id']}  {m['from']} -> {m['to']}")
-                if len(diff["moved"]) > 200:
-                    print(f"  ... ({len(diff['moved']) - 200} more)")
+        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
         return 0
+
+    except NotFoundError as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        die(str(e), 2)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
 
@@ -974,54 +785,134 @@ def playlists_diff_cmd(args: argparse.Namespace) -> int:
 # -------- tracks commands --------
 
 def tracks_list_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
     try:
-        rows = db_list_tracks(
-            conn,
-            limit=args.limit,
-            mood=args.mood,
-            genre=args.genre,
-            status=args.status,
-            bpm_min=args.bpm_min,
-            bpm_max=args.bpm_max,
-            q=args.q,
+        with conn:
+            rows = db_list_tracks(
+                conn,
+                limit=args.limit,
+                mood=args.mood,
+                genre=args.genre,
+                status=args.status,
+                bpm_min=args.bpm_min,
+                bpm_max=args.bpm_max,
+                q=args.q,
+            )
+
+        if args.json:
+            print(json.dumps([r.__dict__ for r in rows], indent=2, ensure_ascii=False))
+        else:
+            if not rows:
+                print("(no tracks)")
+            else:
+                for i, t in enumerate(rows, 1):
+                    print(f"{i:>2}. {t.id}  {t.title}  mood={t.mood} genre={t.genre} bpm={t.bpm} dur={t.duration_sec:.1f}s status={t.status}")
+
+        ew.emit(
+            "system.command_completed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": True, "result_count": len(rows)},
+            occurred_at=now_iso(),
         )
+        return 0
+
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
-
-    if args.json:
-        print(json.dumps([r.__dict__ for r in rows], indent=2, ensure_ascii=False))
-        return 0
-
-    if not rows:
-        print("(no tracks)")
-        return 0
-
-    for i, t in enumerate(rows, 1):
-        print(f"{i:>2}. {t.id}  {t.title}  mood={t.mood} genre={t.genre} bpm={t.bpm} dur={t.duration_sec:.1f}s status={t.status}")
-    return 0
 
 
 def tracks_show_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
     try:
-        t = db_get_track(conn, args.id)
+        with conn:
+            t: TrackRow = db_get_track(conn, args.id)
+
+        print(json.dumps(t.__dict__, indent=2, ensure_ascii=False))
+        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+        return 0
+
+    except NotFoundError as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        die(str(e), 2)
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
-
-    print(json.dumps(t.__dict__, indent=2, ensure_ascii=False))
-    return 0
 
 
 def tracks_stats_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
     conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+    ew.emit(
+        "system.command_started",
+        "system",
+        None,
+        {"command": cmd_name(args), "args": args_payload(args)},
+        occurred_at=now_iso(),
+    )
+
     try:
-        stats = db_tracks_stats(conn)
+        with conn:
+            stats = db_tracks_stats(conn)
+
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+        return 0
+
+    except Exception as e:
+        ew.emit(
+            "system.command_failed",
+            "system",
+            None,
+            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
+            occurred_at=now_iso(),
+        )
+        raise
     finally:
         conn.close()
-
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
-    return 0
 
 
 # ----------------------------
@@ -1110,8 +1001,20 @@ def build_parser() -> argparse.ArgumentParser:
     tt.add_argument("--db", default="data/db.sqlite")
     tt.set_defaults(func=tracks_stats_cmd)
 
-    # analytics (REGISTERED IN THE RIGHT PLACE)
+    # analytics
     register_analytics_subcommand(sub)
+
+    # events
+    eg = sub.add_parser("events", help="Event log inspection")
+    egs = eg.add_subparsers(dest="events_cmd", required=True)
+
+    el = egs.add_parser("list", help="List events")
+    el.add_argument("--db", default="data/db.sqlite")
+    el.add_argument("--limit", type=int, default=20)
+    el.add_argument("--run-id", default=None)
+    el.add_argument("--type", dest="event_type", default=None)
+    el.add_argument("--json", action="store_true")
+    el.set_defaults(func=events_list_cmd)
 
     return p
 
