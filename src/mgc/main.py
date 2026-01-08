@@ -310,12 +310,6 @@ def playlists_open_cmd(args) -> int:
 
 
 def playlists_reveal_cmd(args) -> int:
-    """
-    Reveal the playlist JSON file in the system file manager.
-    - macOS: open -R <file>
-    - Windows: explorer /select,<file>
-    - Linux: open containing folder (xdg-open <dir>)
-    """
     db = _open_db(args.db)
     try:
         r = db.execute("SELECT json_path FROM playlists WHERE id = ?", (args.id,)).fetchone()
@@ -342,6 +336,73 @@ def playlists_reveal_cmd(args) -> int:
             subprocess.check_call(["xdg-open", str(p.parent)])
 
         print(f"Revealed: {p}")
+        return 0
+    finally:
+        db.close()
+
+
+def playlists_export_cmd(args) -> int:
+    """
+    Export playlists to stdout.
+    - default: CSV
+    - --json: JSON
+    """
+    db = _open_db(args.db)
+    try:
+        rows = db.execute(
+            """
+            SELECT
+              id, created_at, slug, name, context, mood, genre,
+              bpm_min, bpm_max, target_minutes, seed,
+              track_count, total_duration_sec, json_path
+            FROM playlists
+            ORDER BY datetime(created_at) DESC
+            """
+        ).fetchall()
+
+        if bool(getattr(args, "json", False)):
+            out = [dict(r) for r in rows]
+            print(json.dumps({"playlists": out}, indent=2))
+            return 0
+
+        w = csv.writer(sys.stdout)
+        w.writerow(
+            [
+                "id",
+                "created_at",
+                "slug",
+                "name",
+                "context",
+                "mood",
+                "genre",
+                "bpm_min",
+                "bpm_max",
+                "target_minutes",
+                "seed",
+                "track_count",
+                "total_duration_sec",
+                "json_path",
+            ]
+        )
+        for r in rows:
+            w.writerow(
+                [
+                    r["id"],
+                    r["created_at"],
+                    r["slug"],
+                    r["name"],
+                    r["context"],
+                    r["mood"],
+                    r["genre"],
+                    r["bpm_min"],
+                    r["bpm_max"],
+                    r["target_minutes"],
+                    r["seed"],
+                    r["track_count"],
+                    r["total_duration_sec"],
+                    r["json_path"],
+                ]
+            )
         return 0
     finally:
         db.close()
@@ -602,6 +663,11 @@ def main() -> int:
     pl_reveal.add_argument("id", help="Playlist id")
     pl_reveal.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
     pl_reveal.set_defaults(func=playlists_reveal_cmd)
+
+    pl_export = pgs.add_parser("export", help="Export playlists (CSV to stdout by default)")
+    pl_export.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
+    pl_export.add_argument("--json", action="store_true", help="Output JSON instead of CSV")
+    pl_export.set_defaults(func=playlists_export_cmd)
 
     # tracks: inspect track library
     tg = sub.add_parser("tracks", help="Inspect track library")
