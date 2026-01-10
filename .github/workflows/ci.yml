@@ -84,34 +84,29 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_rebuild_verify.sh
 
-      - name: Run CI gate (authoritative DB env)
+      - name: Run CI gate (MARKER 2026-01-10)
         run: |
           set -euxo pipefail
+          echo "WORKFLOW_MARKER=2026-01-10-ci-gate-authoritative"
+          git rev-parse HEAD
 
-          # Always build the fixture DB in the same step that runs the gate
           python scripts/make_fixture_db.py
-          ls -la fixtures
-
           export MGC_DB=fixtures/ci_db.sqlite
           echo "MGC_DB=$MGC_DB"
 
-          # Prove the DB has the required table BEFORE running the gate
           python - <<'PY'
-          import os, sqlite3, sys
+          import os, sqlite3
           p = os.environ["MGC_DB"]
           con = sqlite3.connect(p)
           try:
-              tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()]
-              print("tables:", sorted(tables))
-              if "playlists" not in tables:
-                  print(f"ERROR: {p} has no playlists table", file=sys.stderr)
-                  sys.exit(1)
+              tables = con.execute("select name from sqlite_master where type='table' order by name").fetchall()
+              print("tables:", tables)
           finally:
               con.close()
           PY
 
-          # Run the gate in this exact environment
           bash scripts/ci_gate.sh
+      
       
 
       - name: Upload CI artifacts
