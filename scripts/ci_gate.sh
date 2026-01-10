@@ -50,6 +50,16 @@ main() {
   log "tracks smoke"
   bash "${ROOT}/scripts/tracks_smoke.sh"
 
+  log "git clean check"
+if command -v git >/dev/null 2>&1; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git status --porcelain
+    die "Working tree is dirty after gates (generated files changed but not committed)"
+  fi
+else
+  log "git not available; skipping clean check"
+fi
+
   log "OK"
 }
 

@@ -100,35 +100,9 @@ def cmd_name(args: argparse.Namespace) -> str:
         parts.append(str(args.events_cmd))
     if getattr(args, "rebuild_cmd", None):
         parts.append(str(args.rebuild_cmd))
+    if getattr(args, "manifest_cmd", None):
+        parts.append(str(args.manifest_cmd))
     return " ".join(parts) if parts else "unknown"
-
-
-def events_list_cmd(args: argparse.Namespace) -> int:
-    conn = sqlite_connect(args.db)
-    try:
-        rows = db_list_events(
-            conn,
-            limit=args.limit,
-            run_id=args.run_id,
-            event_type=args.event_type,
-        )
-    finally:
-        conn.close()
-
-    if args.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-
-    if not rows:
-        print("(no events)")
-        return 0
-
-    for r in rows:
-        ts = r["occurred_at"]
-        et = r["event_type"]
-        ent = f"{r['entity_type']}:{r['entity_id']}" if r["entity_id"] else r["entity_type"]
-        print(f"{ts}  {et:<28}  {ent}  run={r['run_id']}")
-    return 0
 
 
 def _jsonable(x: Any) -> Any:
@@ -313,6 +287,38 @@ def maybe_record_run(
 # ----------------------------
 # commands
 # ----------------------------
+
+def events_list_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    try:
+        rows = db_list_events(
+            conn,
+            limit=args.limit,
+            run_id=args.run_id,
+            event_type=args.event_type,
+        )
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+
+    if not rows:
+        print("(no events)")
+        return 0
+
+    for r in rows:
+        ts = r["occurred_at"]
+        et = r["event_type"]
+        ent = f"{r['entity_type']}:{r['entity_id']}" if r["entity_id"] else r["entity_type"]
+        print(f"{ts}  {et:<28}  {ent}  run={r['run_id']}")
+    return 0
+
+
+def manifest_diff_cmd(args: argparse.Namespace) -> int:
+    from mgc.manifest import diff_manifest
+    return int(diff_manifest(args.committed, args.generated))
 
 def db_schema_cmd(args: argparse.Namespace) -> int:
     run_id = new_run_id()
@@ -921,6 +927,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
 
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # manifest
+    mg = sub.add_parser("manifest", help="Manifest utilities")
+    mgs = mg.add_subparsers(dest="manifest_cmd", required=True)
+
+    md = mgs.add_parser("diff", help="Diff committed vs generated manifest")
+    md.add_argument("--committed", default="data/manifest.json", help="Path to committed manifest")
+    md.add_argument("--generated", default="data/manifest.generated.json", help="Path to generated manifest")
+    md.set_defaults(func=manifest_diff_cmd)
 
     # db
     dbg = sub.add_parser("db", help="DB utilities")
