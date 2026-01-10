@@ -61,17 +61,35 @@ jobs:
             --py src/mgc/db.py \
             --py src/mgc/main.py
 
-      - name: Debug CI scripts (show versions)
+      - name: Debug gate/verify scripts + DB
         run: |
           set -euxo pipefail
-          git rev-parse HEAD
-          ls -la scripts/ci_gate.sh scripts/ci_rebuild_verify.sh
-          echo "---- ci_gate.sh (first 160 lines) ----"
-          sed -n '1,160p' scripts/ci_gate.sh
-          echo "---- ci_rebuild_verify.sh (first 220 lines) ----"
-          sed -n '1,220p' scripts/ci_rebuild_verify.sh
-          echo "---- env (MGC_DB/CI) ----"
-          env | sort | grep -E '^(MGC_DB|CI|GITHUB)=' || true
+          echo "HEAD=$(git rev-parse HEAD)"
+          echo "pwd=$(pwd)"
+          ls -la scripts/ci_gate.sh scripts/ci_rebuild_verify.sh || true
+          echo "---- ci_gate.sh (first 200 lines) ----"
+          sed -n '1,200p' scripts/ci_gate.sh || true
+          echo "---- ci_rebuild_verify.sh (first 240 lines) ----"
+          sed -n '1,240p' scripts/ci_rebuild_verify.sh || true
+          echo "---- env (MGC_DB) ----"
+          env | sort | grep -E '^MGC_DB=' || true
+          echo "---- fixtures dir ----"
+          ls -la fixtures || true
+          echo "---- sqlite tables (if DB exists) ----"
+          python - <<'PY'
+          import os, sqlite3, sys
+          p = os.environ.get("MGC_DB", "fixtures/ci_db.sqlite")
+          print("using:", p)
+          try:
+              con = sqlite3.connect(p)
+              tables = con.execute("select name from sqlite_master where type='table' order by name").fetchall()
+              print("tables:", tables)
+              con.close()
+          except Exception as e:
+              print("sqlite error:", e, file=sys.stderr)
+              sys.exit(0)
+          PY
+      
 
       - name: Run CI gate
         run: |
