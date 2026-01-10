@@ -23,6 +23,10 @@ jobs:
           python -m pip install -U pip
           pip install -e .
 
+      # Ensure artifact path exists even if ci_gate fails early
+      - name: Prepare artifacts dir
+        run: mkdir -p artifacts/ci
+
       - name: Run CI gate
         run: bash scripts/ci_gate.sh
 
@@ -33,4 +37,3 @@ jobs:
           name: ci-artifacts
           path: artifacts/ci
           if-no-files-found: warn
-

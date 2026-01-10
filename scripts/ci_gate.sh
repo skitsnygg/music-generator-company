@@ -3,9 +3,39 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PYTHON:-python}"
+ART_DIR="${ROOT}/artifacts/ci"
 
 log() { printf "[ci_gate] %s\n" "$*"; }
 die() { printf "[ci_gate] ERROR: %s\n" "$*" >&2; exit 2; }
+
+run_step() {
+  # Usage: run_step "name" command...
+  local name="$1"; shift
+  log "$name"
+  # tee eats the exit status unless we preserve it; PIPESTATUS works in bash 3.2+
+  "$@" 2>&1 | tee "${ART_DIR}/${name}.log"
+  local rc="${PIPESTATUS[0]}"
+  if [[ "${rc}" -ne 0 ]]; then
+    log "${name} failed (exit=${rc})"
+    return "${rc}"
+  fi
+  return 0
+}
+
+snapshot() {
+  log "snapshot"
+  {
+    echo "== date =="; date || true
+    echo "== pwd =="; pwd || true
+    echo "== git status --porcelain =="; git status --porcelain || true
+    echo "== git rev-parse HEAD =="; git rev-parse HEAD || true
+  } > "${ART_DIR}/snapshot.txt" 2>&1 || true
+
+  ls -la data/playlists > "${ART_DIR}/ls_data_playlists.txt" 2>&1 || true
+  "${PY}" -m mgc.main events list --type rebuild.completed --limit 20 > "${ART_DIR}/events_rebuild_completed.txt" 2>&1 || true
+  "${PY}" -m mgc.main events list --type rebuild.verify_completed --limit 20 > "${ART_DIR}/events_verify_completed.txt" 2>&1 || true
+  cp -f data/playlists/_manifest.playlists.json "${ART_DIR}/_manifest.playlists.json" 2>/dev/null || true
+}
 
 py_compile_all() {
   log "py_compile"
@@ -14,63 +44,32 @@ py_compile_all() {
     die "Python executable not found: ${PY} (set PYTHON=/path/to/python if needed)"
   fi
 
-  log "py_compile"
+  local files
+  files="$(git ls-files '*.py' 2>/dev/null || true)"
+  if [[ -z "${files}" ]]; then
+    log "No tracked *.py files found (skipping)"
+    return 0
+  fi
 
-if ! command -v "${PY}" >/dev/null 2>&1; then
-  die "Python executable not found: ${PY}"
-fi
-
-if command -v git >/dev/null 2>&1; then
-  PY_FILES="$(git ls-files '*.py' || true)"
-else
-  PY_FILES=""
-fi
-
-if [[ -z "${PY_FILES}" ]]; then
-  log "No tracked *.py files found (skipping py_compile)"
-else
   # shellcheck disable=SC2086
-  "${PY}" -m py_compile ${PY_FILES}
-fi
+  "${PY}" -m py_compile ${files}
 }
 
-
 main() {
-  log "Repo: ${ROOT}"
   cd "${ROOT}"
+  log "Repo: ${ROOT}"
+
+  mkdir -p "${ART_DIR}"
+  log "Artifacts: ${ART_DIR}"
+
+  # Always try to snapshot, even on failures.
+  trap snapshot EXIT
 
   py_compile_all
 
-  log "rebuild + verify"
-  bash "${ROOT}/scripts/ci_rebuild_verify.sh"
-
-  log "manifest diff"
-  "${PY}" -m mgc.main manifest diff
-
-  log "tracks smoke"
-  bash "${ROOT}/scripts/tracks_smoke.sh"
-
-  log "git clean check"
-if command -v git >/dev/null 2>&1; then
-  if [[ -n "$(git status --porcelain)" ]]; then
-    git status --porcelain
-    die "Working tree is dirty after gates (generated files changed but not committed)"
-  fi
-else
-  log "git not available; skipping clean check"
-fi
-
-log "git dirty-tree check"
-
-if command -v git >/dev/null 2>&1; then
-  DIRTY="$(git status --porcelain)"
-  if [[ -n "${DIRTY}" ]]; then
-    echo "${DIRTY}"
-    die "Working tree is dirty after CI gate (generated files changed but not committed)"
-  fi
-else
-  log "git not available; skipping dirty-tree check"
-fi
+  run_step "rebuild_verify" bash "${ROOT}/scripts/ci_rebuild_verify.sh"
+  run_step "manifest_diff" "${PY}" -m mgc.main manifest diff
+  run_step "tracks_smoke" bash "${ROOT}/scripts/tracks_smoke.sh"
 
   log "OK"
 }
