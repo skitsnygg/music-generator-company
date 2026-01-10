@@ -39,16 +39,34 @@ jobs:
           python scripts/make_fixture_db.py
           ls -la fixtures
 
-      - name: CI DB preflight
+      - name: Debug checked-out commit + scripts + DB
         run: |
           set -euxo pipefail
+          echo "HEAD=$(git rev-parse HEAD)"
+          git --no-pager log -1 --oneline --decorate
+          echo "pwd=$(pwd)"
           echo "MGC_DB=$MGC_DB"
-          python -c "import os, sqlite3; p=os.environ['MGC_DB']; con=sqlite3.connect(p); print(con.execute(\"select name from sqlite_master where type='table' order by name\").fetchall()); con.close()"
-
-      - name: Rebuild verify
-        run: |
-          set -euxo pipefail
-          bash scripts/ci_rebuild_verify.sh
+          echo "---- list scripts ----"
+          ls -la scripts/ci_gate.sh scripts/ci_rebuild_verify.sh || true
+          echo "---- marker grep ----"
+          grep -n "MARKER=" scripts/ci_gate.sh scripts/ci_rebuild_verify.sh || true
+          echo "---- ci_gate.sh (first 120 lines) ----"
+          sed -n '1,120p' scripts/ci_gate.sh || true
+          echo "---- ci_rebuild_verify.sh (first 180 lines) ----"
+          sed -n '1,180p' scripts/ci_rebuild_verify.sh || true
+          echo "---- fixtures dir ----"
+          ls -la fixtures || true
+          echo "---- sqlite tables (fixture DB) ----"
+          python - <<'PY'
+          import os, sqlite3
+          p = os.environ["MGC_DB"]
+          con = sqlite3.connect(p)
+          try:
+              tables = con.execute("select name from sqlite_master where type='table' order by name").fetchall()
+              print("tables:", tables)
+          finally:
+              con.close()
+          PY
 
       - name: CI schema audit
         run: |
@@ -61,49 +79,10 @@ jobs:
             --py src/mgc/db.py \
             --py src/mgc/main.py
 
-      - name: Debug gate/verify scripts + DB
+      - name: Rebuild verify
         run: |
           set -euxo pipefail
-          echo "HEAD=$(git rev-parse HEAD)"
-          echo "pwd=$(pwd)"
-          ls -la scripts/ci_gate.sh scripts/ci_rebuild_verify.sh || true
-          echo "---- ci_gate.sh (first 200 lines) ----"
-          sed -n '1,200p' scripts/ci_gate.sh || true
-          echo "---- ci_rebuild_verify.sh (first 240 lines) ----"
-          sed -n '1,240p' scripts/ci_rebuild_verify.sh || true
-          echo "---- env (MGC_DB) ----"
-          env | sort | grep -E '^MGC_DB=' || true
-          echo "---- fixtures dir ----"
-          ls -la fixtures || true
-          echo "---- sqlite tables (if DB exists) ----"
-          python - <<'PY'
-          import os, sqlite3, sys
-          p = os.environ.get("MGC_DB", "fixtures/ci_db.sqlite")
-          print("using:", p)
-          try:
-              con = sqlite3.connect(p)
-              tables = con.execute("select name from sqlite_master where type='table' order by name").fetchall()
-              print("tables:", tables)
-              con.close()
-          except Exception as e:
-              print("sqlite error:", e, file=sys.stderr)
-              sys.exit(0)
-          PY
-
-        - name: Debug checked-out commit + scripts
-        run: |
-          set -euxo pipefail
-          echo "HEAD=$(git rev-parse HEAD)"
-          git --no-pager log -1 --oneline --decorate
-          echo "---- ci_gate.sh marker lines ----"
-          grep -n "MARKER=" -n scripts/ci_gate.sh || true
-          echo "---- first 80 lines of ci_gate.sh ----"
-          sed -n '1,80p' scripts/ci_gate.sh
-          echo "---- first 120 lines of ci_rebuild_verify.sh ----"
-          sed -n '1,120p' scripts/ci_rebuild_verify.sh
-          echo "---- env ----"
-          env | sort | grep -E '^(MGC_DB|CI|GITHUB)=' || true
-
+          bash scripts/ci_rebuild_verify.sh
 
       - name: Run CI gate
         run: |
