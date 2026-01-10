@@ -933,8 +933,16 @@ def build_parser() -> argparse.ArgumentParser:
     mgs = mg.add_subparsers(dest="manifest_cmd", required=True)
 
     md = mgs.add_parser("diff", help="Diff committed vs generated manifest")
-    md.add_argument("--committed", default="data/manifest.json", help="Path to committed manifest")
-    md.add_argument("--generated", default="data/manifest.generated.json", help="Path to generated manifest")
+    md.add_argument(
+        "--committed",
+        default="git:HEAD",
+        help="Committed manifest source (file path or git:REV; default: git:HEAD)",
+    )
+    md.add_argument(
+        "--generated",
+        default="data/playlists/_manifest.playlists.json",
+        help="Generated manifest path (default: data/playlists/_manifest.playlists.json)",
+    )
     md.set_defaults(func=manifest_diff_cmd)
 
     # db
