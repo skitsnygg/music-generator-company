@@ -89,7 +89,21 @@ jobs:
               print("sqlite error:", e, file=sys.stderr)
               sys.exit(0)
           PY
-      
+
+        - name: Debug checked-out commit + scripts
+        run: |
+          set -euxo pipefail
+          echo "HEAD=$(git rev-parse HEAD)"
+          git --no-pager log -1 --oneline --decorate
+          echo "---- ci_gate.sh marker lines ----"
+          grep -n "MARKER=" -n scripts/ci_gate.sh || true
+          echo "---- first 80 lines of ci_gate.sh ----"
+          sed -n '1,80p' scripts/ci_gate.sh
+          echo "---- first 120 lines of ci_rebuild_verify.sh ----"
+          sed -n '1,120p' scripts/ci_rebuild_verify.sh
+          echo "---- env ----"
+          env | sort | grep -E '^(MGC_DB|CI|GITHUB)=' || true
+
 
       - name: Run CI gate
         run: |
