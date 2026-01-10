@@ -25,7 +25,9 @@ jobs:
 
       # Ensure artifact path exists even if ci_gate fails early
       - name: Prepare artifacts dir
-        run: mkdir -p artifacts/ci
+        run: |
+          mkdir -p artifacts/ci
+          echo "placeholder" > artifacts/ci/.keep
 
       - name: Run CI gate
         run: bash scripts/ci_gate.sh

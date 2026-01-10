@@ -60,6 +60,7 @@ main() {
   log "Repo: ${ROOT}"
 
   mkdir -p "${ART_DIR}"
+  : > "${ART_DIR}/.keep"
   log "Artifacts: ${ART_DIR}"
 
   # Always try to snapshot, even on failures.
