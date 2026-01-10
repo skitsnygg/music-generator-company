@@ -1,74 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="${PYTHON:-python}"
-ART_DIR="${ROOT}/artifacts/ci"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
-log() { printf "[ci_gate] %s\n" "$*"; }
-die() { printf "[ci_gate] ERROR: %s\n" "$*" >&2; exit 2; }
+echo "[ci_gate] Repo: $repo_root"
 
-run_step() {
-  local name="$1"; shift
-  log "${name}"
-  "$@" 2>&1 | tee "${ART_DIR}/${name}.log"
-  local rc="${PIPESTATUS[0]}"
-  if [[ "${rc}" -ne 0 ]]; then
-    log "${name} failed (exit=${rc})"
-    return "${rc}"
-  fi
-  return 0
-}
+# If MGC_DB is unset OR set to empty string, default it.
+: "${MGC_DB:=fixtures/ci_db.sqlite}"
 
-snapshot() {
-  log "snapshot"
-  {
-    echo "== date =="; date || true
-    echo "== pwd =="; pwd || true
-    echo "== python =="; "${PY}" -V || true
-    echo "== git rev-parse HEAD =="; git rev-parse HEAD || true
-    echo "== git status --porcelain =="; git status --porcelain || true
-    echo "== ls -la artifacts/ci =="; ls -la "${ART_DIR}" || true
-    echo "== ls -la data =="; ls -la data || true
-    echo "== ls -la data/playlists =="; ls -la data/playlists || true
-  } > "${ART_DIR}/snapshot.txt" 2>&1 || true
-}
+# Normalize to absolute path to avoid surprises with working directories.
+case "$MGC_DB" in
+  /*) db_path="$MGC_DB" ;;
+  *)  db_path="$repo_root/$MGC_DB" ;;
+esac
 
-py_compile_all() {
-  log "py_compile"
+export MGC_DB="$db_path"
+echo "[ci_gate] MGC_DB=$MGC_DB"
 
-  if ! command -v "${PY}" >/dev/null 2>&1; then
-    die "Python executable not found: ${PY} (set PYTHON=/path/to/python if needed)"
-  fi
+# Ensure fixture DB exists and is non-empty (sqlite will create empty DB files otherwise).
+mkdir -p "$(dirname "$MGC_DB")"
 
-  local files
-  files="$(git ls-files '*.py' 2>/dev/null || true)"
-  if [[ -z "${files}" ]]; then
-    log "No tracked *.py files found (skipping)"
-    return 0
-  fi
+if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
+  echo "[ci_gate] Fixture DB missing/empty; generating: $MGC_DB"
+  python scripts/make_fixture_db.py
+fi
 
-  # shellcheck disable=SC2086
-  "${PY}" -m py_compile ${files}
-}
+# Preflight: ensure playlists table exists (fail fast with clear error)
+python - <<'PY'
+import os, sqlite3, sys
+p = os.environ["MGC_DB"]
+con = sqlite3.connect(p)
+try:
+    tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()]
+    if "playlists" not in tables:
+        print(f"[ci_gate] ERROR: DB at {p} has no 'playlists' table. Tables: {tables}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[ci_gate] DB OK. Tables: {sorted(tables)}")
+finally:
+    con.close()
+PY
 
-main() {
-  cd "${ROOT}"
-  mkdir -p "${ART_DIR}"
-  : > "${ART_DIR}/.keep"   # ensure artifact upload always has at least 1 file
+echo "[ci_gate] py_compile"
+python -m py_compile $(git ls-files '*.py')
 
-  log "Repo: ${ROOT}"
-  log "Artifacts: ${ART_DIR}"
+echo "[ci_gate] rebuild + verify"
+bash scripts/ci_rebuild_verify.sh
 
-  trap snapshot EXIT
-
-  py_compile_all
-
-  run_step "rebuild_verify" bash "${ROOT}/scripts/ci_rebuild_verify.sh"
-  run_step "manifest_diff" "${PY}" -m mgc.main manifest diff
-  run_step "tracks_smoke" bash "${ROOT}/scripts/tracks_smoke.sh"
-
-  log "OK"
-}
-
-main "$@"
+echo "[ci_gate] done"

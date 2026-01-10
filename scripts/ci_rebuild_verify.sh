@@ -1,18 +1,19 @@
-#!/usr/bin/env bash
 set -euo pipefail
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-# Default DB for CI if not provided
 : "${MGC_DB:=fixtures/ci_db.sqlite}"
-
-# Normalize to absolute path
 case "$MGC_DB" in
   /*) db_path="$MGC_DB" ;;
   *)  db_path="$repo_root/$MGC_DB" ;;
 esac
 export MGC_DB="$db_path"
+echo "[ci_rebuild_verify] db: $MGC_DB"
+
+mkdir -p "$(dirname "$MGC_DB")"
+if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
+  python scripts/make_fixture_db.py
+fi
 
 echo "[ci_rebuild_verify] repo_root: $repo_root"
 echo "[ci_rebuild_verify] python: python"
