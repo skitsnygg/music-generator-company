@@ -2,12 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
 
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      MGC_DB: fixtures/ci_db.sqlite
 
     steps:
       - name: Checkout repo
@@ -15,6 +17,7 @@ jobs:
 
       - name: Prepare artifacts dir (always)
         run: |
+          set -euxo pipefail
           mkdir -p artifacts/ci
           echo "placeholder" > artifacts/ci/.keep
           ls -la artifacts/ci
@@ -26,11 +29,42 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install -U pip
           pip install -e .
 
+      - name: Build fixture DB
+        run: |
+          set -euxo pipefail
+          python scripts/make_fixture_db.py
+          ls -la fixtures
+
+      - name: CI DB preflight
+        run: |
+          set -euxo pipefail
+          echo "MGC_DB=$MGC_DB"
+          python -c "import os, sqlite3; p=os.environ['MGC_DB']; con=sqlite3.connect(p); print(con.execute(\"select name from sqlite_master where type='table' order by name\").fetchall()); con.close()"
+
+      - name: Rebuild verify
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_rebuild_verify.sh
+
+      - name: CI schema audit
+        run: |
+          set -euxo pipefail
+          ./scripts/ci_schema_audit.py \
+            --db fixtures/ci_db.sqlite \
+            --py src/mgc/db_helpers.py \
+            --py src/mgc/events.py \
+            --py src/mgc/rebuild_cli.py \
+            --py src/mgc/db.py \
+            --py src/mgc/main.py
+
       - name: Run CI gate
-        run: bash scripts/ci_gate.sh
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_gate.sh
 
       - name: Upload CI artifacts
         if: always()
