@@ -61,6 +61,18 @@ jobs:
             --py src/mgc/db.py \
             --py src/mgc/main.py
 
+       - name: Debug CI scripts (show versions)
+        run: |
+          set -euxo pipefail
+          git rev-parse HEAD
+          ls -la scripts/ci_gate.sh scripts/ci_rebuild_verify.sh
+          echo "---- ci_gate.sh (first 120 lines) ----"
+          sed -n '1,120p' scripts/ci_gate.sh
+          echo "---- ci_rebuild_verify.sh (first 160 lines) ----"
+          sed -n '1,160p' scripts/ci_rebuild_verify.sh
+          echo "---- env ----"
+          env | sort | rg '^(MGC_DB|GITHUB|CI)=' || true
+
       - name: Run CI gate
         run: |
           set -euxo pipefail
