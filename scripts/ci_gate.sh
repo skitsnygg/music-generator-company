@@ -60,6 +60,18 @@ else
   log "git not available; skipping clean check"
 fi
 
+log "git dirty-tree check"
+
+if command -v git >/dev/null 2>&1; then
+  DIRTY="$(git status --porcelain)"
+  if [[ -n "${DIRTY}" ]]; then
+    echo "${DIRTY}"
+    die "Working tree is dirty after CI gate (generated files changed but not committed)"
+  fi
+else
+  log "git not available; skipping dirty-tree check"
+fi
+
   log "OK"
 }
 
