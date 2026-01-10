@@ -37,3 +37,9 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# data
+data/
+# but keep the playlists manifest tracked
+!data/playlists/
+!data/playlists/_manifest.playlists.json
