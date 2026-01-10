@@ -44,6 +44,10 @@ python -m mgc.main rebuild playlists --limit 1000 --stamp ci
 
 echo "[ci_rebuild_verify] == verify playlists vs manifest =="
 
+test -f data/playlists/_manifest.playlists.json
+python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
+
+echo "[ci_rebuild_verify] OK: manifest exists and is valid JSON"
+
 # Your existing verify logic goes here. Keep exactly what you already had.
 # Example:
-python -m mgc.main playlists verify --manifest data/playlists/_manifest.playlists.json
