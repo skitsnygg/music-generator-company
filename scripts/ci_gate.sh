@@ -9,10 +9,8 @@ log() { printf "[ci_gate] %s\n" "$*"; }
 die() { printf "[ci_gate] ERROR: %s\n" "$*" >&2; exit 2; }
 
 run_step() {
-  # Usage: run_step "name" command...
   local name="$1"; shift
-  log "$name"
-  # tee eats the exit status unless we preserve it; PIPESTATUS works in bash 3.2+
+  log "${name}"
   "$@" 2>&1 | tee "${ART_DIR}/${name}.log"
   local rc="${PIPESTATUS[0]}"
   if [[ "${rc}" -ne 0 ]]; then
@@ -27,14 +25,13 @@ snapshot() {
   {
     echo "== date =="; date || true
     echo "== pwd =="; pwd || true
-    echo "== git status --porcelain =="; git status --porcelain || true
+    echo "== python =="; "${PY}" -V || true
     echo "== git rev-parse HEAD =="; git rev-parse HEAD || true
+    echo "== git status --porcelain =="; git status --porcelain || true
+    echo "== ls -la artifacts/ci =="; ls -la "${ART_DIR}" || true
+    echo "== ls -la data =="; ls -la data || true
+    echo "== ls -la data/playlists =="; ls -la data/playlists || true
   } > "${ART_DIR}/snapshot.txt" 2>&1 || true
-
-  ls -la data/playlists > "${ART_DIR}/ls_data_playlists.txt" 2>&1 || true
-  "${PY}" -m mgc.main events list --type rebuild.completed --limit 20 > "${ART_DIR}/events_rebuild_completed.txt" 2>&1 || true
-  "${PY}" -m mgc.main events list --type rebuild.verify_completed --limit 20 > "${ART_DIR}/events_verify_completed.txt" 2>&1 || true
-  cp -f data/playlists/_manifest.playlists.json "${ART_DIR}/_manifest.playlists.json" 2>/dev/null || true
 }
 
 py_compile_all() {
@@ -57,13 +54,12 @@ py_compile_all() {
 
 main() {
   cd "${ROOT}"
-  log "Repo: ${ROOT}"
-
   mkdir -p "${ART_DIR}"
-  : > "${ART_DIR}/.keep"
+  : > "${ART_DIR}/.keep"   # ensure artifact upload always has at least 1 file
+
+  log "Repo: ${ROOT}"
   log "Artifacts: ${ART_DIR}"
 
-  # Always try to snapshot, even on failures.
   trap snapshot EXIT
 
   py_compile_all
