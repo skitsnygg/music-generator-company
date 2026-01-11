@@ -675,3 +675,4 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pm.add_argument("--commit", action="store_true", help="Update DB status to published (still simulated)")
     pm.add_argument("--json", action="store_true")
     pm.set_defaults(func=cmd_publish_marketing)
+
