@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,19 +39,8 @@ def _safe_slug(s: str) -> str:
     return "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_")).strip("-_")
 
 
-def _playlist_out_path(export_dir: Path, pl: PlaylistRow) -> Path:
-    safe = _safe_slug(pl.slug)
-    name = f"{safe}_{pl.id}.json" if safe else f"{pl.id}.json"
-    return export_dir / name
-
-
 def _payload_bytes(obj: Dict[str, Any]) -> bytes:
-    """
-    The *exact* bytes we will write for playlist JSON files:
-      - canonical_json(obj)
-      - + trailing newline
-    Manifest hashing and byte counts must match this exactly.
-    """
+    # Hash/bytes must match exactly what we write: canonical JSON + newline.
     return (canonical_json(obj) + "\n").encode("utf-8")
 
 
@@ -59,14 +49,23 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.write_bytes(_payload_bytes(obj))
 
 
-def _stable_playlist_obj(obj: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
-    # Normalize time-ish fields so rebuilds are deterministic.
+def _stable_time_fields(obj: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
     out = dict(obj)
     if "built_from_db_at" in out:
         out["built_from_db_at"] = stamp
     if "exported_at" in out:
         out["exported_at"] = stamp
     return out
+
+
+# ----------------------------
+# PLAYLISTS
+# ----------------------------
+
+def _playlist_out_path(export_dir: Path, pl: PlaylistRow) -> Path:
+    safe = _safe_slug(pl.slug)
+    name = f"{safe}_{pl.id}.json" if safe else f"{pl.id}.json"
+    return export_dir / name
 
 
 def _sum_duration_sec(obj: Dict[str, Any]) -> int:
@@ -81,11 +80,11 @@ def _sum_duration_sec(obj: Dict[str, Any]) -> int:
 
 def _quality_gate_playlist(pl: PlaylistRow, obj: Dict[str, Any]) -> None:
     """
-    Gate #1: DB vs rebuilt JSON consistency.
+    Gate #1 (playlists): DB vs rebuilt JSON consistency.
       - tracks must be a list
       - len(tracks) must match playlists.track_count
       - sum(duration_sec) must match playlists.total_duration_sec (rounded)
-    Raises ValueError on failure (no events here).
+    Raises ValueError on failure.
     """
     tracks = obj.get("tracks")
     if not isinstance(tracks, list):
@@ -103,23 +102,23 @@ def _quality_gate_playlist(pl: PlaylistRow, obj: Dict[str, Any]) -> None:
 
 
 def _build_playlist_obj(conn, pl: PlaylistRow, *, stamp: str) -> Dict[str, Any]:
-    # Always build from DB for rebuilds.
     obj = db_build_playlist_json(conn, pl, built_at=stamp)
     obj["exported_at"] = stamp
-    return _stable_playlist_obj(obj, stamp=stamp)
+    return _stable_time_fields(obj, stamp=stamp)
 
 
 @dataclass(frozen=True)
 class ManifestItem:
-    playlist_id: str
+    # Used for both playlists and tracks; keys vary by scope, but keep shared fields stable.
+    scope_id: str
     slug: str
     path: str
     sha256: str
     bytes: int
-    track_count: int
+    item_count: int  # track_count for playlists, 0 for tracks (or 1)
 
 
-def _build_manifest(
+def _build_manifest_playlists(
     conn,
     *,
     export_dir: Path,
@@ -135,23 +134,21 @@ def _build_manifest(
     for pl in playlists:
         obj = _build_playlist_obj(conn, pl, stamp=stamp)
 
-        # 🔒 Gate #1: DB vs export consistency (raise only)
         _quality_gate_playlist(pl, obj)
 
         out_path = _playlist_out_path(export_dir, pl)
 
-        # IMPORTANT: hash + bytes match what we actually write (canonical JSON + newline)
         data = _payload_bytes(obj)
         sha = _sha256_bytes(data)
 
         items.append(
             ManifestItem(
-                playlist_id=pl.id,
-                slug=pl.slug,
+                scope_id=str(pl.id),
+                slug=str(pl.slug or ""),
                 path=str(out_path),
                 sha256=sha,
                 bytes=len(data),
-                track_count=len(obj.get("tracks") or []),
+                item_count=len(obj.get("tracks") or []),
             )
         )
         to_write.append((out_path, obj))
@@ -161,12 +158,190 @@ def _build_manifest(
         "scope": "playlists",
         "stamp": stamp,
         "count": len(items),
-        "items": [i.__dict__ for i in items],
+        "items": [
+            {
+                "playlist_id": i.scope_id,
+                "slug": i.slug,
+                "path": i.path,
+                "sha256": i.sha256,
+                "bytes": i.bytes,
+                "track_count": i.item_count,
+            }
+            for i in items
+        ],
     }
-    # fingerprint is over the manifest WITHOUT the fingerprint field
     manifest["fingerprint_sha256"] = _sha256_text(canonical_json(manifest))
     return manifest, to_write
 
+
+# ----------------------------
+# TRACKS (schema-agnostic)
+# ----------------------------
+
+def _table_columns(conn, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    cols: List[str] = []
+    for r in rows:
+        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        try:
+            cols.append(str(r[1]))
+        except Exception:
+            pass
+    return cols
+
+
+def _row_to_jsonable(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    SQLite can return types that aren't JSON-serializable; normalize conservatively.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in row.items():
+        if v is None:
+            out[k] = None
+        elif isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, (bytes, bytearray, memoryview)):
+            # Avoid embedding raw bytes (unstable, noisy). Hex is deterministic.
+            out[k] = bytes(v).hex()
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _list_tracks(conn, *, limit: int) -> List[Dict[str, Any]]:
+    cols = _table_columns(conn, "tracks")
+    if not cols:
+        raise ValueError("tracks_table_has_no_columns")
+
+    # Always include rowid fallback in case schema lacks a stable primary key.
+    sql = f"SELECT {', '.join(cols)} FROM tracks LIMIT ?"
+    cur = conn.execute(sql, (int(limit),))
+    names = [d[0] for d in cur.description]  # type: ignore[union-attr]
+    rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = {names[i]: r[i] for i in range(len(names))}
+        out.append(_row_to_jsonable(d))
+    return out
+
+
+def _track_identity(row: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Returns (track_id, slugish) in a defensive way.
+    """
+    # Prefer common key names.
+    for k in ("id", "track_id", "uuid"):
+        if row.get(k) is not None:
+            return str(row.get(k)), ""
+    # Fall back to something stable-ish (but deterministic) if no obvious id.
+    # This should be rare and is still deterministic for the same row content.
+    raw = canonical_json(row)
+    return _sha256_text(raw)[:32], ""
+
+
+def _track_out_path(export_dir: Path, track_id: str, slugish: str) -> Path:
+    safe = _safe_slug(slugish)
+    name = f"{safe}_{track_id}.json" if safe else f"{track_id}.json"
+    return export_dir / name
+
+
+def _quality_gate_track(row: Dict[str, Any]) -> None:
+    """
+    Gate #1 (tracks): basic sanity.
+      - must have an identity (id/track_id/uuid or content hash fallback)
+      - if duration_sec exists, it must be numeric and >= 0
+    Raises ValueError on failure.
+    """
+    track_id, _ = _track_identity(row)
+    if not track_id:
+        raise ValueError("track_missing_id")
+
+    if "duration_sec" in row and row["duration_sec"] is not None:
+        try:
+            dur = float(row["duration_sec"])
+        except Exception:
+            raise ValueError("track_duration_not_numeric")
+        if dur < 0:
+            raise ValueError("track_duration_negative")
+
+
+def _build_track_obj(row: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
+    obj: Dict[str, Any] = {
+        "schema_version": 1,
+        "scope": "track",
+        "built_from_db_at": stamp,
+        "exported_at": stamp,
+        "track": dict(row),
+    }
+    return _stable_time_fields(obj, stamp=stamp)
+
+
+def _build_manifest_tracks(
+    conn,
+    *,
+    export_dir: Path,
+    limit: int,
+    stamp: str,
+) -> Tuple[Dict[str, Any], List[Tuple[Path, Dict[str, Any]]]]:
+    rows = _list_tracks(conn, limit=limit)
+
+    # Deterministic ordering: prefer (title, id) if present; else by id-ish.
+    def sort_key(r: Dict[str, Any]) -> Tuple[str, str]:
+        tid, _ = _track_identity(r)
+        title = str(r.get("title") or r.get("name") or "")
+        return (title, tid)
+
+    rows = sorted(rows, key=sort_key)
+
+    items: List[ManifestItem] = []
+    to_write: List[Tuple[Path, Dict[str, Any]]] = []
+
+    for r in rows:
+        _quality_gate_track(r)
+
+        track_id, slugish = _track_identity(r)
+        out_path = _track_out_path(export_dir, track_id, slugish)
+
+        obj = _build_track_obj(r, stamp=stamp)
+
+        data = _payload_bytes(obj)
+        sha = _sha256_bytes(data)
+
+        items.append(
+            ManifestItem(
+                scope_id=track_id,
+                slug=slugish,
+                path=str(out_path),
+                sha256=sha,
+                bytes=len(data),
+                item_count=1,
+            )
+        )
+        to_write.append((out_path, obj))
+
+    manifest: Dict[str, Any] = {
+        "schema_version": 1,
+        "scope": "tracks",
+        "stamp": stamp,
+        "count": len(items),
+        "items": [
+            {
+                "track_id": i.scope_id,
+                "path": i.path,
+                "sha256": i.sha256,
+                "bytes": i.bytes,
+            }
+            for i in items
+        ],
+    }
+    manifest["fingerprint_sha256"] = _sha256_text(canonical_json(manifest))
+    return manifest, to_write
+
+
+# ----------------------------
+# Manifest helpers (shared)
+# ----------------------------
 
 def _load_manifest(path: Path) -> Dict[str, Any]:
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -176,29 +351,16 @@ def _load_manifest(path: Path) -> Dict[str, Any]:
 
 
 def _manifest_fingerprint(manifest: Dict[str, Any]) -> str:
-    # Recompute fingerprint over manifest content excluding fingerprint_sha256
     m2 = dict(manifest)
     m2.pop("fingerprint_sha256", None)
     return _sha256_text(canonical_json(m2))
 
 
-def _require_manifest_playlists(m: Dict[str, Any]) -> None:
-    if m.get("scope") != "playlists":
+def _require_manifest_scope(m: Dict[str, Any], scope: str) -> None:
+    if m.get("scope") != scope:
         raise ValueError(f"manifest_wrong_scope scope={m.get('scope')!r}")
     if not isinstance(m.get("items"), list):
         raise ValueError("manifest_items_not_list")
-
-
-def _items_by_playlist_id(items: List[Any]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        pid = str(it.get("playlist_id") or "")
-        if not pid:
-            continue
-        out[pid] = it
-    return out
 
 
 def _as_int(x: Any) -> Optional[int]:
@@ -213,12 +375,23 @@ def _short(s: str, n: int = 12) -> str:
     return s[:n]
 
 
-def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    a_items = list(a.get("items") or [])
-    b_items = list(b.get("items") or [])
+def _items_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    items = list(manifest.get("items") or [])
+    out: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # accept either playlist_id or track_id as the id key
+        pid = str(it.get("playlist_id") or it.get("track_id") or "")
+        if not pid:
+            continue
+        out[pid] = it
+    return out
 
-    a_map = _items_by_playlist_id(a_items)
-    b_map = _items_by_playlist_id(b_items)
+
+def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    a_map = _items_map(a)
+    b_map = _items_map(b)
 
     a_ids = set(a_map.keys())
     b_ids = set(b_map.keys())
@@ -240,26 +413,18 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         b_bytes = _as_int(bi.get("bytes"))
         a_path = str(ai.get("path") or "")
         b_path = str(bi.get("path") or "")
-        a_tc = _as_int(ai.get("track_count"))
-        b_tc = _as_int(bi.get("track_count"))
-        a_slug = str(ai.get("slug") or "")
-        b_slug = str(bi.get("slug") or "")
 
-        if (a_sha == b_sha) and (a_bytes == b_bytes) and (a_path == b_path) and (a_tc == b_tc) and (a_slug == b_slug):
+        if (a_sha == b_sha) and (a_bytes == b_bytes) and (a_path == b_path):
             same.append(pid)
             continue
 
         changed.append(
             {
-                "playlist_id": pid,
-                "slug_a": a_slug,
-                "slug_b": b_slug,
+                "id": pid,
                 "sha256_a": a_sha,
                 "sha256_b": b_sha,
                 "bytes_a": a_bytes,
                 "bytes_b": b_bytes,
-                "track_count_a": a_tc,
-                "track_count_b": b_tc,
                 "path_a": a_path,
                 "path_b": b_path,
             }
@@ -288,7 +453,7 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Commands
+# Commands: playlists
 # ----------------------------
 
 def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
@@ -319,36 +484,26 @@ def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
             )
 
             try:
-                manifest1, to_write1 = _build_manifest(
-                    conn,
-                    export_dir=export_dir,
-                    limit=limit,
-                    stamp=stamp,
-                )
+                manifest1, to_write1 = _build_manifest_playlists(conn, export_dir=export_dir, limit=limit, stamp=stamp)
             except ValueError as e:
                 ew.emit(
                     "rebuild.quality_gate_failed",
                     "system",
                     None,
-                    {"gate": "db_vs_export", "reason": str(e)},
+                    {"scope": "playlists", "gate": "db_vs_export", "reason": str(e)},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
 
             if args.determinism_check:
                 try:
-                    manifest2, _ = _build_manifest(
-                        conn,
-                        export_dir=export_dir,
-                        limit=limit,
-                        stamp=stamp,
-                    )
+                    manifest2, _ = _build_manifest_playlists(conn, export_dir=export_dir, limit=limit, stamp=stamp)
                 except ValueError as e:
                     ew.emit(
                         "rebuild.quality_gate_failed",
                         "system",
                         None,
-                        {"gate": "db_vs_export", "reason": str(e)},
+                        {"scope": "playlists", "gate": "db_vs_export", "reason": str(e)},
                         occurred_at=now_iso(),
                     )
                     raise SystemExit(2)
@@ -359,6 +514,7 @@ def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
                         "system",
                         None,
                         {
+                            "scope": "playlists",
                             "gate": "determinism",
                             "fingerprint_1": manifest1["fingerprint_sha256"],
                             "fingerprint_2": manifest2["fingerprint_sha256"],
@@ -404,12 +560,147 @@ def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
 
 
 def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
+    return _rebuild_verify_generic(
+        args,
+        scope="playlists",
+        default_manifest_name="_manifest.playlists.json",
+    )
+
+
+def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
+    return _rebuild_diff_generic(args, scope="playlists")
+
+
+# ----------------------------
+# Commands: tracks
+# ----------------------------
+
+def rebuild_tracks_cmd(args: argparse.Namespace) -> int:
+    run_id = new_run_id()
+    conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+
+    export_dir = Path(args.out_dir)
+    stamp = args.stamp or FIXED_STAMP
+    limit = int(args.limit)
+
+    try:
+        with conn:
+            ew.emit(
+                "rebuild.started",
+                "system",
+                None,
+                {
+                    "scope": "tracks",
+                    "db": args.db,
+                    "out_dir": str(export_dir),
+                    "limit": limit,
+                    "stamp": stamp,
+                    "determinism_check": bool(args.determinism_check),
+                    "write": bool(args.write),
+                },
+                occurred_at=now_iso(),
+            )
+
+            try:
+                manifest1, to_write1 = _build_manifest_tracks(conn, export_dir=export_dir, limit=limit, stamp=stamp)
+            except (ValueError, sqlite3.Error) as e:
+                ew.emit(
+                    "rebuild.quality_gate_failed",
+                    "system",
+                    None,
+                    {"scope": "tracks", "gate": "row_sanity", "reason": str(e)},
+                    occurred_at=now_iso(),
+                )
+                raise SystemExit(2)
+
+            if args.determinism_check:
+                try:
+                    manifest2, _ = _build_manifest_tracks(conn, export_dir=export_dir, limit=limit, stamp=stamp)
+                except (ValueError, sqlite3.Error) as e:
+                    ew.emit(
+                        "rebuild.quality_gate_failed",
+                        "system",
+                        None,
+                        {"scope": "tracks", "gate": "row_sanity", "reason": str(e)},
+                        occurred_at=now_iso(),
+                    )
+                    raise SystemExit(2)
+
+                if manifest1["fingerprint_sha256"] != manifest2["fingerprint_sha256"]:
+                    ew.emit(
+                        "rebuild.quality_gate_failed",
+                        "system",
+                        None,
+                        {
+                            "scope": "tracks",
+                            "gate": "determinism",
+                            "fingerprint_1": manifest1["fingerprint_sha256"],
+                            "fingerprint_2": manifest2["fingerprint_sha256"],
+                        },
+                        occurred_at=now_iso(),
+                    )
+                    raise SystemExit(2)
+
+            if args.write:
+                export_dir.mkdir(parents=True, exist_ok=True)
+                for path, obj in to_write1:
+                    _write_json(path, obj)
+                _write_json(export_dir / "_manifest.tracks.json", manifest1)
+
+            ew.emit(
+                "rebuild.completed",
+                "system",
+                None,
+                {
+                    "scope": "tracks",
+                    "ok": True,
+                    "fingerprint_sha256": manifest1["fingerprint_sha256"],
+                    "count": manifest1["count"],
+                    "wrote": bool(args.write),
+                },
+                occurred_at=now_iso(),
+            )
+
+        if args.json:
+            print(json.dumps(manifest1, indent=2, ensure_ascii=False))
+        else:
+            print(f"fingerprint_sha256: {manifest1['fingerprint_sha256']}")
+            print(f"count: {manifest1['count']}")
+            if args.write:
+                print(f"wrote: {export_dir}/_manifest.tracks.json")
+
+        return 0
+
+    except SystemExit:
+        raise
+    finally:
+        conn.close()
+
+
+def rebuild_verify_tracks_cmd(args: argparse.Namespace) -> int:
+    return _rebuild_verify_generic(
+        args,
+        scope="tracks",
+        default_manifest_name="_manifest.tracks.json",
+    )
+
+
+def rebuild_diff_tracks_cmd(args: argparse.Namespace) -> int:
+    return _rebuild_diff_generic(args, scope="tracks")
+
+
+# ----------------------------
+# Generic verify/diff (shared)
+# ----------------------------
+
+def _rebuild_verify_generic(args: argparse.Namespace, *, scope: str, default_manifest_name: str) -> int:
     run_id = new_run_id()
     conn = sqlite_connect(args.db)
     ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
 
     out_dir = Path(args.out_dir)
-    manifest_path = Path(args.manifest) if args.manifest else (out_dir / "_manifest.playlists.json")
+    manifest_path = Path(args.manifest) if getattr(args, "manifest", None) else (out_dir / default_manifest_name)
 
     try:
         with conn:
@@ -417,12 +708,7 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                 "rebuild.verify_started",
                 "system",
                 None,
-                {
-                    "scope": "playlists",
-                    "db": args.db,
-                    "out_dir": str(out_dir),
-                    "manifest": str(manifest_path),
-                },
+                {"scope": scope, "db": args.db, "out_dir": str(out_dir), "manifest": str(manifest_path)},
                 occurred_at=now_iso(),
             )
 
@@ -431,20 +717,20 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                     "rebuild.verify_failed",
                     "system",
                     None,
-                    {"reason": "manifest_missing", "manifest": str(manifest_path)},
+                    {"scope": scope, "reason": "manifest_missing", "manifest": str(manifest_path)},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
 
             try:
                 manifest = _load_manifest(manifest_path)
-                _require_manifest_playlists(manifest)
+                _require_manifest_scope(manifest, scope)
             except Exception as e:
                 ew.emit(
                     "rebuild.verify_failed",
                     "system",
                     None,
-                    {"reason": "manifest_invalid", "error": str(e)},
+                    {"scope": scope, "reason": "manifest_invalid", "error": str(e)},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
@@ -456,11 +742,7 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                     "rebuild.verify_failed",
                     "system",
                     None,
-                    {
-                        "reason": "fingerprint_mismatch",
-                        "expected": expected_fp,
-                        "recomputed": recomputed_fp,
-                    },
+                    {"scope": scope, "reason": "fingerprint_mismatch", "expected": expected_fp, "recomputed": recomputed_fp},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
@@ -477,15 +759,13 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                 rel_or_abs = str(it.get("path") or "")
                 expected_sha = str(it.get("sha256") or "")
                 expected_bytes = it.get("bytes")
-                playlist_id = str(it.get("playlist_id") or "")
-                slug = str(it.get("slug") or "")
 
                 p = Path(rel_or_abs)
                 if not p.is_absolute():
                     p = Path.cwd() / p
 
                 if not p.exists():
-                    failures.append({"playlist_id": playlist_id, "slug": slug, "path": rel_or_abs, "reason": "file_missing"})
+                    failures.append({"path": rel_or_abs, "reason": "file_missing"})
                     continue
 
                 data = p.read_bytes()
@@ -499,8 +779,6 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                 if not ok_bytes or not ok_sha:
                     failures.append(
                         {
-                            "playlist_id": playlist_id,
-                            "slug": slug,
                             "path": rel_or_abs,
                             "reason": "file_mismatch",
                             "expected_bytes": int(expected_bytes) if expected_bytes is not None else None,
@@ -516,7 +794,7 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                     "rebuild.verify_failed",
                     "system",
                     None,
-                    {"reason": "verification_failed", "checked": checked, "failures": len(failures), "sample": sample},
+                    {"scope": scope, "reason": "verification_failed", "checked": checked, "failures": len(failures), "sample": sample},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
@@ -525,18 +803,12 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
                 "rebuild.verify_completed",
                 "system",
                 None,
-                {"scope": "playlists", "ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp},
+                {"scope": scope, "ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp},
                 occurred_at=now_iso(),
             )
 
         if args.json:
-            print(
-                json.dumps(
-                    {"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)},
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            print(json.dumps({"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)}, indent=2, ensure_ascii=False))
         else:
             print("ok: true")
             print(f"checked: {checked}")
@@ -551,7 +823,7 @@ def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
         conn.close()
 
 
-def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
+def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
     run_id = new_run_id()
     conn = sqlite_connect(args.db)
     ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
@@ -559,7 +831,6 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
     a_path = Path(args.a)
     b_path = Path(args.b)
 
-    # Allow relative paths; interpret relative to repo cwd.
     if not a_path.is_absolute():
         a_path = Path.cwd() / a_path
     if not b_path.is_absolute():
@@ -569,26 +840,14 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
 
     try:
         with conn:
-            ew.emit(
-                "rebuild.diff_started",
-                "system",
-                None,
-                {"scope": "playlists", "a": str(a_path), "b": str(b_path)},
-                occurred_at=now_iso(),
-            )
+            ew.emit("rebuild.diff_started", "system", None, {"scope": scope, "a": str(a_path), "b": str(b_path)}, occurred_at=now_iso())
 
             if not a_path.exists() or not b_path.exists():
                 ew.emit(
                     "rebuild.diff_failed",
                     "system",
                     None,
-                    {
-                        "reason": "manifest_missing",
-                        "a_exists": a_path.exists(),
-                        "b_exists": b_path.exists(),
-                        "a": str(a_path),
-                        "b": str(b_path),
-                    },
+                    {"scope": scope, "reason": "manifest_missing", "a_exists": a_path.exists(), "b_exists": b_path.exists(), "a": str(a_path), "b": str(b_path)},
                     occurred_at=now_iso(),
                 )
                 raise SystemExit(2)
@@ -596,16 +855,10 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
             try:
                 a = _load_manifest(a_path)
                 b = _load_manifest(b_path)
-                _require_manifest_playlists(a)
-                _require_manifest_playlists(b)
+                _require_manifest_scope(a, scope)
+                _require_manifest_scope(b, scope)
             except Exception as e:
-                ew.emit(
-                    "rebuild.diff_failed",
-                    "system",
-                    None,
-                    {"reason": "manifest_invalid", "error": str(e)},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.diff_failed", "system", None, {"scope": scope, "reason": "manifest_invalid", "error": str(e)}, occurred_at=now_iso())
                 raise SystemExit(2)
 
             diff = _diff_manifests(a, b)
@@ -614,14 +867,7 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
                 "rebuild.diff_completed",
                 "system",
                 None,
-                {
-                    "scope": "playlists",
-                    "a": str(a_path),
-                    "b": str(b_path),
-                    "counts": diff["counts"],
-                    "fingerprint_a": diff["fingerprint"]["a"],
-                    "fingerprint_b": diff["fingerprint"]["b"],
-                },
+                {"scope": scope, "a": str(a_path), "b": str(b_path), "counts": diff["counts"], "fingerprint_a": diff["fingerprint"]["a"], "fingerprint_b": diff["fingerprint"]["b"]},
                 occurred_at=now_iso(),
             )
 
@@ -656,11 +902,8 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
         if diff["changed"]:
             print("\nCHANGED:")
             for ch in diff["changed"][:show]:
-                pid = ch["playlist_id"]
-                print(
-                    f"  ~ {pid}  sha {_short(ch['sha256_a'])} -> {_short(ch['sha256_b'])}  "
-                    f"bytes {ch['bytes_a']} -> {ch['bytes_b']}  tc {ch['track_count_a']} -> {ch['track_count_b']}"
-                )
+                pid = ch["id"]
+                print(f"  ~ {pid}  sha {_short(ch['sha256_a'])} -> {_short(ch['sha256_b'])}  bytes {ch['bytes_a']} -> {ch['bytes_b']}")
             if len(diff["changed"]) > show:
                 print(f"  ... ({len(diff['changed']) - show} more)")
 
@@ -671,6 +914,10 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+
+# ----------------------------
+# CLI wiring
+# ----------------------------
 
 def register_rebuild_subcommand(subparsers) -> None:
     rg = subparsers.add_parser("rebuild", help="Deterministic rebuilds + quality gates")
@@ -685,11 +932,21 @@ def register_rebuild_subcommand(subparsers) -> None:
     rp.add_argument("--stamp", default=None, help=f"Override deterministic stamp (default: {FIXED_STAMP})")
     rp.add_argument("--determinism-check", action="store_true")
     rp.add_argument("--write", action="store_true")
-    # Compatibility flag (ignored). Keeps old muscle-memory from erroring.
     rp.add_argument("--build-from-db", action="store_true", help=argparse.SUPPRESS)
     rp.set_defaults(func=rebuild_playlists_cmd)
 
-    # rebuild verify playlists
+    # rebuild tracks
+    rt = rgs.add_parser("tracks", help="Rebuild track exports deterministically (from DB)")
+    rt.add_argument("--db", default="data/db.sqlite")
+    rt.add_argument("--out-dir", default="data/tracks")
+    rt.add_argument("--limit", type=int, default=100000)
+    rt.add_argument("--json", action="store_true")
+    rt.add_argument("--stamp", default=None, help=f"Override deterministic stamp (default: {FIXED_STAMP})")
+    rt.add_argument("--determinism-check", action="store_true")
+    rt.add_argument("--write", action="store_true")
+    rt.set_defaults(func=rebuild_tracks_cmd)
+
+    # rebuild verify
     rv = rgs.add_parser("verify", help="Verify rebuild artifacts against manifest")
     rvs = rv.add_subparsers(dest="rebuild_verify_cmd", required=True)
 
@@ -700,7 +957,14 @@ def register_rebuild_subcommand(subparsers) -> None:
     rvp.add_argument("--json", action="store_true")
     rvp.set_defaults(func=rebuild_verify_playlists_cmd)
 
-    # rebuild diff playlists
+    rvt = rvs.add_parser("tracks", help="Verify track JSON files against _manifest.tracks.json")
+    rvt.add_argument("--db", default="data/db.sqlite")
+    rvt.add_argument("--out-dir", default="data/tracks")
+    rvt.add_argument("--manifest", default=None, help="Path to manifest (default: <out-dir>/_manifest.tracks.json)")
+    rvt.add_argument("--json", action="store_true")
+    rvt.set_defaults(func=rebuild_verify_tracks_cmd)
+
+    # rebuild diff
     rd = rgs.add_parser("diff", help="Diff two manifests")
     rds = rd.add_subparsers(dest="rebuild_diff_cmd", required=True)
 
@@ -711,3 +975,11 @@ def register_rebuild_subcommand(subparsers) -> None:
     rdp.add_argument("--json", action="store_true")
     rdp.add_argument("--show", type=int, default=50, help="Max items to print per section (default: 50)")
     rdp.set_defaults(func=rebuild_diff_playlists_cmd)
+
+    rdt = rds.add_parser("tracks", help="Diff two track manifests")
+    rdt.add_argument("a", help="Path to manifest A (old)")
+    rdt.add_argument("b", help="Path to manifest B (new)")
+    rdt.add_argument("--db", default="data/db.sqlite")
+    rdt.add_argument("--json", action="store_true")
+    rdt.add_argument("--show", type=int, default=50, help="Max items to print per section (default: 50)")
+    rdt.set_defaults(func=rebuild_diff_tracks_cmd)
