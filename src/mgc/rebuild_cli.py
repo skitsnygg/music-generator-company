@@ -44,9 +44,19 @@ def _playlist_out_path(export_dir: Path, pl: PlaylistRow) -> Path:
     return export_dir / name
 
 
+def _payload_bytes(obj: Dict[str, Any]) -> bytes:
+    """
+    The *exact* bytes we will write for playlist JSON files:
+      - canonical_json(obj)
+      - + trailing newline
+    Manifest hashing and byte counts must match this exactly.
+    """
+    return (canonical_json(obj) + "\n").encode("utf-8")
+
+
 def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(canonical_json(obj) + "\n", encoding="utf-8")
+    path.write_bytes(_payload_bytes(obj))
 
 
 def _stable_playlist_obj(obj: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
@@ -128,9 +138,11 @@ def _build_manifest(
         # 🔒 Gate #1: DB vs export consistency (raise only)
         _quality_gate_playlist(pl, obj)
 
-        payload = canonical_json(obj)
-        sha = _sha256_text(payload)
         out_path = _playlist_out_path(export_dir, pl)
+
+        # IMPORTANT: hash + bytes match what we actually write (canonical JSON + newline)
+        data = _payload_bytes(obj)
+        sha = _sha256_bytes(data)
 
         items.append(
             ManifestItem(
@@ -138,7 +150,7 @@ def _build_manifest(
                 slug=pl.slug,
                 path=str(out_path),
                 sha256=sha,
-                bytes=len(payload.encode("utf-8")) + 1,  # + newline when written
+                bytes=len(data),
                 track_count=len(obj.get("tracks") or []),
             )
         )
@@ -217,15 +229,6 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
     changed: List[Dict[str, Any]] = []
     same: List[str] = []
-
-    def key_fields(it: Dict[str, Any]) -> Tuple[str, str, Optional[int], Optional[int], Optional[int]]:
-        return (
-            str(it.get("sha256") or ""),
-            str(it.get("path") or ""),
-            _as_int(it.get("bytes")),
-            _as_int(it.get("track_count")),
-            _as_int(it.get("playlist_id")),  # never used, just keeps tuple stable-ish
-        )
 
     for pid in common:
         ai = a_map[pid]
@@ -654,7 +657,10 @@ def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
             print("\nCHANGED:")
             for ch in diff["changed"][:show]:
                 pid = ch["playlist_id"]
-                print(f"  ~ {pid}  sha {_short(ch['sha256_a'])} -> {_short(ch['sha256_b'])}  bytes {ch['bytes_a']} -> {ch['bytes_b']}  tc {ch['track_count_a']} -> {ch['track_count_b']}")
+                print(
+                    f"  ~ {pid}  sha {_short(ch['sha256_a'])} -> {_short(ch['sha256_b'])}  "
+                    f"bytes {ch['bytes_a']} -> {ch['bytes_b']}  tc {ch['track_count_a']} -> {ch['track_count_b']}"
+                )
             if len(diff["changed"]) > show:
                 print(f"  ... ({len(diff['changed']) - show} more)")
 
