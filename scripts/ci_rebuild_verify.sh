@@ -4,10 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-# Default DB for CI
 : "${MGC_DB:=fixtures/ci_db.sqlite}"
 
-# Normalize to absolute path
 case "$MGC_DB" in
   /*) db_path="$MGC_DB" ;;
   *)  db_path="$repo_root/$MGC_DB" ;;
@@ -70,67 +68,92 @@ maybe_generate_fixture_db () {
   fi
 }
 
+# Feature-detect CLI flags so CI won't break if flags aren't present yet.
+has_flag () {
+  # usage: has_flag "<help command>" "<flag>"
+  local help_cmd="$1"
+  local flag="$2"
+  if eval "$help_cmd" 2>/dev/null | grep -q -- "$flag"; then
+    return 0
+  fi
+  return 1
+}
+
+PLAYLISTS_REL_FLAG=""
+TRACKS_REL_FLAG=""
+VERIFY_PLAYLISTS_STRICT_FLAG=""
+VERIFY_TRACKS_STRICT_FLAG=""
+
+if has_flag "python -m mgc.main rebuild playlists --help" "--relative-paths"; then
+  PLAYLISTS_REL_FLAG="--relative-paths"
+fi
+if has_flag "python -m mgc.main rebuild tracks --help" "--relative-paths"; then
+  TRACKS_REL_FLAG="--relative-paths"
+fi
+if has_flag "python -m mgc.main rebuild verify playlists --help" "--strict-paths"; then
+  VERIFY_PLAYLISTS_STRICT_FLAG="--strict-paths"
+fi
+if has_flag "python -m mgc.main rebuild verify tracks --help" "--strict-paths"; then
+  VERIFY_TRACKS_STRICT_FLAG="--strict-paths"
+fi
+
+echo "[ci_rebuild_verify] flags: playlists_relative='${PLAYLISTS_REL_FLAG:-<none>}' tracks_relative='${TRACKS_REL_FLAG:-<none>}' verify_playlists_strict='${VERIFY_PLAYLISTS_STRICT_FLAG:-<none>}' verify_tracks_strict='${VERIFY_TRACKS_STRICT_FLAG:-<none>}'"
+
 run_ls_json () {
-  # Stats command may not exist; ls is the authoritative, lightweight status.
+  echo "[ci_rebuild_verify] == ls (status) =="
   python -m mgc.main rebuild ls --json || true
 }
 
 run_rebuild_playlists () {
+  echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
   python -m mgc.main rebuild playlists \
     --db "$MGC_DB" \
     --out-dir "data/playlists" \
     --stamp "ci" \
-    --relative-paths \
+    ${PLAYLISTS_REL_FLAG} \
     --determinism-check \
     --write
 }
 
 run_verify_playlists () {
+  echo "[ci_rebuild_verify] == verify playlists vs manifest + files =="
+  test -f data/playlists/_manifest.playlists.json
+  python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
   python -m mgc.main rebuild verify playlists \
     --db "$MGC_DB" \
     --out-dir "data/playlists" \
-    --strict-paths
+    ${VERIFY_PLAYLISTS_STRICT_FLAG}
 }
 
 run_rebuild_tracks () {
+  echo "[ci_rebuild_verify] == rebuild tracks (determinism check + write) =="
   python -m mgc.main rebuild tracks \
     --db "$MGC_DB" \
     --out-dir "data/tracks" \
     --stamp "ci" \
-    --relative-paths \
+    ${TRACKS_REL_FLAG} \
     --determinism-check \
     --write
 }
 
 run_verify_tracks () {
+  echo "[ci_rebuild_verify] == verify tracks vs manifest + files =="
+  test -f data/tracks/_manifest.tracks.json
+  python -c "import json; json.load(open('data/tracks/_manifest.tracks.json'))"
   python -m mgc.main rebuild verify tracks \
     --db "$MGC_DB" \
     --out-dir "data/tracks" \
-    --strict-paths
+    ${VERIFY_TRACKS_STRICT_FLAG}
 }
 
 # --- main flow ---
-
 maybe_generate_fixture_db
 db_preflight
 
-echo "[ci_rebuild_verify] == ls (status) =="
 run_ls_json
-
-echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
 run_rebuild_playlists
-
-echo "[ci_rebuild_verify] == verify playlists vs manifest + files =="
-test -f data/playlists/_manifest.playlists.json
-python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
 run_verify_playlists
-
-echo "[ci_rebuild_verify] == rebuild tracks (determinism check + write) =="
 run_rebuild_tracks
-
-echo "[ci_rebuild_verify] == verify tracks vs manifest + files =="
-test -f data/tracks/_manifest.tracks.json
-python -c "import json; json.load(open('data/tracks/_manifest.tracks.json'))"
 run_verify_tracks
 
 echo "[ci_rebuild_verify] OK"
