@@ -18,6 +18,10 @@ export MGC_DB="$db_path"
 
 echo "[ci_gate] MGC_DB=$MGC_DB"
 
+echo "[ci_gate] git_sha: $(git rev-parse HEAD)"
+echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD)"
+
+
 # Ensure DB exists and is non-empty; otherwise generate it
 mkdir -p "$(dirname "$MGC_DB")"
 if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
