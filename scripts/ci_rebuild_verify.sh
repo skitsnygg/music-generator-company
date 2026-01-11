@@ -100,6 +100,33 @@ run_verify_tracks () {
     --out-dir "data/tracks"
 }
 
+run_stats_strict () {
+  python -m mgc.main rebuild stats \
+    --db "$MGC_DB" \
+    --min-playlists 1 \
+    --min-tracks 1
+}
+
+echo "[ci_rebuild_verify] == stats (strict) =="
+run_stats_strict
+
+echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
+run_rebuild_playlists
+
+echo "[ci_rebuild_verify] == verify playlists vs manifest + files =="
+test -f data/playlists/_manifest.playlists.json
+python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
+run_verify_playlists
+
+echo "[ci_rebuild_verify] == rebuild tracks (determinism check + write) =="
+run_rebuild_tracks
+
+echo "[ci_rebuild_verify] == verify tracks vs manifest + files =="
+test -f data/tracks/_manifest.tracks.json
+python -c "import json; json.load(open('data/tracks/_manifest.tracks.json'))"
+run_verify_tracks
+
+
 # --- main flow ---
 
 maybe_generate_fixture_db
