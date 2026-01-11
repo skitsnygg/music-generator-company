@@ -1,48 +1,47 @@
 #!/usr/bin/env python3
+"""
+src/mgc/main.py
+
+CI compatibility:
+- `mgc rebuild ls --json ...`  (CI may put --json after subcommand)
+- `mgc rebuild playlists --db ... --out-dir ... --stamp ... --determinism-check --write`
+- `mgc rebuild verify playlists ...`
+- `mgc rebuild tracks ...`
+- `mgc rebuild verify tracks ...`
+
+Other commands:
+- playlists: list, history, reveal, export
+- tracks: list, show, stats
+- marketing: posts list
+- analytics: delegated to mgc.analytics_cli if available
+
+Logging:
+- deterministic UTC timestamps
+- no duplicate logging
+- if --log-file is set, default file-only logs (use --log-console to also log to stderr)
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dotenv import load_dotenv
 
-try:
-    from mgc.logging_setup import setup_logging  # type: ignore
-except Exception:
-    setup_logging = None  # type: ignore
+DEFAULT_DB = "data/db.sqlite"
+DEFAULT_PLAYLIST_DIR = Path("data/playlists")
+DEFAULT_TRACKS_DIR = Path("data/tracks")
+DEFAULT_TRACKS_EXPORT = DEFAULT_TRACKS_DIR / "tracks.json"
 
-from mgc.analytics_cli import register_analytics_subcommand
-from mgc.events import EventContext, EventWriter, new_run_id
-from mgc.rebuild_cli import register_rebuild_subcommand
-from mgc.db_helpers import (
-    NotFoundError,
-    PlaylistRow,
-    ResolvedRef,
-    TrackRow,
-    compute_diff,
-    db_build_playlist_json,
-    db_duration_for_tracks,
-    db_get_playlist,
-    db_get_track,
-    db_insert_playlist_run,
-    db_list_events,
-    db_list_playlist_runs,
-    db_list_playlists,
-    db_list_playlists_by_slug,
-    db_list_tracks,
-    db_playlist_track_ids,
-    db_tracks_stats,
-    ensure_playlist_runs_table,
-    resolve_ref,
-    resolve_json_path,
-    sqlite_connect,
-)
+LOG_FMT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 
 # ----------------------------
@@ -53,1007 +52,991 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-def die(msg: str, code: int = 2) -> NoReturn:
+def die(msg: str, code: int = 2) -> "NoReturn":
     eprint(msg)
     raise SystemExit(code)
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def read_json_file(path: Path) -> Dict[str, Any]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        die(f"JSON file not found: {path}")
-    except json.JSONDecodeError as ex:
-        die(f"Invalid JSON in {path}: {ex}")
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    ensure_parent_dir(path)
+    path.write_text(text, encoding="utf-8")
+
+
+def read_json_file(path: Path) -> Any:
+    return json.loads(read_text(path))
+
+
+def stable_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def write_json_file(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def ensure_requests() -> Any:
-    try:
-        import requests  # type: ignore
-        return requests
-    except Exception:
-        die("Missing dependency: requests. Install with: pip install requests")
-
-
-def cmd_name(args: argparse.Namespace) -> str:
-    parts: List[str] = []
-    if getattr(args, "cmd", None):
-        parts.append(str(args.cmd))
-    if getattr(args, "db_cmd", None):
-        parts.append(str(args.db_cmd))
-    if getattr(args, "playlists_cmd", None):
-        parts.append(str(args.playlists_cmd))
-    if getattr(args, "tracks_cmd", None):
-        parts.append(str(args.tracks_cmd))
-    if getattr(args, "analytics_cmd", None):
-        parts.append(str(args.analytics_cmd))
-    if getattr(args, "events_cmd", None):
-        parts.append(str(args.events_cmd))
-    if getattr(args, "rebuild_cmd", None):
-        parts.append(str(args.rebuild_cmd))
-    if getattr(args, "manifest_cmd", None):
-        parts.append(str(args.manifest_cmd))
-    return " ".join(parts) if parts else "unknown"
-
-
-def _jsonable(x: Any) -> Any:
-    if x is None or isinstance(x, (str, int, float, bool)):
-        return x
-    if isinstance(x, Path):
-        return str(x)
-    if isinstance(x, dict):
-        out: Dict[str, Any] = {}
-        for k, v in x.items():
-            if k == "func":
-                continue
-            out[str(k)] = _jsonable(v)
-        return out
-    if isinstance(x, (list, tuple)):
-        return [_jsonable(v) for v in x]
-    if isinstance(x, (set, frozenset)):
-        return sorted([_jsonable(v) for v in x])
-    if callable(x):
-        return getattr(x, "__name__", "<callable>")
-    return str(x)
-
-
-def args_payload(args: argparse.Namespace) -> Dict[str, Any]:
-    d = vars(args).copy()
-    d.pop("func", None)
-    return _jsonable(d)
-
-
-# ----------------------------
-# export layout
-# ----------------------------
-
-def default_export_dir() -> Path:
-    return Path(os.environ.get("MGC_PLAYLISTS_DIR", "data/playlists"))
-
-
-def safe_slug(s: str) -> str:
-    s = s.strip()
-    out = "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_")).strip("-_")
-    return out
-
-
-def export_filename(playlist_id: str, slug: Optional[str] = None) -> str:
-    if slug:
-        return f"{safe_slug(slug)}_{playlist_id}.json"
-    return f"{playlist_id}.json"
-
-
-# ----------------------------
-# validation
-# ----------------------------
-
-def validate_playlist_json(obj: Dict[str, Any]) -> Tuple[bool, str]:
-    if not isinstance(obj, dict):
-        return False, "playlist JSON is not an object"
-    tracks = obj.get("tracks")
-    if not isinstance(tracks, list):
-        return False, "missing tracks[] list"
-    if len(tracks) == 0:
-        return False, "tracks[] is empty"
-    return True, "ok"
-
-
-# ----------------------------
-# push targets
-# ----------------------------
-
-@dataclass
-class PushResult:
-    target: str
-    ok: bool
-    detail: str
-
-
-def push_local(src_path: Path, dst_dir: Path, overwrite: bool, dry_run: bool) -> PushResult:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_path = dst_dir / src_path.name
-
-    if dst_path.exists() and not overwrite:
-        return PushResult("local", True, f"Skipped (exists): {dst_path}")
-
-    if dry_run:
-        return PushResult("local", True, f"Dry-run copy to: {dst_path}")
-
-    dst_path.write_bytes(src_path.read_bytes())
-    return PushResult("local", True, f"Copied to: {dst_path}")
-
-
-def push_webhook(src_path: Path, url: str, timeout_s: int, dry_run: bool) -> PushResult:
-    requests = ensure_requests()
-    payload = read_json_file(src_path)
-    headers = {"Content-Type": "application/json", "User-Agent": "mgc-cli/1.0"}
-
-    if dry_run:
-        return PushResult("webhook", True, f"Dry-run POST to: {url}")
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
-        if 200 <= int(resp.status_code) < 300:
-            return PushResult("webhook", True, f"POST {resp.status_code}: {url}")
-        return PushResult("webhook", False, f"POST {resp.status_code}: {resp.text[:400]}")
-    except Exception as ex:
-        return PushResult("webhook", False, f"POST failed: {ex}")
-
-
-# ----------------------------
-# playlist export helpers
-# ----------------------------
-
-def export_one_playlist(conn, pl: PlaylistRow, hookup_export_dir: Path, build: bool) -> Path:
-    hookup_export_dir.mkdir(parents=True, exist_ok=True)
-    out_path = hookup_export_dir / export_filename(pl.id, pl.slug)
-
-    if build:
-        obj = db_build_playlist_json(conn, pl, built_at=now_iso())
-        obj.setdefault("exported_at", now_iso())
-        write_json_file(out_path, obj)
-        return out_path
-
-    src = resolve_json_path(pl.json_path)
-    if src.exists():
-        obj = read_json_file(src)
-        if isinstance(obj, dict):
-            obj.setdefault("id", pl.id)
-            obj.setdefault("slug", pl.slug)
-            obj.setdefault("exported_at", now_iso())
-            write_json_file(out_path, obj)
-        else:
-            out_path.write_bytes(src.read_bytes())
-        return out_path
-
-    obj = db_build_playlist_json(conn, pl, built_at=now_iso())
-    obj.setdefault("exported_at", now_iso())
-    write_json_file(out_path, obj)
-    return out_path
-
-
-def maybe_record_run(
-    conn,
-    ew: Optional[EventWriter],
-    pl: PlaylistRow,
-    export_path: Path,
-    record: bool,
-    notes: Optional[str],
-) -> Optional[str]:
-    if not record:
-        return None
-
-    ensure_playlist_runs_table(conn)
-    track_ids = db_playlist_track_ids(conn, pl.id)
-
-    rid = db_insert_playlist_run(
-        conn=conn,
-        created_at=now_iso(),
-        playlist_id=pl.id,
-        seed=pl.seed,
-        track_ids=track_ids,
-        export_path=export_path,
-        notes=notes,
+    ensure_parent_dir(path)
+    path.write_text(
+        json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
-    if ew:
-        ew.emit(
-            "playlist.run_recorded",
-            "playlist",
-            pl.id,
-            {
-                "playlist_id": pl.id,
-                "slug": pl.slug,
-                "run_id": rid,
-                "seed": pl.seed,
-                "track_count": len(track_ids),
-                "export_path": str(export_path),
-                "notes": notes,
-            },
-            occurred_at=now_iso(),
-        )
-    return rid
+
+def _truthy(a: bool, b: bool) -> bool:
+    return bool(a) or bool(b)
 
 
 # ----------------------------
-# commands
+# logging (deterministic, no duplicates)
 # ----------------------------
 
-def events_list_cmd(args: argparse.Namespace) -> int:
-    conn = sqlite_connect(args.db)
+class _UTCFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec="seconds")
+
+
+def _parse_level(level: str) -> int:
     try:
-        rows = db_list_events(
-            conn,
-            limit=args.limit,
-            run_id=args.run_id,
-            event_type=args.event_type,
-        )
-    finally:
-        conn.close()
+        return int(level)
+    except Exception:
+        pass
+    lvl = logging.getLevelName(str(level).upper())
+    return lvl if isinstance(lvl, int) else logging.INFO
+
+
+def _clear_all_non_root_handlers() -> None:
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    mgr = logging.root.manager
+    for name, logger_obj in list(mgr.loggerDict.items()):
+        if not isinstance(logger_obj, logging.Logger):
+            continue
+        if name == "root":
+            continue
+        for h in list(logger_obj.handlers):
+            logger_obj.removeHandler(h)
+        logger_obj.propagate = True
+
+
+def _configure_logging(*, level: str, log_file: Optional[str], log_console: bool) -> None:
+    _clear_all_non_root_handlers()
+
+    fmt = _UTCFormatter(LOG_FMT, datefmt=LOG_DATEFMT)
+    handlers: List[logging.Handler] = []
+
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        handlers.append(fh)
+
+        if log_console:
+            sh = logging.StreamHandler(stream=sys.stderr)
+            sh.setFormatter(fmt)
+            handlers.append(sh)
+    else:
+        sh = logging.StreamHandler(stream=sys.stderr)
+        sh.setFormatter(fmt)
+        handlers.append(sh)
+
+    logging.basicConfig(
+        level=_parse_level(level),
+        handlers=handlers,
+        force=True,
+    )
+
+
+# ----------------------------
+# DB helpers
+# ----------------------------
+
+@dataclass(frozen=True)
+class DBConn:
+    path: Path
+
+    def connect(self) -> sqlite3.Connection:
+        if not self.path.exists():
+            raise FileNotFoundError(f"DB not found: {self.path}")
+        conn = sqlite3.connect(str(self.path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return [r["name"] for r in rows]
+
+
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
+
+
+def _maybe_int(v: Any) -> Optional[int]:
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _safe_select_playlist_rows(conn: sqlite3.Connection, *, limit: int, slug: Optional[str] = None) -> List[sqlite3.Row]:
+    if not _table_exists(conn, "playlists"):
+        return []
+
+    cols = set(_columns(conn, "playlists"))
+
+    order_by = None
+    if "created_at" in cols:
+        order_by = "created_at DESC"
+    elif "created_ts" in cols:
+        order_by = "created_ts DESC"
+    elif "id" in cols:
+        order_by = "id DESC"
+
+    where = ""
+    params: List[Any] = []
+    if slug and "slug" in cols:
+        where = "WHERE slug = ?"
+        params.append(slug)
+
+    q = "SELECT * FROM playlists "
+    if where:
+        q += where + " "
+    if order_by:
+        q += f"ORDER BY {order_by} "
+    q += "LIMIT ?"
+    params.append(limit)
+
+    return conn.execute(q, tuple(params)).fetchall()
+
+
+def _safe_select_latest_playlists_by_slug(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    if not _table_exists(conn, "playlists"):
+        return []
+
+    cols = set(_columns(conn, "playlists"))
+    if "slug" not in cols:
+        return _safe_select_playlist_rows(conn, limit=1_000_000)
+
+    ts_col = "created_at" if "created_at" in cols else ("created_ts" if "created_ts" in cols else None)
+
+    if ts_col:
+        q = f"""
+        SELECT p.*
+        FROM playlists p
+        JOIN (
+          SELECT slug, MAX({ts_col}) AS mx
+          FROM playlists
+          GROUP BY slug
+        ) x
+        ON p.slug = x.slug AND p.{ts_col} = x.mx
+        ORDER BY p.slug ASC
+        """
+    else:
+        q = """
+        SELECT p.*
+        FROM playlists p
+        JOIN (
+          SELECT slug, MAX(id) AS mx
+          FROM playlists
+          GROUP BY slug
+        ) x
+        ON p.slug = x.slug AND p.id = x.mx
+        ORDER BY p.slug ASC
+        """
+    return conn.execute(q).fetchall()
+
+
+def _safe_get_playlist_by_id(conn: sqlite3.Connection, playlist_id: str) -> Optional[sqlite3.Row]:
+    if not _table_exists(conn, "playlists"):
+        return None
+    cols = set(_columns(conn, "playlists"))
+    if "id" not in cols:
+        return None
+    return conn.execute("SELECT * FROM playlists WHERE id = ? LIMIT 1", (playlist_id,)).fetchone()
+
+
+def _safe_select_playlist_items(conn: sqlite3.Connection, playlist_id: str, limit: int) -> List[sqlite3.Row]:
+    if not _table_exists(conn, "playlist_items"):
+        return []
+    cols = set(_columns(conn, "playlist_items"))
+    if "playlist_id" not in cols:
+        return []
+
+    q = "SELECT * FROM playlist_items WHERE playlist_id = ?"
+    params: List[Any] = [playlist_id]
+
+    if "position" in cols:
+        q += " ORDER BY position ASC"
+    elif "idx" in cols:
+        q += " ORDER BY idx ASC"
+    elif "created_at" in cols:
+        q += " ORDER BY created_at ASC"
+    q += " LIMIT ?"
+    params.append(limit)
+
+    return conn.execute(q, tuple(params)).fetchall()
+
+
+def _safe_get_track_by_id(conn: sqlite3.Connection, track_id: str) -> Optional[sqlite3.Row]:
+    if not _table_exists(conn, "tracks"):
+        return None
+    cols = set(_columns(conn, "tracks"))
+    if "id" not in cols:
+        return None
+    return conn.execute("SELECT * FROM tracks WHERE id = ? LIMIT 1", (track_id,)).fetchone()
+
+
+# ----------------------------
+# formatting
+# ----------------------------
+
+def _fmt_playlist_list_row(row: sqlite3.Row) -> str:
+    d = _row_to_dict(row)
+    pid = str(d.get("id", ""))
+    slug = str(d.get("slug", d.get("name", "")) or "")
+    created = d.get("created_at", d.get("created_ts", d.get("created", "")))
+
+    tracks_n = None
+    for key in ("tracks", "track_count", "num_tracks", "n_tracks"):
+        if key in d:
+            tracks_n = _maybe_int(d.get(key))
+            break
+
+    json_path = d.get("json_path", d.get("path", ""))
+
+    parts = [pid, slug]
+    if created:
+        parts.append(str(created))
+    if tracks_n is not None:
+        parts.append(f"tracks={tracks_n}")
+    if json_path:
+        parts.append(f"json_path={json_path}")
+    return "  " + "  ".join(parts)
+
+
+# ----------------------------
+# playlist JSON extraction/rebuild
+# ----------------------------
+
+def _extract_playlist_json_from_row(d: Dict[str, Any]) -> Optional[Any]:
+    for key in ("json", "playlist_json", "payload", "payload_json", "data", "data_json", "json_blob"):
+        if key not in d:
+            continue
+        val = d.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (dict, list)):
+            return val
+        if isinstance(val, (bytes, bytearray)):
+            try:
+                return json.loads(val.decode("utf-8"))
+            except Exception:
+                continue
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                continue
+            try:
+                return json.loads(s)
+            except Exception:
+                continue
+    return None
+
+
+def _reconstruct_playlist_json(conn: sqlite3.Connection, playlist_row: Dict[str, Any], *, item_limit: int = 500) -> Dict[str, Any]:
+    pid = str(playlist_row.get("id", ""))
+    slug = str(playlist_row.get("slug", playlist_row.get("name", "")) or "")
+    created_at = playlist_row.get("created_at", playlist_row.get("created_ts", playlist_row.get("created", "")))
+
+    items = _safe_select_playlist_items(conn, pid, limit=item_limit)
+    item_dicts = [_row_to_dict(r) for r in items]
+
+    tracks: List[Dict[str, Any]] = []
+    for it in item_dicts:
+        tid = None
+        for k in ("track_id", "track_uuid", "track", "id_track"):
+            if k in it and it[k]:
+                tid = str(it[k])
+                break
+        if tid:
+            tr = _safe_get_track_by_id(conn, tid)
+            if tr is not None:
+                tracks.append(_row_to_dict(tr))
+                continue
+        tracks.append(it)
+
+    return {"id": pid, "slug": slug, "created_at": created_at, "tracks": tracks}
+
+
+def _safe_slug(s: str) -> str:
+    s2 = s.strip().replace(" ", "_")
+    return s2 if s2 else "playlist"
+
+
+def _playlist_output_path(d: Dict[str, Any], *, out_dir: Path) -> Path:
+    p = d.get("json_path") or d.get("path")
+    if p:
+        return Path(str(p))
+    slug = str(d.get("slug", "")) if d.get("slug") else "playlist"
+    return out_dir / f"{_safe_slug(slug)}.json"
+
+
+def _build_playlist_json_for_row(conn: sqlite3.Connection, d: Dict[str, Any]) -> Any:
+    src = d.get("json_path") or d.get("path")
+    if src:
+        src_path = Path(str(src))
+        if src_path.exists():
+            try:
+                return read_json_file(src_path)
+            except Exception:
+                pass
+
+    blob = _extract_playlist_json_from_row(d)
+    if blob is not None:
+        return blob
+
+    return _reconstruct_playlist_json(conn, d)
+
+
+# ----------------------------
+# playlists/tracks/marketing commands
+# ----------------------------
+
+def cmd_playlists_list(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.playlists.list")
+    db = DBConn(Path(args.db))
+    with db.connect() as conn:
+        rows = _safe_select_playlist_rows(conn, limit=args.limit, slug=args.slug)
 
     if args.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(json.dumps([_row_to_dict(r) for r in rows], indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
     if not rows:
-        print("(no events)")
+        log.info("No playlists found.")
         return 0
 
     for r in rows:
-        ts = r["occurred_at"]
-        et = r["event_type"]
-        ent = f"{r['entity_type']}:{r['entity_id']}" if r["entity_id"] else r["entity_type"]
-        print(f"{ts}  {et:<28}  {ent}  run={r['run_id']}")
+        print(_fmt_playlist_list_row(r))
     return 0
 
 
-def manifest_diff_cmd(args: argparse.Namespace) -> int:
-    from mgc.manifest import diff_manifest
-    return int(diff_manifest(args.committed, args.generated))
+def cmd_playlists_history(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.playlists.history")
+    db = DBConn(Path(args.db))
+    target = args.target
 
-def db_schema_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
-
-    try:
-        with conn:
-            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            tables = [r["name"] for r in cur.fetchall()]
-            for t in tables:
-                print(t)
-                info = conn.execute(f"PRAGMA table_info({t})").fetchall()
-                for r in info:
-                    name = r["name"]
-                    ctype = r["type"] or ""
-                    pk = " pk" if r["pk"] else ""
-                    nn = " notnull" if r["notnull"] else ""
-                    print(f"  - {name} {ctype}{pk}{nn}")
-
-        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-        return 0
-
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
-
-
-def playlists_list_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
-
-    try:
-        with conn:
-            pls = db_list_playlists(conn, limit=args.limit)
-
-        if args.json:
-            print(json.dumps([pl.__dict__ for pl in pls], indent=2, ensure_ascii=False))
+    with db.connect() as conn:
+        by_id = _safe_get_playlist_by_id(conn, target)
+        if by_id is not None:
+            d = _row_to_dict(by_id)
+            slug = d.get("slug")
+            rows = _safe_select_playlist_rows(conn, limit=args.limit, slug=slug) if slug else [by_id]
         else:
-            if not pls:
-                print("(no playlists)")
-            else:
-                for i, pl in enumerate(pls, 1):
-                    print(f"{i:>2}. {pl.id}  {pl.slug}  {pl.created_at}  tracks={pl.track_count}  json_path={pl.json_path}")
+            rows = _safe_select_playlist_rows(conn, limit=args.limit, slug=target)
 
-        ew.emit(
-            "system.command_completed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": True, "result_count": len(pls)},
-            occurred_at=now_iso(),
-        )
+    if args.json:
+        print(json.dumps([_row_to_dict(r) for r in rows], indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+    if not rows:
+        log.info("No playlist history found for: %s", target)
+        return 0
+
+    for i, r in enumerate(rows, start=1):
+        print(f"{i:2d}. {_fmt_playlist_list_row(r).strip()}")
+    return 0
 
 
-def playlists_reveal_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
+def cmd_playlists_reveal(args: argparse.Namespace) -> int:
+    db = DBConn(Path(args.db))
+    playlist_id = args.id
+    json_path: Optional[Path] = None
 
-    try:
-        with conn:
-            pl = db_get_playlist(conn, args.id)
+    with db.connect() as conn:
+        row = _safe_get_playlist_by_id(conn, playlist_id)
+        if row is not None:
+            d = _row_to_dict(row)
+            p = d.get("json_path") or d.get("path")
+            if p:
+                json_path = Path(str(p))
 
-            if args.build:
-                obj = db_build_playlist_json(conn, pl, built_at=now_iso())
-                print(json.dumps(obj, indent=2, ensure_ascii=False))
-                ew.emit(
-                    "playlist.built_from_db",
-                    "playlist",
-                    pl.id,
-                    {"playlist_id": pl.id, "slug": pl.slug, "track_count": len(obj.get("tracks", []))},
-                    occurred_at=now_iso(),
-                )
-                ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-                return 0
+    if json_path is None:
+        candidate = Path(playlist_id)
+        if candidate.exists() and candidate.is_file():
+            json_path = candidate
 
-            jp = resolve_json_path(pl.json_path)
-            if jp.exists():
-                obj = read_json_file(jp)
-                print(json.dumps(obj, indent=2, ensure_ascii=False))
-                ew.emit(
-                    "playlist.revealed",
-                    "playlist",
-                    pl.id,
-                    {"playlist_id": pl.id, "slug": pl.slug, "source": "json_path", "path": str(jp)},
-                    occurred_at=now_iso(),
-                )
-                ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-                return 0
+    if json_path is None:
+        die(f"Could not find playlist JSON for id/path: {playlist_id}")
 
-            obj = db_build_playlist_json(conn, pl, built_at=now_iso())
-            print(json.dumps(obj, indent=2, ensure_ascii=False))
-            ew.emit(
-                "playlist.revealed",
-                "playlist",
-                pl.id,
-                {"playlist_id": pl.id, "slug": pl.slug, "source": "db_build"},
-                occurred_at=now_iso(),
-            )
-            ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
+    data = read_json_file(json_path)
+    print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_playlists_export(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.playlists.export")
+    db = DBConn(Path(args.db))
+    out_dir = Path(args.out_dir)
+
+    exported: List[str] = []
+    with db.connect() as conn:
+        rows = _safe_select_playlist_rows(conn, limit=args.limit, slug=args.slug)
+        if not rows:
+            log.info("No playlists to export.")
             return 0
 
-    except NotFoundError as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        die(str(e), 2)
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+        for r in rows:
+            d = _row_to_dict(r)
+            pid = str(d.get("id", ""))
+            slug = str(d.get("slug", "")) if d.get("slug") else ""
+            safe = _safe_slug(slug) if slug else "playlist"
+            dst = out_dir / (f"{safe}_{pid}.json" if pid else f"{safe}.json")
+
+            obj = _build_playlist_json_for_row(conn, d)
+            write_json_file(dst, obj)
+            exported.append(str(dst))
+
+    if args.json:
+        print(json.dumps({"exported": exported}, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for p in exported:
+            print(p)
+    return 0
 
 
-def playlists_export_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    export_dir = Path(args.out_dir) if args.out_dir else default_export_dir()
+def cmd_tracks_list(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.tracks.list")
+    db = DBConn(Path(args.db))
 
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
-
-    try:
-        out_paths: List[str] = []
-        run_ids: List[str] = []
-
-        with conn:
-            if args.id:
-                pl = db_get_playlist(conn, args.id)
-                out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
-                out_paths.append(str(out_path))
-
-                ew.emit(
-                    "playlist.exported",
-                    "playlist",
-                    pl.id,
-                    {"playlist_id": pl.id, "slug": pl.slug, "export_path": str(out_path), "build": bool(args.build), "out_dir": str(export_dir)},
-                    occurred_at=now_iso(),
-                )
-
-                rid = maybe_record_run(conn, ew, pl, out_path, record=not args.no_record, notes=args.notes)
-                if rid:
-                    run_ids.append(rid)
-
+    with db.connect() as conn:
+        if not _table_exists(conn, "tracks"):
+            if args.json:
+                print("[]")
             else:
-                pls = db_list_playlists(conn, limit=args.limit)
-                if not pls:
-                    die("No playlists found to export.")
+                log.info("No tracks table found.")
+            return 0
 
-                for pl in pls:
-                    out_path = export_one_playlist(conn, pl, export_dir, build=bool(args.build))
-                    out_paths.append(str(out_path))
+        cols = set(_columns(conn, "tracks"))
+        where: List[str] = []
+        params: List[Any] = []
 
-                    ew.emit(
-                        "playlist.exported",
-                        "playlist",
-                        pl.id,
-                        {"playlist_id": pl.id, "slug": pl.slug, "export_path": str(out_path), "build": bool(args.build), "out_dir": str(export_dir)},
-                        occurred_at=now_iso(),
-                    )
+        if args.mood and "mood" in cols:
+            where.append("mood = ?")
+            params.append(args.mood)
+        if args.genre and "genre" in cols:
+            where.append("genre = ?")
+            params.append(args.genre)
 
-                    rid = maybe_record_run(conn, ew, pl, out_path, record=not args.no_record, notes=args.notes)
-                    if rid:
-                        run_ids.append(rid)
+        q = "SELECT * FROM tracks "
+        if where:
+            q += "WHERE " + " AND ".join(where) + " "
+        if "created_at" in cols:
+            q += "ORDER BY created_at DESC "
+        elif "id" in cols:
+            q += "ORDER BY id DESC "
+        q += "LIMIT ?"
+        params.append(args.limit)
 
-        if args.json:
-            payload: Dict[str, Any] = {"exported": out_paths}
-            if args.id:
-                payload["run_id"] = (run_ids[0] if run_ids else None)
+        rows = conn.execute(q, tuple(params)).fetchall()
+
+    if args.json:
+        print(json.dumps([_row_to_dict(r) for r in rows], indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if not rows:
+        log.info("No tracks found.")
+        return 0
+
+    for r in rows:
+        d = _row_to_dict(r)
+        parts = [str(d.get("id", ""))]
+        for key in ("title", "name", "slug"):
+            if d.get(key):
+                parts.append(str(d[key]))
+                break
+        if d.get("mood"):
+            parts.append(f"mood={d['mood']}")
+        if d.get("genre"):
+            parts.append(f"genre={d['genre']}")
+        print("  " + "  ".join(parts))
+    return 0
+
+
+def cmd_tracks_show(args: argparse.Namespace) -> int:
+    db = DBConn(Path(args.db))
+    with db.connect() as conn:
+        if not _table_exists(conn, "tracks"):
+            die("No tracks table found.")
+        cols = set(_columns(conn, "tracks"))
+        if "id" not in cols:
+            die("tracks table has no id column.")
+        row = conn.execute("SELECT * FROM tracks WHERE id = ? LIMIT 1", (args.id,)).fetchone()
+
+    if row is None:
+        die(f"Track not found: {args.id}")
+
+    print(json.dumps(_row_to_dict(row), indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_tracks_stats(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.tracks.stats")
+    db = DBConn(Path(args.db))
+
+    with db.connect() as conn:
+        if not _table_exists(conn, "tracks"):
+            if args.json:
+                print("{}")
             else:
-                payload["run_ids"] = run_ids
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-        else:
-            for pth in out_paths:
-                print(pth)
-            if run_ids:
-                print("Recorded runs:")
-                for rid in run_ids:
-                    print(f"  {rid}")
+                log.info("No tracks table found.")
+            return 0
 
-        ew.emit(
-            "system.command_completed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": True, "exported_count": len(out_paths), "recorded_runs": len(run_ids)},
-            occurred_at=now_iso(),
-        )
-        return 0
+        cols = set(_columns(conn, "tracks"))
+        total = int(conn.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()["n"])
 
-    except NotFoundError as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        die(str(e), 2)
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+        by_mood: Dict[str, int] = {}
+        if "mood" in cols:
+            rows = conn.execute("SELECT mood, COUNT(*) AS n FROM tracks GROUP BY mood ORDER BY mood ASC").fetchall()
+            by_mood = {str(r["mood"]): int(r["n"]) for r in rows}
+
+        by_genre: Dict[str, int] = {}
+        if "genre" in cols:
+            rows = conn.execute("SELECT genre, COUNT(*) AS n FROM tracks GROUP BY genre ORDER BY genre ASC").fetchall()
+            by_genre = {str(r["genre"]): int(r["n"]) for r in rows}
+
+    out = {"total": total, "by_mood": by_mood, "by_genre": by_genre}
+    print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
-def playlists_history_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
+def cmd_marketing_posts_list(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.marketing.posts.list")
+    db = DBConn(Path(args.db))
 
-    try:
-        with conn:
-            ensure_playlist_runs_table(conn)
-
-            runs = db_list_playlist_runs(conn, args.playlist_id, limit=args.limit)
-            if runs:
-                if args.json:
-                    print(
-                        json.dumps(
-                            [
-                                {
-                                    "kind": "run",
-                                    "id": r.id,
-                                    "created_at": r.created_at,
-                                    "playlist_id": r.playlist_id,
-                                    "seed": r.seed,
-                                    "track_count": len(r.track_ids),
-                                    "export_path": r.export_path,
-                                    "notes": r.notes,
-                                }
-                                for r in runs
-                            ],
-                            indent=2,
-                            ensure_ascii=False,
-                        )
-                    )
-                else:
-                    for i, r in enumerate(runs, 1):
-                        ep = r.export_path or ""
-                        notes = (r.notes or "").strip()
-                        notes_s = (notes[:60] + "…") if len(notes) > 60 else notes
-                        print(f"{i:>2}. RUN {r.id}  {r.created_at}  seed={r.seed}  tracks={len(r.track_ids)}  {ep}  {notes_s}")
-
-                ew.emit(
-                    "system.command_completed",
-                    "system",
-                    None,
-                    {"command": cmd_name(args), "ok": True, "mode": "playlist_runs", "count": len(runs)},
-                    occurred_at=now_iso(),
-                )
-                return 0
-
-            pl = db_get_playlist(conn, args.playlist_id)
-            peers = db_list_playlists_by_slug(conn, pl.slug, limit=args.limit)
-
-        if args.json:
-            with conn:
-                print(
-                    json.dumps(
-                        [
-                            {
-                                "kind": "playlist",
-                                "id": p.id,
-                                "created_at": p.created_at,
-                                "playlist_id": p.id,
-                                "seed": p.seed,
-                                "track_count": len(db_playlist_track_ids(conn, p.id)),
-                                "slug": p.slug,
-                            }
-                            for p in peers
-                        ],
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                )
-        else:
-            print("(no recorded runs in playlist_runs; showing implicit history from playlists table by slug)")
-            with conn:
-                for i, p in enumerate(peers, 1):
-                    tc = len(db_playlist_track_ids(conn, p.id))
-                    print(f"{i:>2}. PL  {p.id}  {p.created_at}  seed={p.seed}  tracks={tc}  slug={p.slug}")
-
-        ew.emit(
-            "system.command_completed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": True, "mode": "slug_history", "count": len(peers)},
-            occurred_at=now_iso(),
-        )
-        return 0
-
-    except NotFoundError as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        die(str(e), 2)
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
-
-
-def playlists_diff_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
-
-    try:
-        with conn:
-            ensure_playlist_runs_table(conn)
-
-            a: ResolvedRef = resolve_ref(conn, args.a)
-            b: ResolvedRef = resolve_ref(conn, args.b)
-
-            diff = compute_diff(a.track_ids, b.track_ids)
-
-            a_dur = db_duration_for_tracks(conn, a.track_ids)
-            b_dur = db_duration_for_tracks(conn, b.track_ids)
-
-        if args.json:
-            print(
-                json.dumps(
-                    {
-                        "a": a.__dict__,
-                        "b": b.__dict__,
-                        "duration_sec": {"a": a_dur, "b": b_dur, "delta": (b_dur - a_dur)},
-                        "diff": diff,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-        else:
-            print(f"A: {a.kind.upper()} {a.id}  created={a.created_at}  seed={a.seed}  tracks={len(a.track_ids)}")
-            print(f"B: {b.kind.upper()} {b.id}  created={b.created_at}  seed={b.seed}  tracks={len(b.track_ids)}")
-            print(f"Duration: A={a_dur:.1f}s  B={b_dur:.1f}s  Δ={(b_dur - a_dur):+.1f}s")
-            print(f"Added:   {len(diff['added'])}")
-            print(f"Removed: {len(diff['removed'])}")
-            print(f"Moved:   {len(diff['moved'])}")
-
-            if args.verbose:
-                if diff["added"]:
-                    print("\nADDED:")
-                    for tid in diff["added"]:
-                        print(f"  + {tid}")
-                if diff["removed"]:
-                    print("\nREMOVED:")
-                    for tid in diff["removed"]:
-                        print(f"  - {tid}")
-                if diff["moved"]:
-                    print("\nMOVED:")
-                    for m in diff["moved"][:200]:
-                        print(f"  ~ {m['track_id']}  {m['from']} -> {m['to']}")
-                    if len(diff["moved"]) > 200:
-                        print(f"  ... ({len(diff['moved']) - 200} more)")
-
-        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-        return 0
-
-    except NotFoundError as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        die(str(e), 2)
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
-
-
-def tracks_list_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
-
-    try:
-        with conn:
-            rows = db_list_tracks(
-                conn,
-                limit=args.limit,
-                mood=args.mood,
-                genre=args.genre,
-                status=args.status,
-                bpm_min=args.bpm_min,
-                bpm_max=args.bpm_max,
-                q=args.q,
-            )
-
-        if args.json:
-            print(json.dumps([r.__dict__ for r in rows], indent=2, ensure_ascii=False))
-        else:
-            if not rows:
-                print("(no tracks)")
+    with db.connect() as conn:
+        if not _table_exists(conn, "marketing_posts"):
+            if args.json:
+                print("[]")
             else:
-                for i, t in enumerate(rows, 1):
-                    print(f"{i:>2}. {t.id}  {t.title}  mood={t.mood} genre={t.genre} bpm={t.bpm} dur={t.duration_sec:.1f}s status={t.status}")
+                log.info("No marketing_posts table found.")
+            return 0
 
-        ew.emit(
-            "system.command_completed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": True, "result_count": len(rows)},
-            occurred_at=now_iso(),
-        )
+        cols = set(_columns(conn, "marketing_posts"))
+        q = "SELECT * FROM marketing_posts "
+        if "created_at" in cols:
+            q += "ORDER BY created_at DESC "
+        elif "id" in cols:
+            q += "ORDER BY id DESC "
+        q += "LIMIT ?"
+
+        rows = conn.execute(q, (args.limit,)).fetchall()
+
+    if args.json:
+        print(json.dumps([_row_to_dict(r) for r in rows], indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+    if not rows:
+        log.info("No marketing posts found.")
+        return 0
+
+    for r in rows:
+        d = _row_to_dict(r)
+        pid = d.get("id", "")
+        title = d.get("title", d.get("slug", "")) or ""
+        created = d.get("created_at", "")
+        print(f"  {pid}  {title}  {created}".rstrip())
+    return 0
 
 
-def tracks_show_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
+# ----------------------------
+# rebuild commands (CI contract)
+# ----------------------------
+
+def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
+    # Robust fallback chain for CI quirks:
+    # 1) rebuild-local --db
+    # 2) global --db
+    # 3) env MGC_DB
+    # 4) DEFAULT_DB
+    return (
+        arg_db
+        or global_db
+        or os.environ.get("MGC_DB")
+        or DEFAULT_DB
     )
 
+
+def _determinism_check(builder) -> None:
+    a = builder()
+    b = builder()
+    if stable_dumps(a) != stable_dumps(b):
+        raise ValueError("Non-deterministic rebuild output detected")
+
+
+def cmd_rebuild_ls(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db = DBConn(Path(db_path))
+
+    out: Dict[str, Any] = {"db": str(db.path), "tables": [], "counts": {}}
+    with db.connect() as conn:
+        out["tables"] = [r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name ASC"
+        ).fetchall()]
+        for t in ("events", "marketing_posts", "playlist_items", "playlist_runs", "playlists", "tracks"):
+            if _table_exists(conn, t):
+                out["counts"][t] = int(conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"])
+
+    print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.rebuild.playlists")
+    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    out_dir = Path(args.out_dir)
+
+    if args.stamp:
+        log.debug("stamp=%s", args.stamp)
+
+    db = DBConn(Path(db_path))
+    written: List[str] = []
+
+    with db.connect() as conn:
+        rows = _safe_select_latest_playlists_by_slug(conn)
+        for r in rows:
+            d = _row_to_dict(r)
+            out_path = _playlist_output_path(d, out_dir=out_dir)
+
+            def build_one() -> Any:
+                return _build_playlist_json_for_row(conn, d)
+
+            if args.determinism_check:
+                _determinism_check(build_one)
+
+            obj = build_one()
+            if args.write:
+                write_json_file(out_path, obj)
+
+            written.append(str(out_path))
+
+    if _truthy(args.json, args.sub_json):
+        print(json.dumps({"written": written}, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for p in written:
+            print(p)
+    return 0
+
+
+def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.rebuild.tracks")
+    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    out_dir = Path(args.out_dir)
+    out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
+
+    if args.stamp:
+        log.debug("stamp=%s", args.stamp)
+
+    db = DBConn(Path(db_path))
+    with db.connect() as conn:
+        if not _table_exists(conn, "tracks"):
+            if _truthy(args.json, args.sub_json):
+                print(json.dumps({"written": []}, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        cols = set(_columns(conn, "tracks"))
+        q = "SELECT * FROM tracks "
+        if "created_at" in cols and "id" in cols:
+            q += "ORDER BY created_at ASC, id ASC"
+        elif "id" in cols:
+            q += "ORDER BY id ASC"
+
+        rows = conn.execute(q).fetchall()
+
+        def build_one() -> Any:
+            return [_row_to_dict(r) for r in rows]
+
+        if args.determinism_check:
+            _determinism_check(build_one)
+
+        data = build_one()
+        if args.write:
+            write_json_file(out_path, data)
+
+    if _truthy(args.json, args.sub_json):
+        print(json.dumps({"written": [str(out_path)]}, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(str(out_path))
+    return 0
+
+
+def _verify_playlists(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, List[Dict[str, Any]]]:
+    diffs: List[Dict[str, Any]] = []
+    rows = _safe_select_latest_playlists_by_slug(conn)
+    for r in rows:
+        d = _row_to_dict(r)
+        path = _playlist_output_path(d, out_dir=out_dir)
+        expected = _build_playlist_json_for_row(conn, d)
+
+        if not path.exists():
+            diffs.append({"path": str(path), "reason": "missing"})
+            continue
+
+        try:
+            actual = read_json_file(path)
+        except Exception:
+            diffs.append({"path": str(path), "reason": "unreadable"})
+            continue
+
+        if stable_dumps(actual) != stable_dumps(expected):
+            diffs.append({"path": str(path), "reason": "content_diff"})
+    return (len(diffs), diffs)
+
+
+def _verify_tracks(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, List[Dict[str, Any]]]:
+    diffs: List[Dict[str, Any]] = []
+    out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
+
+    if not _table_exists(conn, "tracks"):
+        return (0, diffs)
+
+    if not out_path.exists():
+        diffs.append({"path": str(out_path), "reason": "missing"})
+        return (1, diffs)
+
     try:
-        with conn:
-            t: TrackRow = db_get_track(conn, args.id)
+        actual = read_json_file(out_path)
+    except Exception:
+        diffs.append({"path": str(out_path), "reason": "unreadable"})
+        return (1, diffs)
 
-        print(json.dumps(t.__dict__, indent=2, ensure_ascii=False))
-        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-        return 0
+    cols = set(_columns(conn, "tracks"))
+    q = "SELECT * FROM tracks "
+    if "created_at" in cols and "id" in cols:
+        q += "ORDER BY created_at ASC, id ASC"
+    elif "id" in cols:
+        q += "ORDER BY id ASC"
+    rows = conn.execute(q).fetchall()
+    expected = [_row_to_dict(r) for r in rows]
 
-    except NotFoundError as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        die(str(e), 2)
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+    if stable_dumps(actual) != stable_dumps(expected):
+        diffs.append({"path": str(out_path), "reason": "content_diff"})
+    return (len(diffs), diffs)
 
 
-def tracks_stats_cmd(args: argparse.Namespace) -> int:
-    run_id = new_run_id()
-    conn = sqlite_connect(args.db)
-    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
-    ew.emit(
-        "system.command_started",
-        "system",
-        None,
-        {"command": cmd_name(args), "args": args_payload(args)},
-        occurred_at=now_iso(),
-    )
+def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.rebuild.verify.playlists")
+    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    out_dir = Path(args.out_dir)
 
-    try:
-        with conn:
-            stats = db_tracks_stats(conn)
+    if args.stamp:
+        log.debug("stamp=%s", args.stamp)
 
-        print(json.dumps(stats, indent=2, ensure_ascii=False))
-        ew.emit("system.command_completed", "system", None, {"command": cmd_name(args), "ok": True}, occurred_at=now_iso())
-        return 0
+    db = DBConn(Path(db_path))
+    with db.connect() as conn:
+        n, diffs = _verify_playlists(conn, out_dir)
 
-    except Exception as e:
-        ew.emit(
-            "system.command_failed",
-            "system",
-            None,
-            {"command": cmd_name(args), "ok": False, "error": str(e), "error_type": type(e).__name__},
-            occurred_at=now_iso(),
-        )
-        raise
-    finally:
-        conn.close()
+    payload = {"diffs": diffs, "diff_count": n}
+    if _truthy(args.json, args.sub_json):
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for d in diffs:
+            print(f"{d['path']} {d['reason']}")
 
+    if n and args.strict:
+        return 2
+    return 0
+
+
+def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
+    log = logging.getLogger("mgc.rebuild.verify.tracks")
+    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    out_dir = Path(args.out_dir)
+
+    if args.stamp:
+        log.debug("stamp=%s", args.stamp)
+
+    db = DBConn(Path(db_path))
+    with db.connect() as conn:
+        n, diffs = _verify_tracks(conn, out_dir)
+
+    payload = {"diffs": diffs, "diff_count": n}
+    if _truthy(args.json, args.sub_json):
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for d in diffs:
+            print(f"{d['path']} {d['reason']}")
+
+    if n and args.strict:
+        return 2
+    return 0
+
+
+# ----------------------------
+# CLI wiring
+# ----------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="mgc", description="mgc CLI")
-    p.add_argument("--env", default=".env", help="Path to .env (default: .env)")
+    p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
+
+    p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
     p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
+    p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
+    p.add_argument("--log-console", action="store_true")
+    p.add_argument("--json", action="store_true", help="Output JSON where supported")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # manifest
-    mg = sub.add_parser("manifest", help="Manifest utilities")
-    mgs = mg.add_subparsers(dest="manifest_cmd", required=True)
+    # -------- rebuild --------
+    rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
+    rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
 
-    md = mgs.add_parser("diff", help="Diff committed vs generated manifest")
-    md.add_argument(
-        "--committed",
-        default="git:HEAD",
-        help="Committed manifest source (file path or git:REV; default: git:HEAD)",
-    )
-    md.add_argument(
-        "--generated",
-        default="data/playlists/_manifest.playlists.json",
-        help="Generated manifest path (default: data/playlists/_manifest.playlists.json)",
-    )
-    md.set_defaults(func=manifest_diff_cmd)
+    rls = rs.add_parser("ls", help="Show rebuild/status info (CI expects this)")
+    rls.add_argument("--db", default=None)
+    rls.add_argument("--json", dest="sub_json", action="store_true")
+    rls.set_defaults(func=cmd_rebuild_ls)
 
-    # db
-    dbg = sub.add_parser("db", help="DB utilities")
-    dbs = dbg.add_subparsers(dest="db_cmd", required=True)
+    rp = rs.add_parser("playlists", help="Rebuild canonical playlist JSON files (CI)")
+    rp.add_argument("--db", default=None)
+    rp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rp.add_argument("--stamp", default=None)
+    rp.add_argument("--determinism-check", action="store_true")
+    rp.add_argument("--write", action="store_true")
+    rp.add_argument("--json", dest="sub_json", action="store_true")
+    rp.set_defaults(func=cmd_rebuild_playlists)
 
-    db_schema = dbs.add_parser("schema", help="Print tables + columns")
-    db_schema.add_argument("--db", default="data/db.sqlite")
-    db_schema.set_defaults(func=db_schema_cmd)
+    rt = rs.add_parser("tracks", help="Rebuild canonical tracks export (CI)")
+    rt.add_argument("--db", default=None)
+    rt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rt.add_argument("--stamp", default=None)
+    rt.add_argument("--determinism-check", action="store_true")
+    rt.add_argument("--write", action="store_true")
+    rt.add_argument("--json", dest="sub_json", action="store_true")
+    rt.set_defaults(func=cmd_rebuild_tracks)
 
-    # playlists
-    pg = sub.add_parser("playlists", help="Playlist operations")
-    pgs = pg.add_subparsers(dest="playlists_cmd", required=True)
+    rv = rs.add_parser("verify", help="Verify rebuilt outputs match DB + files (CI expects this)")
+    rvs = rv.add_subparsers(dest="verify_cmd", required=True)
 
-    pl_list = pgs.add_parser("list", help="List playlists")
-    pl_list.add_argument("--db", default="data/db.sqlite")
-    pl_list.add_argument("--limit", type=int, default=20)
-    pl_list.add_argument("--json", action="store_true")
-    pl_list.set_defaults(func=playlists_list_cmd)
+    rvp = rvs.add_parser("playlists", help="Verify playlists outputs")
+    rvp.add_argument("--db", default=None)
+    rvp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rvp.add_argument("--stamp", default=None)
+    rvp.add_argument("--strict", action="store_true")
+    rvp.add_argument("--json", dest="sub_json", action="store_true")
+    rvp.add_argument("rest", nargs=argparse.REMAINDER)
+    rvp.set_defaults(func=cmd_rebuild_verify_playlists)
 
-    pl_rev = pgs.add_parser("reveal", help="Reveal playlist JSON (json_path) or build from DB")
-    pl_rev.add_argument("id")
-    pl_rev.add_argument("--db", default="data/db.sqlite")
-    pl_rev.add_argument("--build", action="store_true")
-    pl_rev.set_defaults(func=playlists_reveal_cmd)
+    rvt = rvs.add_parser("tracks", help="Verify tracks outputs")
+    rvt.add_argument("--db", default=None)
+    rvt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rvt.add_argument("--stamp", default=None)
+    rvt.add_argument("--strict", action="store_true")
+    rvt.add_argument("--json", dest="sub_json", action="store_true")
+    rvt.add_argument("rest", nargs=argparse.REMAINDER)
+    rvt.set_defaults(func=cmd_rebuild_verify_tracks)
 
-    pl_exp = pgs.add_parser("export", help="Export playlists to JSON files")
-    pl_exp.add_argument("--db", default="data/db.sqlite")
-    pl_exp.add_argument("--id", default=None)
-    pl_exp.add_argument("--limit", type=int, default=20)
-    pl_exp.add_argument("--out-dir", default=None)
-    pl_exp.add_argument("--json", action="store_true")
-    pl_exp.add_argument("--build", action="store_true")
-    pl_exp.add_argument("--no-record", action="store_true")
-    pl_exp.add_argument("--notes", default=None)
-    pl_exp.set_defaults(func=playlists_export_cmd)
+    # -------- playlists --------
+    playlists = sub.add_parser("playlists", help="Inspect playlists")
+    ps = playlists.add_subparsers(dest="playlists_cmd", required=True)
 
-    pl_hist = pgs.add_parser("history", help="List recorded runs for a playlist (fallback: playlist rows by slug)")
-    pl_hist.add_argument("playlist_id")
-    pl_hist.add_argument("--db", default="data/db.sqlite")
-    pl_hist.add_argument("--limit", type=int, default=20)
-    pl_hist.add_argument("--json", action="store_true")
-    pl_hist.set_defaults(func=playlists_history_cmd)
+    pl = ps.add_parser("list", help="List playlists")
+    pl.add_argument("--limit", type=int, default=20)
+    pl.add_argument("--slug", default=None)
+    pl.set_defaults(func=cmd_playlists_list)
 
-    pl_diff = pgs.add_parser("diff", help="Diff two refs: run IDs or playlist IDs")
-    pl_diff.add_argument("a")
-    pl_diff.add_argument("b")
-    pl_diff.add_argument("--db", default="data/db.sqlite")
-    pl_diff.add_argument("--json", action="store_true")
-    pl_diff.add_argument("--verbose", action="store_true")
-    pl_diff.set_defaults(func=playlists_diff_cmd)
+    ph = ps.add_parser("history", help="Show playlist history for a slug (or id)")
+    ph.add_argument("target")
+    ph.add_argument("--limit", type=int, default=20)
+    ph.set_defaults(func=cmd_playlists_history)
 
-    # tracks
-    tg = sub.add_parser("tracks", help="Track library")
-    tgs = tg.add_subparsers(dest="tracks_cmd", required=True)
+    pr = ps.add_parser("reveal", help="Print playlist JSON for a playlist id")
+    pr.add_argument("id")
+    pr.set_defaults(func=cmd_playlists_reveal)
 
-    tl = tgs.add_parser("list", help="List tracks")
-    tl.add_argument("--db", default="data/db.sqlite")
+    pe = ps.add_parser("export", help="Export recent playlist JSON files")
+    pe.add_argument("--limit", type=int, default=1)
+    pe.add_argument("--slug", default=None)
+    pe.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    pe.set_defaults(func=cmd_playlists_export)
+
+    # -------- tracks --------
+    tracks = sub.add_parser("tracks", help="Inspect track library")
+    ts = tracks.add_subparsers(dest="tracks_cmd", required=True)
+
+    tl = ts.add_parser("list", help="List tracks")
     tl.add_argument("--limit", type=int, default=20)
     tl.add_argument("--mood", default=None)
     tl.add_argument("--genre", default=None)
-    tl.add_argument("--status", default=None)
-    tl.add_argument("--bpm-min", type=int, default=None)
-    tl.add_argument("--bpm-max", type=int, default=None)
-    tl.add_argument("--q", default=None)
-    tl.add_argument("--json", action="store_true")
-    tl.set_defaults(func=tracks_list_cmd)
+    tl.set_defaults(func=cmd_tracks_list)
 
-    ts = tgs.add_parser("show", help="Show track details")
-    ts.add_argument("id")
-    ts.add_argument("--db", default="data/db.sqlite")
-    ts.set_defaults(func=tracks_show_cmd)
+    tshow = ts.add_parser("show", help="Show track details")
+    tshow.add_argument("id")
+    tshow.set_defaults(func=cmd_tracks_show)
 
-    tt = tgs.add_parser("stats", help="Track library stats")
-    tt.add_argument("--db", default="data/db.sqlite")
-    tt.set_defaults(func=tracks_stats_cmd)
+    tstats = ts.add_parser("stats", help="Track library stats")
+    tstats.set_defaults(func=cmd_tracks_stats)
 
-    # analytics
-    register_analytics_subcommand(sub)
+    # -------- marketing --------
+    marketing = sub.add_parser("marketing", help="Marketing tools")
+    ms = marketing.add_subparsers(dest="marketing_cmd", required=True)
 
-    # events
-    eg = sub.add_parser("events", help="Event log inspection")
-    egs = eg.add_subparsers(dest="events_cmd", required=True)
+    mposts = ms.add_parser("posts", help="Marketing posts")
+    mps = mposts.add_subparsers(dest="posts_cmd", required=True)
 
-    el = egs.add_parser("list", help="List events")
-    el.add_argument("--db", default="data/db.sqlite")
-    el.add_argument("--limit", type=int, default=20)
-    el.add_argument("--run-id", default=None)
-    el.add_argument("--type", dest="event_type", default=None)
-    el.add_argument("--json", action="store_true")
-    el.set_defaults(func=events_list_cmd)
+    mpl = mps.add_parser("list", help="List marketing posts")
+    mpl.add_argument("--limit", type=int, default=20)
+    mpl.set_defaults(func=cmd_marketing_posts_list)
 
-    # rebuild
-    register_rebuild_subcommand(sub)
+    # -------- analytics passthrough --------
+    try:
+        from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
+    except Exception:
+        register_analytics_subcommand = None  # type: ignore
+
+    if register_analytics_subcommand:
+        register_analytics_subcommand(sub)
 
     return p
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(list(argv) if argv is not None else None)
 
-    load_dotenv(args.env)
+    _configure_logging(level=args.log_level, log_file=args.log_file, log_console=bool(args.log_console))
 
-    if setup_logging:
-        try:
-            setup_logging(level=args.log_level)
-        except Exception:
-            pass
+    log = logging.getLogger("mgc")
+    log.debug("argv=%s", sys.argv if argv is None else ["mgc", *argv])
+    log.debug("db=%s", args.db)
 
-    return int(args.func(args))
+    # Make global db accessible to rebuild subcommands
+    setattr(args, "global_db", getattr(args, "db", None))
+
+    # Ensure sub_json exists on non-rebuild commands
+    if not hasattr(args, "sub_json"):
+        setattr(args, "sub_json", False)
+
+    func = getattr(args, "func", None)
+    if not func:
+        parser.print_help()
+        return 2
+    return int(func(args))
 
 
 if __name__ == "__main__":
