@@ -14,6 +14,7 @@ Other commands:
 - tracks: list, show, stats
 - marketing: posts list
 - analytics: delegated to mgc.analytics_cli if available
+- run: autonomous pipeline entrypoint (daily/weekly)
 
 Logging:
 - deterministic UTC timestamps
@@ -670,11 +671,6 @@ def cmd_marketing_posts_list(args: argparse.Namespace) -> int:
 # ----------------------------
 
 def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
-    # Robust fallback chain for CI quirks:
-    # 1) rebuild-local --db
-    # 2) global --db
-    # 3) env MGC_DB
-    # 4) DEFAULT_DB
     return (
         arg_db
         or global_db
@@ -1011,6 +1007,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
+
+    # -------- run pipeline --------
+    try:
+        from mgc.run_cli import register_run_subcommand  # type: ignore
+    except Exception:
+        register_run_subcommand = None  # type: ignore
+
+    if register_run_subcommand:
+        register_run_subcommand(sub)
 
     return p
 

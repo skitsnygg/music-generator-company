@@ -1,0 +1,42 @@
+name: Scheduled Drops
+
+on:
+  schedule:
+    # Daily at 09:00 UTC (adjust as you like)
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  drop:
+    runs-on: ubuntu-latest
+    env:
+      MGC_DB: data/db.sqlite
+      MGC_PROVIDER: stub
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip
+          pip install -e .
+
+      - name: Run daily drop pipeline
+        run: |
+          set -euxo pipefail
+          # Stamp by UTC date (matches your default)
+          python -m mgc.main run daily --db "$MGC_DB" --context focus --json
+
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgc-run-evidence
+          path: artifacts/runs
+          if-no-files-found: error
