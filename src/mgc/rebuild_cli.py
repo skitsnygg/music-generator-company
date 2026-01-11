@@ -145,6 +145,59 @@ def rebuild_clean_cmd(args: argparse.Namespace) -> int:
     print(f"[rebuild.clean] removed: {removed}")
     return 0
 
+def rebuild_ls_cmd(args: argparse.Namespace) -> int:
+    scope = str(args.ls_scope) if getattr(args, "ls_scope", None) else "all"
+    as_json = bool(args.json)
+
+    def one(scope_name: str, out_dir: str, manifest_name: str) -> Dict[str, Any]:
+        d = Path(out_dir)
+        m = d / manifest_name
+        info: Dict[str, Any] = {
+            "scope": scope_name,
+            "out_dir": str(d),
+            "manifest": str(m),
+            "manifest_exists": m.exists(),
+        }
+        if not m.exists():
+            return info
+
+        try:
+            man = _load_manifest(m)
+            info["manifest_scope"] = man.get("scope")
+            info["count"] = int(man.get("count") or 0)
+            info["fingerprint_sha256"] = str(man.get("fingerprint_sha256") or "")
+            info["fingerprint_recomputed_sha256"] = _manifest_fingerprint(man)
+        except Exception as e:
+            info["error"] = str(e)
+        return info
+
+    results: List[Dict[str, Any]] = []
+    if scope in ("playlists", "all"):
+        results.append(one("playlists", args.playlists_out_dir, "_manifest.playlists.json"))
+    if scope in ("tracks", "all"):
+        results.append(one("tracks", args.tracks_out_dir, "_manifest.tracks.json"))
+
+    if as_json:
+        print(json.dumps({"ok": True, "results": results}, indent=2, ensure_ascii=False))
+        return 0
+
+    for r in results:
+        print(f"scope: {r['scope']}")
+        print(f"  out_dir: {r['out_dir']}")
+        print(f"  manifest: {r['manifest']}")
+        print(f"  manifest_exists: {r['manifest_exists']}")
+        if r.get("error"):
+            print(f"  error: {r['error']}")
+        elif r["manifest_exists"]:
+            print(f"  manifest_scope: {r.get('manifest_scope')}")
+            print(f"  count: {r.get('count')}")
+            print(f"  fingerprint_sha256: {r.get('fingerprint_sha256')}")
+            print(f"  fingerprint_recomputed_sha256: {r.get('fingerprint_recomputed_sha256')}")
+        print()
+
+    return 0
+
+
 
 # ----------------------------
 # PLAYLISTS
@@ -322,9 +375,20 @@ def _track_out_path(export_dir: Path, track_id: str, slugish: str) -> Path:
 
 
 def _quality_gate_track(row: Dict[str, Any]) -> None:
+    """
+    Gate #1 (tracks): basic sanity.
+      - must have an identity (id/track_id/uuid or content hash fallback)
+      - must have a human name field (title or name) that is non-empty
+      - if duration_sec exists, it must be numeric and >= 0
+    Raises ValueError on failure.
+    """
     track_id, _ = _track_identity(row)
     if not track_id:
         raise ValueError("track_missing_id")
+
+    title = str(row.get("title") or row.get("name") or "").strip()
+    if not title:
+        raise ValueError("track_missing_title")
 
     if "duration_sec" in row and row["duration_sec"] is not None:
         try:
@@ -333,6 +397,7 @@ def _quality_gate_track(row: Dict[str, Any]) -> None:
             raise ValueError("track_duration_not_numeric")
         if dur < 0:
             raise ValueError("track_duration_negative")
+
 
 
 def _build_track_obj(row: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
@@ -990,6 +1055,8 @@ def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
 # CLI wiring
 # ----------------------------
 
+
+
 def register_rebuild_subcommand(subparsers) -> None:
     rg = subparsers.add_parser("rebuild", help="Deterministic rebuilds + quality gates")
     rgs = rg.add_subparsers(dest="rebuild_cmd", required=True)
@@ -1072,3 +1139,23 @@ def register_rebuild_subcommand(subparsers) -> None:
 
     rca = rcs.add_parser("all", help="Delete playlists + tracks rebuild artifacts")
     rca.set_defaults(func=rebuild_clean_cmd)
+
+    # rebuild ls
+    rls = rgs.add_parser("ls", help="Show rebuild output status + fingerprints")
+    rls.add_argument("--json", action="store_true")
+    rls.add_argument("--playlists-out-dir", default="data/playlists")
+    rls.add_argument("--tracks-out-dir", default="data/tracks")
+
+    rlss = rls.add_subparsers(dest="ls_scope", required=False)
+
+    rlsp = rlss.add_parser("playlists", help="Show playlists manifest info")
+    rlsp.set_defaults(func=rebuild_ls_cmd)
+
+    rlst = rlss.add_parser("tracks", help="Show tracks manifest info")
+    rlst.set_defaults(func=rebuild_ls_cmd)
+
+    rlsa = rlss.add_parser("all", help="Show both manifests info")
+    rlsa.set_defaults(func=rebuild_ls_cmd)
+
+    # default when no subcommand is provided
+    rls.set_defaults(func=rebuild_ls_cmd, ls_scope="all")
