@@ -668,16 +668,6 @@ def _stats_tracks_strict(conn, *, min_tracks: int) -> Dict[str, Any]:
     if missing_dur:
         raise ValueError("tracks_missing_duration_values")
 
-    non_numeric = int(
-        _db_scalar(
-            conn,
-            "select count(*) from tracks where duration_sec is not null and cast(duration_sec as real) is null",
-        )
-        or 0
-    )
-    # NOTE: SQLite cast(... as real) doesn't produce NULL for arbitrary strings reliably across versions;
-    # the strict check that really matters is negative / null. Keep this as informational only.
-    # Do not fail solely on non_numeric due to SQLite casting quirks.
     neg = int(_db_scalar(conn, "select count(*) from tracks where duration_sec < 0") or 0)
     if neg:
         raise ValueError("tracks_negative_duration")
@@ -696,7 +686,6 @@ def _stats_tracks_strict(conn, *, min_tracks: int) -> Dict[str, Any]:
         "duration_min_sec": min_dur,
         "duration_max_sec": max_dur,
         "duration_total_sec": total_dur,
-        "duration_cast_non_numeric_count": non_numeric,
     }
 
 
@@ -720,39 +709,21 @@ def rebuild_stats_cmd(args: argparse.Namespace) -> int:
                 "rebuild.stats_started",
                 "system",
                 None,
-                {
-                    "scope": scope,
-                    "db": args.db,
-                    "min_playlists": min_playlists,
-                    "min_tracks": min_tracks,
-                },
+                {"scope": scope, "db": args.db, "min_playlists": min_playlists, "min_tracks": min_tracks},
                 occurred_at=now_iso(),
             )
 
             results: List[Dict[str, Any]] = []
-
             try:
                 if scope in ("playlists", "all"):
                     results.append(_stats_playlists_strict(conn, min_playlists=min_playlists))
                 if scope in ("tracks", "all"):
                     results.append(_stats_tracks_strict(conn, min_tracks=min_tracks))
             except Exception as e:
-                ew.emit(
-                    "rebuild.stats_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": str(e)},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.stats_failed", "system", None, {"scope": scope, "reason": str(e)}, occurred_at=now_iso())
                 raise SystemExit(2)
 
-            ew.emit(
-                "rebuild.stats_completed",
-                "system",
-                None,
-                {"scope": scope, "ok": True},
-                occurred_at=now_iso(),
-            )
+            ew.emit("rebuild.stats_completed", "system", None, {"scope": scope, "ok": True}, occurred_at=now_iso())
 
         if as_json:
             print(json.dumps({"ok": True, "results": results}, indent=2, ensure_ascii=False))
@@ -773,6 +744,170 @@ def rebuild_stats_cmd(args: argparse.Namespace) -> int:
         raise
     finally:
         conn.close()
+
+
+# ----------------------------
+# SAMPLE (read-only)
+# ----------------------------
+
+def _file_exists_for_manifest_item(path_str: str) -> Tuple[bool, str]:
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p.exists(), str(p)
+
+
+def _manifest_item_paths(manifest: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for it in list(manifest.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        pid = str(it.get("playlist_id") or it.get("track_id") or "")
+        path = str(it.get("path") or "")
+        if pid and path:
+            out[pid] = path
+    return out
+
+
+def rebuild_sample_playlists_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    n = int(args.n)
+    out_dir = Path(args.out_dir)
+    as_json = bool(args.json)
+    stamp = args.stamp or FIXED_STAMP
+
+    manifest_path = out_dir / "_manifest.playlists.json"
+    manifest_paths: Dict[str, str] = {}
+    if manifest_path.exists():
+        try:
+            m = _load_manifest(manifest_path)
+            if m.get("scope") == "playlists":
+                manifest_paths = _manifest_item_paths(m)
+        except Exception:
+            manifest_paths = {}
+
+    try:
+        playlists = db_list_playlists(conn, limit=max(1, n))
+        playlists = sorted(playlists, key=lambda p: (p.slug, p.id))[:n]
+
+        samples: List[Dict[str, Any]] = []
+        for pl in playlists:
+            obj = _build_playlist_obj(conn, pl, stamp=stamp)
+
+            json_tc = len(obj.get("tracks") or [])
+            json_dur = _sum_duration_sec(obj)
+            db_tc = int(pl.track_count)
+            db_dur = int(pl.total_duration_sec)
+
+            pid = str(pl.id)
+            guessed = str(_playlist_out_path(out_dir, pl))
+            from_manifest = manifest_paths.get(pid) or guessed
+            exists, abs_path = _file_exists_for_manifest_item(from_manifest)
+
+            samples.append(
+                {
+                    "playlist_id": pid,
+                    "slug": str(pl.slug or ""),
+                    "db": {"track_count": db_tc, "total_duration_sec": db_dur},
+                    "json_built": {"track_count": json_tc, "sum_duration_sec": json_dur},
+                    "file": {"path": from_manifest, "abs_path": abs_path, "exists": exists},
+                }
+            )
+
+        if as_json:
+            print(json.dumps({"ok": True, "scope": "playlists", "n": n, "samples": samples}, indent=2, ensure_ascii=False))
+            return 0
+
+        print("playlists sample:")
+        for s in samples:
+            print(f"  {s['playlist_id']}  slug={s['slug']}")
+            print(f"    db:   tc={s['db']['track_count']} dur={s['db']['total_duration_sec']}")
+            print(f"    json: tc={s['json_built']['track_count']} dur={s['json_built']['sum_duration_sec']}")
+            print(f"    file: exists={s['file']['exists']}  {s['file']['path']}")
+        return 0
+
+    finally:
+        conn.close()
+
+
+def rebuild_sample_tracks_cmd(args: argparse.Namespace) -> int:
+    conn = sqlite_connect(args.db)
+    n = int(args.n)
+    out_dir = Path(args.out_dir)
+    as_json = bool(args.json)
+
+    manifest_path = out_dir / "_manifest.tracks.json"
+    manifest_paths: Dict[str, str] = {}
+    if manifest_path.exists():
+        try:
+            m = _load_manifest(manifest_path)
+            if m.get("scope") == "tracks":
+                manifest_paths = _manifest_item_paths(m)
+        except Exception:
+            manifest_paths = {}
+
+    try:
+        rows = _list_tracks(conn, limit=max(1, n))
+
+        def sort_key(r: Dict[str, Any]) -> Tuple[str, str]:
+            tid, _ = _track_identity(r)
+            title = str(r.get("title") or r.get("name") or "")
+            return (title, tid)
+
+        rows = sorted(rows, key=sort_key)[:n]
+
+        samples: List[Dict[str, Any]] = []
+        for r in rows:
+            tid, _ = _track_identity(r)
+            title = str(r.get("title") or r.get("name") or "").strip()
+            dur = r.get("duration_sec")
+
+            guessed = str(_track_out_path(out_dir, tid, ""))
+            from_manifest = manifest_paths.get(tid) or guessed
+            exists, abs_path = _file_exists_for_manifest_item(from_manifest)
+
+            samples.append(
+                {
+                    "track_id": tid,
+                    "title": title,
+                    "duration_sec": dur,
+                    "file": {"path": from_manifest, "abs_path": abs_path, "exists": exists},
+                }
+            )
+
+        if as_json:
+            print(json.dumps({"ok": True, "scope": "tracks", "n": n, "samples": samples}, indent=2, ensure_ascii=False))
+            return 0
+
+        print("tracks sample:")
+        for s in samples:
+            print(f"  {s['track_id']}  title={s['title']!r}  duration_sec={s['duration_sec']}")
+            print(f"    file: exists={s['file']['exists']}  {s['file']['path']}")
+        return 0
+
+    finally:
+        conn.close()
+
+
+def register_rebuild_sample_subcommand(rgs) -> None:
+    rsamp = rgs.add_parser("sample", help="Show small DB/export samples (read-only)")
+    rsamp.add_argument("--json", action="store_true")
+    rsamps = rsamp.add_subparsers(dest="sample_scope", required=True)
+
+    sp = rsamps.add_parser("playlists", help="Sample playlists from DB + matching export path (if present)")
+    sp.add_argument("--db", default="data/db.sqlite")
+    sp.add_argument("--out-dir", default="data/playlists")
+    sp.add_argument("--n", type=int, default=1)
+    sp.add_argument("--stamp", default=None, help=f"Stamp used when building sample JSON (default: {FIXED_STAMP})")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=rebuild_sample_playlists_cmd)
+
+    st = rsamps.add_parser("tracks", help="Sample tracks from DB + matching export path (if present)")
+    st.add_argument("--db", default="data/db.sqlite")
+    st.add_argument("--out-dir", default="data/tracks")
+    st.add_argument("--n", type=int, default=2)
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=rebuild_sample_tracks_cmd)
 
 
 # ----------------------------
@@ -856,13 +991,7 @@ def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
                 "rebuild.completed",
                 "system",
                 None,
-                {
-                    "scope": "playlists",
-                    "ok": True,
-                    "fingerprint_sha256": manifest1["fingerprint_sha256"],
-                    "count": manifest1["count"],
-                    "wrote": bool(args.write),
-                },
+                {"scope": "playlists", "ok": True, "fingerprint_sha256": manifest1["fingerprint_sha256"], "count": manifest1["count"], "wrote": bool(args.write)},
                 occurred_at=now_iso(),
             )
 
@@ -951,12 +1080,7 @@ def rebuild_tracks_cmd(args: argparse.Namespace) -> int:
                         "rebuild.quality_gate_failed",
                         "system",
                         None,
-                        {
-                            "scope": "tracks",
-                            "gate": "determinism",
-                            "fingerprint_1": manifest1["fingerprint_sha256"],
-                            "fingerprint_2": manifest2["fingerprint_sha256"],
-                        },
+                        {"scope": "tracks", "gate": "determinism", "fingerprint_1": manifest1["fingerprint_sha256"], "fingerprint_2": manifest2["fingerprint_sha256"]},
                         occurred_at=now_iso(),
                     )
                     raise SystemExit(2)
@@ -971,13 +1095,7 @@ def rebuild_tracks_cmd(args: argparse.Namespace) -> int:
                 "rebuild.completed",
                 "system",
                 None,
-                {
-                    "scope": "tracks",
-                    "ok": True,
-                    "fingerprint_sha256": manifest1["fingerprint_sha256"],
-                    "count": manifest1["count"],
-                    "wrote": bool(args.write),
-                },
+                {"scope": "tracks", "ok": True, "fingerprint_sha256": manifest1["fingerprint_sha256"], "count": manifest1["count"], "wrote": bool(args.write)},
                 occurred_at=now_iso(),
             )
 
@@ -1028,38 +1146,20 @@ def _rebuild_verify_generic(args: argparse.Namespace, *, scope: str, default_man
             )
 
             if not manifest_path.exists():
-                ew.emit(
-                    "rebuild.verify_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": "manifest_missing", "manifest": str(manifest_path)},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.verify_failed", "system", None, {"scope": scope, "reason": "manifest_missing", "manifest": str(manifest_path)}, occurred_at=now_iso())
                 raise SystemExit(2)
 
             try:
                 manifest = _load_manifest(manifest_path)
                 _require_manifest_scope(manifest, scope)
             except Exception as e:
-                ew.emit(
-                    "rebuild.verify_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": "manifest_invalid", "error": str(e)},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.verify_failed", "system", None, {"scope": scope, "reason": "manifest_invalid", "error": str(e)}, occurred_at=now_iso())
                 raise SystemExit(2)
 
             expected_fp = str(manifest.get("fingerprint_sha256") or "")
             recomputed_fp = _manifest_fingerprint(manifest)
             if expected_fp and expected_fp != recomputed_fp:
-                ew.emit(
-                    "rebuild.verify_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": "fingerprint_mismatch", "expected": expected_fp, "recomputed": recomputed_fp},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.verify_failed", "system", None, {"scope": scope, "reason": "fingerprint_mismatch", "expected": expected_fp, "recomputed": recomputed_fp}, occurred_at=now_iso())
                 raise SystemExit(2)
 
             items = list(manifest.get("items") or [])
@@ -1092,44 +1192,17 @@ def _rebuild_verify_generic(args: argparse.Namespace, *, scope: str, default_man
 
                 checked += 1
                 if not ok_bytes or not ok_sha:
-                    failures.append(
-                        {
-                            "path": rel_or_abs,
-                            "reason": "file_mismatch",
-                            "expected_bytes": int(expected_bytes) if expected_bytes is not None else None,
-                            "got_bytes": got_bytes,
-                            "expected_sha256": expected_sha,
-                            "got_sha256": got_sha,
-                        }
-                    )
+                    failures.append({"path": rel_or_abs, "reason": "file_mismatch", "expected_bytes": int(expected_bytes) if expected_bytes is not None else None, "got_bytes": got_bytes, "expected_sha256": expected_sha, "got_sha256": got_sha})
 
             if failures:
                 sample = failures[: min(20, len(failures))]
-                ew.emit(
-                    "rebuild.verify_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": "verification_failed", "checked": checked, "failures": len(failures), "sample": sample},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.verify_failed", "system", None, {"scope": scope, "reason": "verification_failed", "checked": checked, "failures": len(failures), "sample": sample}, occurred_at=now_iso())
                 raise SystemExit(2)
 
-            ew.emit(
-                "rebuild.verify_completed",
-                "system",
-                None,
-                {"scope": scope, "ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp},
-                occurred_at=now_iso(),
-            )
+            ew.emit("rebuild.verify_completed", "system", None, {"scope": scope, "ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp}, occurred_at=now_iso())
 
         if args.json:
-            print(
-                json.dumps(
-                    {"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)},
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            print(json.dumps({"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)}, indent=2, ensure_ascii=False))
         else:
             print("ok: true")
             print(f"checked: {checked}")
@@ -1164,13 +1237,7 @@ def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
             ew.emit("rebuild.diff_started", "system", None, {"scope": scope, "a": str(a_path), "b": str(b_path)}, occurred_at=now_iso())
 
             if not a_path.exists() or not b_path.exists():
-                ew.emit(
-                    "rebuild.diff_failed",
-                    "system",
-                    None,
-                    {"scope": scope, "reason": "manifest_missing", "a_exists": a_path.exists(), "b_exists": b_path.exists(), "a": str(a_path), "b": str(b_path)},
-                    occurred_at=now_iso(),
-                )
+                ew.emit("rebuild.diff_failed", "system", None, {"scope": scope, "reason": "manifest_missing", "a_exists": a_path.exists(), "b_exists": b_path.exists(), "a": str(a_path), "b": str(b_path)}, occurred_at=now_iso())
                 raise SystemExit(2)
 
             try:
@@ -1184,20 +1251,7 @@ def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
 
             diff = _diff_manifests(a, b)
 
-            ew.emit(
-                "rebuild.diff_completed",
-                "system",
-                None,
-                {
-                    "scope": scope,
-                    "a": str(a_path),
-                    "b": str(b_path),
-                    "counts": diff["counts"],
-                    "fingerprint_a": diff["fingerprint"]["a"],
-                    "fingerprint_b": diff["fingerprint"]["b"],
-                },
-                occurred_at=now_iso(),
-            )
+            ew.emit("rebuild.diff_completed", "system", None, {"scope": scope, "a": str(a_path), "b": str(b_path), "counts": diff["counts"], "fingerprint_a": diff["fingerprint"]["a"], "fingerprint_b": diff["fingerprint"]["b"]}, occurred_at=now_iso())
 
         if args.json:
             print(json.dumps(diff, indent=2, ensure_ascii=False))
@@ -1366,3 +1420,6 @@ def register_rebuild_subcommand(subparsers) -> None:
     rsa.set_defaults(func=rebuild_stats_cmd)
 
     rs.set_defaults(func=rebuild_stats_cmd, stats_scope="all")
+
+    # rebuild sample
+    register_rebuild_sample_subcommand(rgs)
