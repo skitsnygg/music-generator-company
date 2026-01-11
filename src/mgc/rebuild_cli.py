@@ -109,7 +109,6 @@ def rebuild_clean_cmd(args: argparse.Namespace) -> int:
     else:
         raise SystemExit(2)
 
-    # De-dup (preserve order)
     seen: set[str] = set()
     uniq: List[Path] = []
     for t in targets:
@@ -145,8 +144,13 @@ def rebuild_clean_cmd(args: argparse.Namespace) -> int:
     print(f"[rebuild.clean] removed: {removed}")
     return 0
 
+
+# ----------------------------
+# LS (manifest status)
+# ----------------------------
+
 def rebuild_ls_cmd(args: argparse.Namespace) -> int:
-    scope = str(args.ls_scope) if getattr(args, "ls_scope", None) else "all"
+    scope = str(getattr(args, "ls_scope", "all") or "all")
     as_json = bool(args.json)
 
     def one(scope_name: str, out_dir: str, manifest_name: str) -> Dict[str, Any]:
@@ -196,7 +200,6 @@ def rebuild_ls_cmd(args: argparse.Namespace) -> int:
         print()
 
     return 0
-
 
 
 # ----------------------------
@@ -250,13 +253,12 @@ def _build_playlist_obj(conn, pl: PlaylistRow, *, stamp: str) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class ManifestItem:
-    # Used for both playlists and tracks; keys vary by scope, but keep shared fields stable.
     scope_id: str
     slug: str
     path: str
     sha256: str
     bytes: int
-    item_count: int  # track_count for playlists, 0 for tracks (or 1)
+    item_count: int  # track_count for playlists; 1 for tracks
 
 
 def _build_manifest_playlists(
@@ -376,10 +378,10 @@ def _track_out_path(export_dir: Path, track_id: str, slugish: str) -> Path:
 
 def _quality_gate_track(row: Dict[str, Any]) -> None:
     """
-    Gate #1 (tracks): basic sanity.
+    Gate #1 (tracks): strict sanity.
       - must have an identity (id/track_id/uuid or content hash fallback)
       - must have a human name field (title or name) that is non-empty
-      - if duration_sec exists, it must be numeric and >= 0
+      - must have duration_sec column with a numeric, non-negative value
     Raises ValueError on failure.
     """
     track_id, _ = _track_identity(row)
@@ -390,14 +392,17 @@ def _quality_gate_track(row: Dict[str, Any]) -> None:
     if not title:
         raise ValueError("track_missing_title")
 
-    if "duration_sec" in row and row["duration_sec"] is not None:
-        try:
-            dur = float(row["duration_sec"])
-        except Exception:
-            raise ValueError("track_duration_not_numeric")
-        if dur < 0:
-            raise ValueError("track_duration_negative")
+    if "duration_sec" not in row:
+        raise ValueError("track_missing_duration_field")
+    if row["duration_sec"] is None:
+        raise ValueError("track_missing_duration")
 
+    try:
+        dur = float(row["duration_sec"])
+    except Exception:
+        raise ValueError("track_duration_not_numeric")
+    if dur < 0:
+        raise ValueError("track_duration_negative")
 
 
 def _build_track_obj(row: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
@@ -581,6 +586,193 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         "changed": changed,
         "same": same,
     }
+
+
+# ----------------------------
+# DB stats (strict)
+# ----------------------------
+
+def _db_tables(conn) -> List[str]:
+    rows = conn.execute("select name from sqlite_master where type='table' order by name").fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def _db_scalar(conn, sql: str, params: Tuple[Any, ...] = ()) -> Any:
+    row = conn.execute(sql, params).fetchone()
+    return row[0] if row else None
+
+
+def _require_table(conn, table: str) -> None:
+    if table not in set(_db_tables(conn)):
+        raise ValueError(f"missing_table:{table}")
+
+
+def _stats_playlists_strict(conn, *, min_playlists: int) -> Dict[str, Any]:
+    _require_table(conn, "playlists")
+
+    cols = set(_table_columns(conn, "playlists"))
+    required = {"track_count", "total_duration_sec"}
+    missing = sorted(list(required - cols))
+    if missing:
+        raise ValueError(f"playlists_missing_columns:{','.join(missing)}")
+
+    count = int(_db_scalar(conn, "select count(*) from playlists") or 0)
+    if count < int(min_playlists):
+        raise ValueError(f"playlists_count_too_small:{count}<min{min_playlists}")
+
+    total_tracks = int(_db_scalar(conn, "select coalesce(sum(track_count),0) from playlists") or 0)
+    total_duration = int(_db_scalar(conn, "select coalesce(sum(total_duration_sec),0) from playlists") or 0)
+
+    neg_tc = int(_db_scalar(conn, "select count(*) from playlists where track_count < 0") or 0)
+    if neg_tc:
+        raise ValueError("playlists_negative_track_count")
+
+    neg_dur = int(_db_scalar(conn, "select count(*) from playlists where total_duration_sec < 0") or 0)
+    if neg_dur:
+        raise ValueError("playlists_negative_total_duration")
+
+    return {
+        "scope": "playlists",
+        "count": count,
+        "total_tracks": total_tracks,
+        "total_duration_sec": total_duration,
+    }
+
+
+def _stats_tracks_strict(conn, *, min_tracks: int) -> Dict[str, Any]:
+    _require_table(conn, "tracks")
+
+    cols = set(_table_columns(conn, "tracks"))
+    title_col = "title" if "title" in cols else ("name" if "name" in cols else "")
+    if not title_col:
+        raise ValueError("tracks_missing_title_column")
+
+    if "duration_sec" not in cols:
+        raise ValueError("tracks_missing_duration_sec_column")
+
+    count = int(_db_scalar(conn, "select count(*) from tracks") or 0)
+    if count < int(min_tracks):
+        raise ValueError(f"tracks_count_too_small:{count}<min{min_tracks}")
+
+    missing_title = int(
+        _db_scalar(
+            conn,
+            f"select count(*) from tracks where {title_col} is null or trim({title_col}) = ''",
+        )
+        or 0
+    )
+    if missing_title:
+        raise ValueError("tracks_missing_title_values")
+
+    missing_dur = int(_db_scalar(conn, "select count(*) from tracks where duration_sec is null") or 0)
+    if missing_dur:
+        raise ValueError("tracks_missing_duration_values")
+
+    non_numeric = int(
+        _db_scalar(
+            conn,
+            "select count(*) from tracks where duration_sec is not null and cast(duration_sec as real) is null",
+        )
+        or 0
+    )
+    # NOTE: SQLite cast(... as real) doesn't produce NULL for arbitrary strings reliably across versions;
+    # the strict check that really matters is negative / null. Keep this as informational only.
+    # Do not fail solely on non_numeric due to SQLite casting quirks.
+    neg = int(_db_scalar(conn, "select count(*) from tracks where duration_sec < 0") or 0)
+    if neg:
+        raise ValueError("tracks_negative_duration")
+
+    min_dur = float(_db_scalar(conn, "select min(duration_sec) from tracks") or 0.0)
+    max_dur = float(_db_scalar(conn, "select max(duration_sec) from tracks") or 0.0)
+    total_dur = float(_db_scalar(conn, "select coalesce(sum(duration_sec),0) from tracks") or 0.0)
+
+    return {
+        "scope": "tracks",
+        "count": count,
+        "title_column": title_col,
+        "missing_title": missing_title,
+        "missing_duration": missing_dur,
+        "negative_duration": neg,
+        "duration_min_sec": min_dur,
+        "duration_max_sec": max_dur,
+        "duration_total_sec": total_dur,
+        "duration_cast_non_numeric_count": non_numeric,
+    }
+
+
+def rebuild_stats_cmd(args: argparse.Namespace) -> int:
+    """
+    Strict DB stats + assertions.
+      mgc rebuild stats [--db ...] [--json] [playlists|tracks|all]
+    """
+    run_id = new_run_id()
+    conn = sqlite_connect(args.db)
+    ew = EventWriter(conn, EventContext(run_id=run_id, source="cli"))
+
+    scope = str(getattr(args, "stats_scope", "all") or "all")
+    as_json = bool(args.json)
+    min_playlists = int(args.min_playlists)
+    min_tracks = int(args.min_tracks)
+
+    try:
+        with conn:
+            ew.emit(
+                "rebuild.stats_started",
+                "system",
+                None,
+                {
+                    "scope": scope,
+                    "db": args.db,
+                    "min_playlists": min_playlists,
+                    "min_tracks": min_tracks,
+                },
+                occurred_at=now_iso(),
+            )
+
+            results: List[Dict[str, Any]] = []
+
+            try:
+                if scope in ("playlists", "all"):
+                    results.append(_stats_playlists_strict(conn, min_playlists=min_playlists))
+                if scope in ("tracks", "all"):
+                    results.append(_stats_tracks_strict(conn, min_tracks=min_tracks))
+            except Exception as e:
+                ew.emit(
+                    "rebuild.stats_failed",
+                    "system",
+                    None,
+                    {"scope": scope, "reason": str(e)},
+                    occurred_at=now_iso(),
+                )
+                raise SystemExit(2)
+
+            ew.emit(
+                "rebuild.stats_completed",
+                "system",
+                None,
+                {"scope": scope, "ok": True},
+                occurred_at=now_iso(),
+            )
+
+        if as_json:
+            print(json.dumps({"ok": True, "results": results}, indent=2, ensure_ascii=False))
+            return 0
+
+        for r in results:
+            sc = r.get("scope")
+            print(f"{sc}:")
+            for k, v in r.items():
+                if k == "scope":
+                    continue
+                print(f"  {k}: {v}")
+            print()
+
+        return 0
+
+    except SystemExit:
+        raise
+    finally:
+        conn.close()
 
 
 # ----------------------------
@@ -1055,8 +1247,6 @@ def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
 # CLI wiring
 # ----------------------------
 
-
-
 def register_rebuild_subcommand(subparsers) -> None:
     rg = subparsers.add_parser("rebuild", help="Deterministic rebuilds + quality gates")
     rgs = rg.add_subparsers(dest="rebuild_cmd", required=True)
@@ -1145,7 +1335,6 @@ def register_rebuild_subcommand(subparsers) -> None:
     rls.add_argument("--json", action="store_true")
     rls.add_argument("--playlists-out-dir", default="data/playlists")
     rls.add_argument("--tracks-out-dir", default="data/tracks")
-
     rlss = rls.add_subparsers(dest="ls_scope", required=False)
 
     rlsp = rlss.add_parser("playlists", help="Show playlists manifest info")
@@ -1157,5 +1346,23 @@ def register_rebuild_subcommand(subparsers) -> None:
     rlsa = rlss.add_parser("all", help="Show both manifests info")
     rlsa.set_defaults(func=rebuild_ls_cmd)
 
-    # default when no subcommand is provided
     rls.set_defaults(func=rebuild_ls_cmd, ls_scope="all")
+
+    # rebuild stats (strict)
+    rs = rgs.add_parser("stats", help="Strict DB stats + assertions")
+    rs.add_argument("--db", default="data/db.sqlite")
+    rs.add_argument("--json", action="store_true")
+    rs.add_argument("--min-playlists", type=int, default=1, help="Fail if playlists count is below this (default: 1)")
+    rs.add_argument("--min-tracks", type=int, default=1, help="Fail if tracks count is below this (default: 1)")
+    rss = rs.add_subparsers(dest="stats_scope", required=False)
+
+    rsp = rss.add_parser("playlists", help="Strict playlists stats from DB")
+    rsp.set_defaults(func=rebuild_stats_cmd)
+
+    rst = rss.add_parser("tracks", help="Strict tracks stats from DB")
+    rst.set_defaults(func=rebuild_stats_cmd)
+
+    rsa = rss.add_parser("all", help="Strict playlists + tracks stats from DB")
+    rsa.set_defaults(func=rebuild_stats_cmd)
+
+    rs.set_defaults(func=rebuild_stats_cmd, stats_scope="all")
