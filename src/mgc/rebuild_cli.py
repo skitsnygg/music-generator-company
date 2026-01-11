@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -56,6 +58,92 @@ def _stable_time_fields(obj: Dict[str, Any], *, stamp: str) -> Dict[str, Any]:
     if "exported_at" in out:
         out["exported_at"] = stamp
     return out
+
+
+# ----------------------------
+# CLEAN (safe delete)
+# ----------------------------
+
+def _is_within_repo(path: Path, *, repo_root: Path) -> bool:
+    try:
+        rr = repo_root.resolve()
+        p = path.resolve()
+        return p == rr or rr in p.parents
+    except Exception:
+        return False
+
+
+def _rm_tree_or_file(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def rebuild_clean_cmd(args: argparse.Namespace) -> int:
+    """
+    Delete rebuild output artifacts safely.
+      mgc rebuild clean playlists|tracks|all [--dry-run] [--yes]
+    """
+    repo_root = Path.cwd().resolve()
+    scope = str(args.clean_scope)
+    dry = bool(args.dry_run)
+    yes = bool(args.yes)
+
+    targets: List[Path] = []
+
+    def add_scope(out_dir: str, manifest_name: str) -> None:
+        d = Path(out_dir)
+        targets.append(d)
+        targets.append(d / manifest_name)
+
+    if scope == "playlists":
+        add_scope(args.playlists_out_dir, "_manifest.playlists.json")
+    elif scope == "tracks":
+        add_scope(args.tracks_out_dir, "_manifest.tracks.json")
+    elif scope == "all":
+        add_scope(args.playlists_out_dir, "_manifest.playlists.json")
+        add_scope(args.tracks_out_dir, "_manifest.tracks.json")
+    else:
+        raise SystemExit(2)
+
+    # De-dup (preserve order)
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for t in targets:
+        ts = str(t)
+        if ts in seen:
+            continue
+        seen.add(ts)
+        uniq.append(t)
+
+    print(f"[rebuild.clean] scope: {scope}")
+    for t in uniq:
+        print(f"[rebuild.clean] target: {t}")
+
+    for t in uniq:
+        if not _is_within_repo(t, repo_root=repo_root):
+            print(f"[rebuild.clean] ERROR: refusing to delete outside repo: {t}", file=os.sys.stderr)
+            raise SystemExit(2)
+
+    if dry:
+        print("[rebuild.clean] dry_run: true")
+        return 0
+
+    if not yes:
+        print("[rebuild.clean] Refusing to delete without --yes (or use --dry-run).")
+        raise SystemExit(2)
+
+    removed = 0
+    for t in uniq:
+        if t.exists():
+            _rm_tree_or_file(t)
+            removed += 1
+
+    print(f"[rebuild.clean] removed: {removed}")
+    return 0
 
 
 # ----------------------------
@@ -133,7 +221,6 @@ def _build_manifest_playlists(
 
     for pl in playlists:
         obj = _build_playlist_obj(conn, pl, stamp=stamp)
-
         _quality_gate_playlist(pl, obj)
 
         out_path = _playlist_out_path(export_dir, pl)
@@ -182,7 +269,6 @@ def _table_columns(conn, table: str) -> List[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     cols: List[str] = []
     for r in rows:
-        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         try:
             cols.append(str(r[1]))
         except Exception:
@@ -191,9 +277,6 @@ def _table_columns(conn, table: str) -> List[str]:
 
 
 def _row_to_jsonable(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    SQLite can return types that aren't JSON-serializable; normalize conservatively.
-    """
     out: Dict[str, Any] = {}
     for k, v in row.items():
         if v is None:
@@ -201,7 +284,6 @@ def _row_to_jsonable(row: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(v, (str, int, float, bool)):
             out[k] = v
         elif isinstance(v, (bytes, bytearray, memoryview)):
-            # Avoid embedding raw bytes (unstable, noisy). Hex is deterministic.
             out[k] = bytes(v).hex()
         else:
             out[k] = str(v)
@@ -213,7 +295,6 @@ def _list_tracks(conn, *, limit: int) -> List[Dict[str, Any]]:
     if not cols:
         raise ValueError("tracks_table_has_no_columns")
 
-    # Always include rowid fallback in case schema lacks a stable primary key.
     sql = f"SELECT {', '.join(cols)} FROM tracks LIMIT ?"
     cur = conn.execute(sql, (int(limit),))
     names = [d[0] for d in cur.description]  # type: ignore[union-attr]
@@ -227,15 +308,9 @@ def _list_tracks(conn, *, limit: int) -> List[Dict[str, Any]]:
 
 
 def _track_identity(row: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns (track_id, slugish) in a defensive way.
-    """
-    # Prefer common key names.
     for k in ("id", "track_id", "uuid"):
         if row.get(k) is not None:
             return str(row.get(k)), ""
-    # Fall back to something stable-ish (but deterministic) if no obvious id.
-    # This should be rare and is still deterministic for the same row content.
     raw = canonical_json(row)
     return _sha256_text(raw)[:32], ""
 
@@ -247,12 +322,6 @@ def _track_out_path(export_dir: Path, track_id: str, slugish: str) -> Path:
 
 
 def _quality_gate_track(row: Dict[str, Any]) -> None:
-    """
-    Gate #1 (tracks): basic sanity.
-      - must have an identity (id/track_id/uuid or content hash fallback)
-      - if duration_sec exists, it must be numeric and >= 0
-    Raises ValueError on failure.
-    """
     track_id, _ = _track_identity(row)
     if not track_id:
         raise ValueError("track_missing_id")
@@ -286,7 +355,6 @@ def _build_manifest_tracks(
 ) -> Tuple[Dict[str, Any], List[Tuple[Path, Dict[str, Any]]]]:
     rows = _list_tracks(conn, limit=limit)
 
-    # Deterministic ordering: prefer (title, id) if present; else by id-ish.
     def sort_key(r: Dict[str, Any]) -> Tuple[str, str]:
         tid, _ = _track_identity(r)
         title = str(r.get("title") or r.get("name") or "")
@@ -302,7 +370,6 @@ def _build_manifest_tracks(
 
         track_id, slugish = _track_identity(r)
         out_path = _track_out_path(export_dir, track_id, slugish)
-
         obj = _build_track_obj(r, stamp=stamp)
 
         data = _payload_bytes(obj)
@@ -381,7 +448,6 @@ def _items_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for it in items:
         if not isinstance(it, dict):
             continue
-        # accept either playlist_id or track_id as the id key
         pid = str(it.get("playlist_id") or it.get("track_id") or "")
         if not pid:
             continue
@@ -560,11 +626,7 @@ def rebuild_playlists_cmd(args: argparse.Namespace) -> int:
 
 
 def rebuild_verify_playlists_cmd(args: argparse.Namespace) -> int:
-    return _rebuild_verify_generic(
-        args,
-        scope="playlists",
-        default_manifest_name="_manifest.playlists.json",
-    )
+    return _rebuild_verify_generic(args, scope="playlists", default_manifest_name="_manifest.playlists.json")
 
 
 def rebuild_diff_playlists_cmd(args: argparse.Namespace) -> int:
@@ -679,11 +741,7 @@ def rebuild_tracks_cmd(args: argparse.Namespace) -> int:
 
 
 def rebuild_verify_tracks_cmd(args: argparse.Namespace) -> int:
-    return _rebuild_verify_generic(
-        args,
-        scope="tracks",
-        default_manifest_name="_manifest.tracks.json",
-    )
+    return _rebuild_verify_generic(args, scope="tracks", default_manifest_name="_manifest.tracks.json")
 
 
 def rebuild_diff_tracks_cmd(args: argparse.Namespace) -> int:
@@ -808,7 +866,13 @@ def _rebuild_verify_generic(args: argparse.Namespace, *, scope: str, default_man
             )
 
         if args.json:
-            print(json.dumps({"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)}, indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {"ok": True, "checked": checked, "fingerprint_sha256": expected_fp or recomputed_fp, "manifest": str(manifest_path)},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
         else:
             print("ok: true")
             print(f"checked: {checked}")
@@ -867,7 +931,14 @@ def _rebuild_diff_generic(args: argparse.Namespace, *, scope: str) -> int:
                 "rebuild.diff_completed",
                 "system",
                 None,
-                {"scope": scope, "a": str(a_path), "b": str(b_path), "counts": diff["counts"], "fingerprint_a": diff["fingerprint"]["a"], "fingerprint_b": diff["fingerprint"]["b"]},
+                {
+                    "scope": scope,
+                    "a": str(a_path),
+                    "b": str(b_path),
+                    "counts": diff["counts"],
+                    "fingerprint_a": diff["fingerprint"]["a"],
+                    "fingerprint_b": diff["fingerprint"]["b"],
+                },
                 occurred_at=now_iso(),
             )
 
@@ -983,3 +1054,21 @@ def register_rebuild_subcommand(subparsers) -> None:
     rdt.add_argument("--json", action="store_true")
     rdt.add_argument("--show", type=int, default=50, help="Max items to print per section (default: 50)")
     rdt.set_defaults(func=rebuild_diff_tracks_cmd)
+
+    # rebuild clean
+    rc = rgs.add_parser("clean", help="Delete rebuild output artifacts (safe)")
+    rcs = rc.add_subparsers(dest="clean_scope", required=True)
+
+    rc.add_argument("--dry-run", action="store_true", help="Print what would be deleted")
+    rc.add_argument("--yes", action="store_true", help="Actually delete files")
+    rc.add_argument("--playlists-out-dir", default="data/playlists", help="Playlists output dir (default: data/playlists)")
+    rc.add_argument("--tracks-out-dir", default="data/tracks", help="Tracks output dir (default: data/tracks)")
+
+    rcp = rcs.add_parser("playlists", help="Delete playlists rebuild artifacts")
+    rcp.set_defaults(func=rebuild_clean_cmd)
+
+    rct = rcs.add_parser("tracks", help="Delete tracks rebuild artifacts")
+    rct.set_defaults(func=rebuild_clean_cmd)
+
+    rca = rcs.add_parser("all", help="Delete playlists + tracks rebuild artifacts")
+    rca.set_defaults(func=rebuild_clean_cmd)
