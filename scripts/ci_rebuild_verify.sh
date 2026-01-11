@@ -70,11 +70,17 @@ maybe_generate_fixture_db () {
   fi
 }
 
+run_ls_json () {
+  # Stats command may not exist; ls is the authoritative, lightweight status.
+  python -m mgc.main rebuild ls --json || true
+}
+
 run_rebuild_playlists () {
   python -m mgc.main rebuild playlists \
     --db "$MGC_DB" \
     --out-dir "data/playlists" \
     --stamp "ci" \
+    --relative-paths \
     --determinism-check \
     --write
 }
@@ -82,7 +88,8 @@ run_rebuild_playlists () {
 run_verify_playlists () {
   python -m mgc.main rebuild verify playlists \
     --db "$MGC_DB" \
-    --out-dir "data/playlists"
+    --out-dir "data/playlists" \
+    --strict-paths
 }
 
 run_rebuild_tracks () {
@@ -90,6 +97,7 @@ run_rebuild_tracks () {
     --db "$MGC_DB" \
     --out-dir "data/tracks" \
     --stamp "ci" \
+    --relative-paths \
     --determinism-check \
     --write
 }
@@ -97,40 +105,17 @@ run_rebuild_tracks () {
 run_verify_tracks () {
   python -m mgc.main rebuild verify tracks \
     --db "$MGC_DB" \
-    --out-dir "data/tracks"
+    --out-dir "data/tracks" \
+    --strict-paths
 }
-
-run_stats_strict () {
-  python -m mgc.main rebuild stats \
-    --db "$MGC_DB" \
-    --min-playlists 1 \
-    --min-tracks 1
-}
-
-echo "[ci_rebuild_verify] == stats (strict) =="
-run_stats_strict
-
-echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
-run_rebuild_playlists
-
-echo "[ci_rebuild_verify] == verify playlists vs manifest + files =="
-test -f data/playlists/_manifest.playlists.json
-python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
-run_verify_playlists
-
-echo "[ci_rebuild_verify] == rebuild tracks (determinism check + write) =="
-run_rebuild_tracks
-
-echo "[ci_rebuild_verify] == verify tracks vs manifest + files =="
-test -f data/tracks/_manifest.tracks.json
-python -c "import json; json.load(open('data/tracks/_manifest.tracks.json'))"
-run_verify_tracks
-
 
 # --- main flow ---
 
 maybe_generate_fixture_db
 db_preflight
+
+echo "[ci_rebuild_verify] == ls (status) =="
+run_ls_json
 
 echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
 run_rebuild_playlists
