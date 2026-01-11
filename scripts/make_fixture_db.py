@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import sqlite3
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_iso_fixed() -> str:
+    # Deterministic timestamp for fixture DB (avoid CI diffs).
+    # Keep UTC + explicit offset format for readability.
+    return datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat()
 
 
 def main() -> int:
@@ -22,6 +24,8 @@ def main() -> int:
     con = sqlite3.connect(str(out_path))
     try:
         con.execute("PRAGMA foreign_keys = ON;")
+        con.execute("PRAGMA journal_mode = DELETE;")  # stable file layout vs WAL
+        con.execute("PRAGMA synchronous = FULL;")
         cur = con.cursor()
 
         # ----------------------------
@@ -116,8 +120,8 @@ def main() -> int:
             CREATE INDEX idx_events_event_type ON events(event_type);
             CREATE INDEX idx_events_entity ON events(entity_type, entity_id);
             CREATE INDEX idx_events_run_id ON events(run_id);
-            
-                        -- marketing_posts (minimal stub table for CI)
+
+            -- marketing_posts (minimal stub table for CI)
             CREATE TABLE marketing_posts (
               id TEXT PRIMARY KEY,
               created_at TEXT NOT NULL,
@@ -125,33 +129,38 @@ def main() -> int:
               title TEXT,
               body TEXT,
               platform TEXT,
-            
+
               track_id TEXT,
               payload_json TEXT,
               metadata_json TEXT
             );
-            
+
             CREATE INDEX idx_marketing_posts_created_at ON marketing_posts(created_at);
             CREATE INDEX idx_marketing_posts_status ON marketing_posts(status);
             CREATE INDEX idx_marketing_posts_track_id ON marketing_posts(track_id);
-
             """
-
         )
 
         # ----------------------------
-        # seed data: smallest useful set
+        # seed data: smallest useful set (fully deterministic IDs + timestamps)
         # ----------------------------
-        created = now_iso()
+        created = now_iso_fixed()
+
+        # Deterministic IDs (avoid uuid4 randomness)
+        track_ids: List[str] = [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003",
+        ]
+        playlist_id = "10000000-0000-0000-0000-000000000001"
+        run_id = "20000000-0000-0000-0000-000000000001"
+        event_id = "30000000-0000-0000-0000-000000000001"
+
+        durations = [180, 190, 200]
 
         # 3 tracks
-        track_ids: list[str] = []
-        durations = []
-        for i in range(3):
-            tid = str(uuid.uuid4())
-            track_ids.append(tid)
-            dur = 180 + i * 10
-            durations.append(dur)
+        for i, tid in enumerate(track_ids):
+            dur = durations[i]
             cur.execute(
                 """
                 INSERT INTO tracks (
@@ -176,7 +185,6 @@ def main() -> int:
             )
 
         # 1 playlist
-        pid = str(uuid.uuid4())
         playlist_seed = "ci_seed"
         total_dur = sum(durations)
         cur.execute(
@@ -188,7 +196,7 @@ def main() -> int:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                pid,
+                playlist_id,
                 "focus_radio",
                 "Focus Radio (CI)",
                 "focus",
@@ -203,19 +211,23 @@ def main() -> int:
             ),
         )
 
-        # playlist items
-        for idx, tid in enumerate(track_ids, start=1):
+        # playlist items (deterministic ids)
+        playlist_item_ids = [
+            "40000000-0000-0000-0000-000000000001",
+            "40000000-0000-0000-0000-000000000002",
+            "40000000-0000-0000-0000-000000000003",
+        ]
+        for pos, (piid, tid) in enumerate(zip(playlist_item_ids, track_ids), start=1):
             cur.execute(
                 """
                 INSERT INTO playlist_items (
                   id, playlist_id, track_id, position, created_at
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (str(uuid.uuid4()), pid, tid, idx, created),
+                (piid, playlist_id, tid, pos, created),
             )
 
         # 1 playlist run
-        run_id = str(uuid.uuid4())
         cur.execute(
             """
             INSERT INTO playlist_runs (
@@ -225,7 +237,7 @@ def main() -> int:
             """,
             (
                 run_id,
-                pid,
+                playlist_id,
                 "ci_seed",
                 created,
                 playlist_seed,
@@ -243,7 +255,7 @@ def main() -> int:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid.uuid4()),
+                event_id,
                 created,
                 "fixture.seeded",
                 "playlist_run",
@@ -255,6 +267,14 @@ def main() -> int:
         )
 
         con.commit()
+
+        # Make DB file more stable (prevents size jitter as pages get allocated differently)
+        try:
+            cur.execute("VACUUM;")
+            con.commit()
+        except Exception:
+            # If VACUUM isn't allowed for any reason, ignore; determinism is still improved.
+            pass
     finally:
         con.close()
 

@@ -1,51 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CI gate: compile + deterministic rebuild/verify
+#
+# Env:
+#   MGC_DB         DB path (default: data/db.sqlite)
+#   PYTHON         python executable (default: python)
+#   ARTIFACTS_DIR  where to write logs/outputs (default: artifacts/ci)
+#   MGC_OUT_ROOT   override output root for rebuilds:
+#                  - if set to "data", writes to data/playlists + data/tracks
+#                  - otherwise writes under $ARTIFACTS_DIR/data/...
+#
+# Files written:
+#   $ARTIFACTS_DIR/ci_gate.log
+#   $ARTIFACTS_DIR/ci_rebuild_verify.log
+#   (plus rebuild outputs under chosen output root)
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-echo "[ci_gate] Repo: $repo_root"
+PYTHON="${PYTHON:-python}"
+DB="${MGC_DB:-${DB:-data/db.sqlite}}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
 
-# Default DB if not provided
-: "${MGC_DB:=fixtures/ci_db.sqlite}"
+mkdir -p "$ARTIFACTS_DIR"
 
-# Normalize to absolute path (prevents cwd surprises)
-case "$MGC_DB" in
-  /*) db_path="$MGC_DB" ;;
-  *)  db_path="$repo_root/$MGC_DB" ;;
-esac
-export MGC_DB="$db_path"
+log_file="$ARTIFACTS_DIR/ci_gate.log"
+: > "$log_file"
 
-echo "[ci_gate] MGC_DB=$MGC_DB"
+{
+  echo "[ci_gate] Repo: $repo_root"
+  echo "[ci_gate] MGC_DB=$DB"
+  echo "[ci_gate] ARTIFACTS_DIR=$ARTIFACTS_DIR"
+  echo "[ci_gate] MGC_OUT_ROOT=${MGC_OUT_ROOT:-}"
+  echo "[ci_gate] git_sha: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  echo "[ci_gate] python: $("$PYTHON" -V 2>&1)"
 
-echo "[ci_gate] git_sha: $(git rev-parse HEAD)"
-echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD)"
+  if [[ ! -f "$DB" ]]; then
+    echo "[ci_gate] ERROR: DB not found: $DB" >&2
+    exit 2
+  fi
 
+  echo "[ci_gate] DB OK."
 
-# Ensure DB exists and is non-empty; otherwise generate it
-mkdir -p "$(dirname "$MGC_DB")"
-if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
-  echo "[ci_gate] Fixture DB missing/empty; generating: $MGC_DB"
-  python scripts/make_fixture_db.py
-fi
+  echo "[ci_gate] py_compile"
+  "$PYTHON" -m py_compile src/mgc/main.py
 
-# Fail fast if playlists table is missing (avoids confusing rebuild errors)
-python - <<'PY'
-import os, sqlite3, sys
-p = os.environ["MGC_DB"]
-con = sqlite3.connect(p)
-try:
-    tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()]
-    if "playlists" not in tables:
-        print(f"[ci_gate] ERROR: DB at {p} has no 'playlists' table. Tables: {tables}", file=sys.stderr)
-        sys.exit(1)
-    print(f"[ci_gate] DB OK. playlists table present.")
-finally:
-    con.close()
-PY
+  echo "[ci_gate] rebuild + verify"
+  MGC_DB="$DB" ARTIFACTS_DIR="$ARTIFACTS_DIR" PYTHON="$PYTHON" MGC_OUT_ROOT="${MGC_OUT_ROOT:-}" \
+    bash scripts/ci_rebuild_verify.sh
 
-echo "[ci_gate] py_compile"
-python -m py_compile $(git ls-files '*.py')
-
-echo "[ci_gate] rebuild + verify"
-bash scripts/ci_rebuild_verify.sh
+  echo "[ci_gate] OK"
+} 2>&1 | tee -a "$log_file"
