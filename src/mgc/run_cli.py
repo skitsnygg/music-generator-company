@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _now_iso() -> str:
@@ -23,7 +23,10 @@ def _ensure_dir(p: Path) -> None:
 
 def _write_json(path: Path, obj: Any) -> None:
     _ensure_dir(path.parent)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _read_json(path: Path) -> Any:
@@ -31,8 +34,42 @@ def _read_json(path: Path) -> Any:
 
 
 def _stable_stamp_default() -> str:
-    # Default stamp: UTC date (stable, human-friendly)
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    # rows: (cid, name, type, notnull, dflt_value, pk)
+    return [r[1] for r in rows]
+
+
+def _try_json_loads(s: Any) -> Any:
+    if s is None:
+        return None
+    if isinstance(s, (dict, list)):
+        return s
+    if isinstance(s, (bytes, bytearray)):
+        try:
+            return json.loads(s.decode("utf-8"))
+        except Exception:
+            return None
+    if isinstance(s, str):
+        ss = s.strip()
+        if not ss:
+            return None
+        try:
+            return json.loads(ss)
+        except Exception:
+            return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -56,6 +93,10 @@ class EvidencePaths:
         return self.root / "run.json"
 
 
+# ----------------------------
+# run pipeline (generation → playlist → marketing → evidence)
+# ----------------------------
+
 def _insert_playlist_and_items(
     conn: sqlite3.Connection,
     *,
@@ -72,7 +113,6 @@ def _insert_playlist_and_items(
     track_ids: List[str],
     json_path: str,
 ) -> None:
-    # Insert playlist (minimal column set; compatible with your DB schema + CI fixture)
     conn.execute(
         """
         INSERT INTO playlists (
@@ -98,17 +138,10 @@ def _insert_playlist_and_items(
 
     for pos, tid in enumerate(track_ids, start=1):
         conn.execute(
-            """
-            INSERT INTO playlist_items (playlist_id, track_id, position)
-            VALUES (?, ?, ?)
-            """,
+            "INSERT INTO playlist_items (playlist_id, track_id, position) VALUES (?, ?, ?)",
             (playlist_id, tid, int(pos)),
         )
 
-
-# ----------------------------
-# run pipeline
-# ----------------------------
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     # Local imports to keep CLI import-time light
@@ -283,9 +316,9 @@ _HTML_TEMPLATE = """<!doctype html>
 
   const s = PLAYLIST.stats || {{}};
   const statsText = [
-    s.track_count != null ? `tracks=${s.track_count}` : null,
-    s.duration_minutes != null ? `minutes=${s.duration_minutes}` : null,
-    s.avg_bpm != null ? `avg_bpm=${s.avg_bpm}` : null,
+    s.track_count != null ? `tracks=${{s.track_count}}` : null,
+    s.duration_minutes != null ? `minutes=${{s.duration_minutes}}` : null,
+    s.avg_bpm != null ? `avg_bpm=${{s.avg_bpm}}` : null,
   ].filter(Boolean).join(" • ");
   document.getElementById("stats").textContent = statsText;
 
@@ -350,7 +383,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
     out_path.write_text(html, encoding="utf-8")
 
-    # Convenience: copy the playlist JSON next to the player (optional)
     if args.copy_playlist:
         dst = out_dir / "playlist.json"
         shutil.copyfile(playlist_path, dst)
@@ -364,7 +396,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
 
 def cmd_web_serve(args: argparse.Namespace) -> int:
-    # Serve repo root by default, so /data/... and /artifacts/... both resolve.
     serve_dir = Path(args.dir).resolve()
     if not serve_dir.exists():
         raise SystemExit(f"serve dir not found: {serve_dir}")
@@ -375,7 +406,6 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
     os.chdir(str(serve_dir))
 
     class Handler(SimpleHTTPRequestHandler):
-        # quieter logs unless needed
         def log_message(self, fmt: str, *a: Any) -> None:
             if args.quiet:
                 return
@@ -391,6 +421,192 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         httpd.serve_forever()
     finally:
         httpd.server_close()
+
+    return 0
+
+
+# ----------------------------
+# publish simulation + receipts
+# ----------------------------
+
+def _simulated_permalink(platform: str, post_id: str) -> str:
+    base = "https://example.invalid"
+    platform = (platform or "unknown").strip().lower()
+    return f"{base}/{platform}/{post_id}"
+
+
+def _load_marketing_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    only_status: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not _table_exists(conn, "marketing_posts"):
+        return []
+
+    cols = set(_columns(conn, "marketing_posts"))
+
+    # Support both schemas:
+    # A) MVP: (id, created_at, track_id, platform, payload_json, status)
+    # B) CI fixture: (id, created_at, status, title, body, platform, track_id, payload_json, metadata_json)
+    want = ["id", "created_at", "track_id", "platform", "status"]
+    if "payload_json" in cols:
+        want.append("payload_json")
+    if "metadata_json" in cols:
+        want.append("metadata_json")
+    if "title" in cols:
+        want.append("title")
+    if "body" in cols:
+        want.append("body")
+
+    select_cols = [c for c in want if c in cols]
+    if not select_cols:
+        select_cols = ["id"]  # last resort
+
+    where = []
+    params: List[Any] = []
+    if only_status and "status" in cols:
+        where.append("status = ?")
+        params.append(only_status)
+
+    q = f"SELECT {', '.join(select_cols)} FROM marketing_posts "
+    if where:
+        q += "WHERE " + " AND ".join(where) + " "
+    if "created_at" in cols:
+        q += "ORDER BY datetime(created_at) ASC "
+    q += "LIMIT ?"
+    params.append(int(limit))
+
+    rows = conn.execute(q, params).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        # parse payload/metadata if present
+        if "payload_json" in d:
+            d["payload"] = _try_json_loads(d.get("payload_json"))
+        if "metadata_json" in d:
+            d["metadata"] = _try_json_loads(d.get("metadata_json"))
+        out.append(d)
+    return out
+
+
+def _update_marketing_post_status(
+    conn: sqlite3.Connection,
+    *,
+    post_id: str,
+    new_status: str,
+    published_at: str,
+) -> None:
+    cols = set(_columns(conn, "marketing_posts"))
+    if "status" not in cols:
+        return
+
+    # We avoid schema migrations; store publish time in metadata_json if available, else payload_json.
+    meta_target = "metadata_json" if "metadata_json" in cols else ("payload_json" if "payload_json" in cols else None)
+
+    if meta_target:
+        row = conn.execute(
+            f"SELECT {meta_target} FROM marketing_posts WHERE id = ? LIMIT 1",
+            (post_id,),
+        ).fetchone()
+        cur = _try_json_loads(row[0]) if row is not None else None
+        if not isinstance(cur, dict):
+            cur = {}
+        cur["published_at"] = published_at
+        cur["published_simulated"] = True
+        blob = json.dumps(cur, ensure_ascii=False, sort_keys=True)
+
+        conn.execute(
+            f"UPDATE marketing_posts SET status = ?, {meta_target} = ? WHERE id = ?",
+            (new_status, blob, post_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE marketing_posts SET status = ? WHERE id = ?",
+            (new_status, post_id),
+        )
+
+
+def cmd_publish_marketing(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    stamp = (args.stamp or _stable_stamp_default()).strip()
+    receipts_dir = Path(args.artifacts_dir) / "receipts" / stamp / "marketing"
+    _ensure_dir(receipts_dir)
+
+    if not db_path.exists():
+        raise SystemExit(f"DB not found: {db_path}")
+
+    published_at = _now_iso()
+    only_status = "planned" if args.only_planned else None
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        posts = _load_marketing_posts(conn, limit=int(args.limit), only_status=only_status)
+
+        results: List[Dict[str, Any]] = []
+
+        for p in posts:
+            post_id = str(p.get("id", ""))
+            platform = str(p.get("platform", "unknown"))
+            track_id = str(p.get("track_id", ""))
+
+            payload = p.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+
+            caption = payload.get("caption") or p.get("body") or ""
+            hashtags = payload.get("hashtags") or []
+            preview_path = payload.get("preview_path") or ""
+
+            receipt = {
+                "post_id": post_id,
+                "platform": platform,
+                "track_id": track_id,
+                "status_before": p.get("status"),
+                "status_after": "published" if args.commit else p.get("status"),
+                "published_at": published_at,
+                "simulated": True,
+                "committed": bool(args.commit),
+                "permalink": _simulated_permalink(platform, post_id),
+                "caption": caption,
+                "hashtags": hashtags,
+                "preview_path": preview_path,
+            }
+
+            out = receipts_dir / platform.lower() / f"{post_id}.json"
+            _write_json(out, receipt)
+
+            if args.commit:
+                _update_marketing_post_status(conn, post_id=post_id, new_status="published", published_at=published_at)
+
+            results.append(
+                {
+                    "post_id": post_id,
+                    "platform": platform,
+                    "receipt_path": str(out),
+                    "permalink": receipt["permalink"],
+                    "committed": bool(args.commit),
+                }
+            )
+
+        if args.commit:
+            conn.commit()
+
+    summary = {
+        "db": str(db_path),
+        "stamp": stamp,
+        "published_at": published_at,
+        "count": len(posts),
+        "only_planned": bool(args.only_planned),
+        "commit": bool(args.commit),
+        "receipts_dir": str(receipts_dir),
+        "results": results,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"[publish marketing] receipts_dir={receipts_dir} count={len(posts)} commit={bool(args.commit)}")
 
     return 0
 
@@ -445,3 +661,17 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     wsrv.add_argument("--port", default=8000, type=int)
     wsrv.add_argument("--quiet", action="store_true", help="Suppress request logs")
     wsrv.set_defaults(func=cmd_web_serve)
+
+    # ---- publish ----
+    pub = subparsers.add_parser("publish", help="Publish simulation steps (with receipts)")
+    ps = pub.add_subparsers(dest="publish_cmd", required=True)
+
+    pm = ps.add_parser("marketing", help="Simulate publishing marketing posts + write receipts")
+    pm.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"))
+    pm.add_argument("--artifacts-dir", default="artifacts")
+    pm.add_argument("--stamp", default=None, help="Receipt stamp (default: UTC date YYYY-MM-DD)")
+    pm.add_argument("--limit", type=int, default=50)
+    pm.add_argument("--only-planned", action="store_true", help="Only publish posts with status=planned")
+    pm.add_argument("--commit", action="store_true", help="Update DB status to published (still simulated)")
+    pm.add_argument("--json", action="store_true")
+    pm.set_defaults(func=cmd_publish_marketing)
