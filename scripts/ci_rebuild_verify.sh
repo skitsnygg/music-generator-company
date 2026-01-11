@@ -23,55 +23,79 @@ python -V
 
 mkdir -p "$(dirname "$MGC_DB")"
 
-ensure_db_has_playlists () {
+die () {
+  echo "[ci_rebuild_verify] ERROR: $*" >&2
+  exit 1
+}
+
+db_tables () {
   python - <<'PY'
 import os, sqlite3, sys
 p = os.environ["MGC_DB"]
 con = sqlite3.connect(p)
 try:
-    tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()]
-    if "playlists" not in tables:
-        print(f"[ci_rebuild_verify] ERROR: DB at {p} has no 'playlists'. Tables={tables}", file=sys.stderr)
-        sys.exit(1)
+    rows = con.execute("select name from sqlite_master where type='table' order by name").fetchall()
+    print(" ".join(r[0] for r in rows))
 finally:
     con.close()
 PY
 }
 
-# If DB missing/empty, generate it
-if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
-  echo "[ci_rebuild_verify] Fixture DB missing/empty; generating: $MGC_DB"
-  python scripts/make_fixture_db.py
-fi
+db_preflight () {
+  if [[ ! -f "$MGC_DB" ]]; then
+    die "DB file missing: $MGC_DB"
+  fi
+  if [[ ! -s "$MGC_DB" ]]; then
+    die "DB file empty: $MGC_DB"
+  fi
 
-ensure_db_has_playlists
+  echo "[ci_rebuild_verify] db_file: $(ls -l "$MGC_DB")"
 
-echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
+  local tables
+  tables="$(db_tables || true)"
+  echo "[ci_rebuild_verify] db_tables: ${tables:-<none>}"
 
-# IMPORTANT:
-# Replace the command below with the exact rebuild command you already use
-# (the one that prints fingerprint_sha256 and writes the manifest).
-run_rebuild () {
-  MGC_DB="$MGC_DB" python -m mgc.main rebuild playlists --stamp ci --write
+  if [[ " $tables " != *" playlists "* ]]; then
+    die "DB at $MGC_DB has no 'playlists' table"
+  fi
 }
 
-# Run #1
-ensure_db_has_playlists
-run_rebuild
+maybe_generate_fixture_db () {
+  # If DB missing/empty, generate it
+  if [[ ! -f "$MGC_DB" || ! -s "$MGC_DB" ]]; then
+    echo "[ci_rebuild_verify] Fixture DB missing/empty; generating: $MGC_DB"
+    python scripts/make_fixture_db.py
+  fi
+}
 
-echo "[ci_rebuild_verify] == verify playlists vs manifest =="
+run_rebuild () {
+  # Always pass explicit db/out-dir so the CLI cannot wander.
+  # --determinism-check ensures two builds inside the CLI match.
+  python -m mgc.main rebuild playlists \
+    --db "$MGC_DB" \
+    --out-dir "data/playlists" \
+    --stamp "ci" \
+    --determinism-check \
+    --write
+}
 
-test -f data/playlists/_manifest.playlists.json
-python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
-echo "[ci_rebuild_verify] OK: manifest exists and is valid JSON"
+run_verify () {
+  python -m mgc.main rebuild verify playlists \
+    --db "$MGC_DB" \
+    --out-dir "data/playlists"
+}
 
-# Run #2 (determinism)
+# --- main flow ---
+
+maybe_generate_fixture_db
+db_preflight
+
 echo "[ci_rebuild_verify] == rebuild playlists (determinism check + write) =="
-ensure_db_has_playlists
 run_rebuild
 
-# Verify again (basic)
-echo "[ci_rebuild_verify] == verify playlists vs manifest =="
+echo "[ci_rebuild_verify] == verify playlists vs manifest + files =="
 test -f data/playlists/_manifest.playlists.json
 python -c "import json; json.load(open('data/playlists/_manifest.playlists.json'))"
-echo "[ci_rebuild_verify] OK: manifest exists and is valid JSON"
+run_verify
+
+echo "[ci_rebuild_verify] OK"
