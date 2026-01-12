@@ -670,6 +670,20 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         exclude_names=[manifest_path.name],  # (write_manifest also excludes out_path.name)
     )
 
+    manifest_path = receipts_dir / "_manifest.receipts.json"
+    manifest = write_manifest(
+        root_dir=receipts_dir,
+        out_path=manifest_path,
+        generated_at=published_at,
+        include_suffixes=[".json"],
+        exclude_names=[manifest_path.name],
+    )
+
+    # NEW: quiet output for CI
+    if bool(getattr(args, "hash_only", False)):
+        print(str(manifest.get("tree_sha256")))
+        return 0
+
     if bool(getattr(args, "hash_only", False)):
         print(str(manifest.get("tree_sha256")))
         return 0
@@ -769,7 +783,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pm.add_argument(
         "--hash-only",
         action="store_true",
-        help="Print only manifest_tree_sha256 on success (implies --json false output format).",
+        help="Print only the manifest tree_sha256 (quiet CI mode). Still writes receipts + manifest.",
     )
 
     pm.add_argument(
@@ -778,6 +792,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         choices=["planned", "published", "any"],
         help="Which rows to receipt/publish (default: planned). Use 'published' to generate audit receipts.",
     )
+
     pm.add_argument("--only-planned", action="store_true", help="Legacy alias for --status planned")
 
     pm.add_argument("--commit", action="store_true", help="Update DB status to published (still simulated)")
