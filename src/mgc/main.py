@@ -10,6 +10,7 @@ CI compatibility:
 - `mgc rebuild verify tracks ...`
 
 Other commands:
+- status: quick health + recent activity summary
 - playlists: list, history, reveal, export
 - tracks: list, show, stats
 - marketing: posts list
@@ -33,7 +34,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
 
 
 DEFAULT_DB = "data/db.sqlite"
@@ -53,7 +54,7 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-def die(msg: str, code: int = 2) -> "NoReturn":
+def die(msg: str, code: int = 2) -> NoReturn:
     eprint(msg)
     raise SystemExit(code)
 
@@ -91,6 +92,10 @@ def _truthy(a: bool, b: bool) -> bool:
     return bool(a) or bool(b)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 # ----------------------------
 # argv preprocessing (make global flags work anywhere)
 # ----------------------------
@@ -106,12 +111,14 @@ _GLOBAL_FLAG_WITH_VALUE = {
     "--log-file",
 }
 
+
 def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
     # supports --db=path style
     if arg.startswith("--") and "=" in arg:
         k, v = arg.split("=", 1)
         return k, v
     return arg, None
+
 
 def _hoist_global_flags(argv: List[str]) -> List[str]:
     """
@@ -593,8 +600,8 @@ def cmd_playlists_export(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"exported": exported}, indent=2, ensure_ascii=False, sort_keys=True))
     else:
-        for p in exported:
-            print(p)
+        for pth in exported:
+            print(pth)
     return 0
 
 
@@ -743,6 +750,212 @@ def cmd_marketing_posts_list(args: argparse.Namespace) -> int:
 
 
 # ----------------------------
+# status command
+# ----------------------------
+
+def _db_count(conn: sqlite3.Connection, table: str) -> Optional[int]:
+    if not _table_exists(conn, table):
+        return None
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+    except Exception:
+        return None
+
+
+def _safe_latest_row(conn: sqlite3.Connection, table: str) -> Optional[sqlite3.Row]:
+    if not _table_exists(conn, table):
+        return None
+    cols = set(_columns(conn, table))
+    order_by = None
+    if "created_at" in cols:
+        order_by = "created_at DESC"
+    elif "created_ts" in cols:
+        order_by = "created_ts DESC"
+    elif "id" in cols:
+        order_by = "id DESC"
+    q = f"SELECT * FROM {table} "
+    if order_by:
+        q += f"ORDER BY {order_by} "
+    q += "LIMIT 1"
+    try:
+        return conn.execute(q).fetchone()
+    except Exception:
+        return None
+
+
+def _path_info(path: Path) -> Dict[str, Any]:
+    try:
+        exists = path.exists()
+        is_dir = path.is_dir() if exists else False
+        is_file = path.is_file() if exists else False
+        size = path.stat().st_size if (exists and is_file) else None
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds") if exists else None
+        return {"path": str(path), "exists": exists, "is_dir": is_dir, "is_file": is_file, "size": size, "mtime_utc": mtime}
+    except Exception as e:
+        return {"path": str(path), "exists": False, "error": str(e)}
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """
+    Human-friendly health + activity snapshot.
+
+    Also supports JSON output via global --json.
+    """
+    db_path = Path(args.db)
+    out: Dict[str, Any] = {
+        "ts_utc": _utc_now_iso(),
+        "db": {"path": str(db_path), "exists": db_path.exists()},
+        "env": {
+            "MGC_DB": os.environ.get("MGC_DB"),
+            "MGC_CONTEXT": os.environ.get("MGC_CONTEXT"),
+            "MGC_SEED": os.environ.get("MGC_SEED"),
+            "MGC_PROVIDER": os.environ.get("MGC_PROVIDER"),
+            "MGC_DETERMINISTIC": os.environ.get("MGC_DETERMINISTIC") or os.environ.get("DETERMINISTIC"),
+            "MGC_ARTIFACTS_DIR": os.environ.get("MGC_ARTIFACTS_DIR"),
+        },
+        "tables": {},
+        "latest": {},
+        "paths": {},
+        "notes": [],
+    }
+
+    # Filesystem quick checks
+    out["paths"]["playlists_dir"] = _path_info(DEFAULT_PLAYLIST_DIR)
+    out["paths"]["tracks_dir"] = _path_info(DEFAULT_TRACKS_DIR)
+    out["paths"]["tracks_export"] = _path_info(DEFAULT_TRACKS_EXPORT)
+    out["paths"]["evidence_dir"] = _path_info(Path("data/evidence"))
+
+    if not db_path.exists():
+        out["notes"].append("db_missing")
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        print("MGC Status")
+        print(f"  time_utc: {_utc_now_iso()}")
+        print(f"  db: {db_path} (MISSING)")
+        print("  (set --db or MGC_DB)")
+        return 0
+
+    db = DBConn(db_path)
+    with db.connect() as conn:
+        # Table presence + counts
+        for t in ("events", "playlist_runs", "playlists", "playlist_items", "tracks", "marketing_posts"):
+            out["tables"][t] = {
+                "exists": _table_exists(conn, t),
+                "count": _db_count(conn, t),
+            }
+
+        # Latest rows (best-effort)
+        latest_playlist = _safe_latest_row(conn, "playlists")
+        if latest_playlist is not None:
+            out["latest"]["playlist"] = _row_to_dict(latest_playlist)
+        latest_track = _safe_latest_row(conn, "tracks")
+        if latest_track is not None:
+            out["latest"]["track"] = _row_to_dict(latest_track)
+        latest_post = _safe_latest_row(conn, "marketing_posts")
+        if latest_post is not None:
+            out["latest"]["marketing_post"] = _row_to_dict(latest_post)
+        latest_event = _safe_latest_row(conn, "events")
+        if latest_event is not None:
+            out["latest"]["event"] = _row_to_dict(latest_event)
+        latest_run = _safe_latest_row(conn, "playlist_runs")
+        if latest_run is not None:
+            out["latest"]["playlist_run"] = _row_to_dict(latest_run)
+
+        # “Latest playlist per slug” summary (handy for contexts)
+        try:
+            rows = _safe_select_latest_playlists_by_slug(conn)
+            out["latest"]["playlists_by_slug"] = [
+                {
+                    "id": r.get("id"),
+                    "slug": r.get("slug", r.get("name")),
+                    "created_at": r.get("created_at", r.get("created_ts")),
+                }
+                for r in (_row_to_dict(x) for x in rows)
+            ]
+        except Exception:
+            pass
+
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    # Human output
+    print("MGC Status")
+    print(f"  time_utc: {out['ts_utc']}")
+    print(f"  db: {out['db']['path']} ({'OK' if out['db']['exists'] else 'MISSING'})")
+
+    # Env (only print the helpful ones if set)
+    env_items = out["env"]
+    env_show = []
+    for k in ("MGC_CONTEXT", "MGC_SEED", "MGC_PROVIDER", "MGC_DETERMINISTIC", "MGC_ARTIFACTS_DIR"):
+        v = env_items.get(k)
+        if v:
+            env_show.append(f"{k}={v}")
+    if env_show:
+        print("  env:")
+        for line in env_show:
+            print(f"    {line}")
+
+    print("  tables:")
+    for t in ("events", "playlist_runs", "playlists", "playlist_items", "tracks", "marketing_posts"):
+        info = out["tables"].get(t, {})
+        exists = info.get("exists", False)
+        cnt = info.get("count", None)
+        cnt_s = str(cnt) if cnt is not None else "?"
+        print(f"    {t}: {'present' if exists else 'missing'}  count={cnt_s}")
+
+    print("  paths:")
+    for key in ("playlists_dir", "tracks_dir", "tracks_export", "evidence_dir"):
+        p = out["paths"].get(key, {})
+        status = "OK" if p.get("exists") else "MISSING"
+        extra = ""
+        if p.get("is_file") and p.get("size") is not None:
+            extra = f" size={p['size']}"
+        if p.get("mtime_utc"):
+            extra += f" mtime_utc={p['mtime_utc']}"
+        print(f"    {key}: {p.get('path')} ({status}){extra}")
+
+    # Latest summary (small + readable)
+    latest = out.get("latest", {})
+    if latest:
+        print("  latest:")
+        if "playlist" in latest:
+            d = latest["playlist"]
+            print(f"    playlist: id={d.get('id')} slug={d.get('slug', d.get('name'))} created={d.get('created_at', d.get('created_ts'))}")
+        if "track" in latest:
+            d = latest["track"]
+            title = d.get("title") or d.get("name") or d.get("slug") or ""
+            print(f"    track: id={d.get('id')} {title}".rstrip())
+        if "marketing_post" in latest:
+            d = latest["marketing_post"]
+            title = d.get("title") or d.get("slug") or ""
+            print(f"    marketing_post: id={d.get('id')} {title}".rstrip())
+        if "playlist_run" in latest:
+            d = latest["playlist_run"]
+            created = d.get("created_at", d.get("created_ts"))
+            print(f"    playlist_run: id={d.get('id')} created={created}".rstrip())
+        if "event" in latest:
+            d = latest["event"]
+            kind = d.get("kind") or d.get("type") or d.get("name") or ""
+            created = d.get("created_at", d.get("created_ts"))
+            print(f"    event: id={d.get('id')} {kind} created={created}".rstrip())
+
+        # Optional: show per-slug list if not enormous
+        pbs = latest.get("playlists_by_slug")
+        if isinstance(pbs, list) and pbs:
+            # keep it short-ish
+            print("    playlists_by_slug:")
+            for item in pbs[:25]:
+                print(f"      {item.get('slug')}  id={item.get('id')}  created={item.get('created_at')}")
+            if len(pbs) > 25:
+                print(f"      ... ({len(pbs) - 25} more)")
+
+    return 0
+
+
+# ----------------------------
 # rebuild commands (CI contract)
 # ----------------------------
 
@@ -753,6 +966,7 @@ def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
         or os.environ.get("MGC_DB")
         or DEFAULT_DB
     )
+
 
 def _resolve_artifacts_dir(default_out_dir: str) -> Path:
     """
@@ -804,7 +1018,6 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
-
     if args.stamp:
         log.debug("stamp=%s", args.stamp)
 
@@ -835,8 +1048,8 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
     if _truthy(args.json, args.sub_json):
         print(json.dumps({"written": written}, indent=2, ensure_ascii=False, sort_keys=True))
     else:
-        for p in written:
-            print(p)
+        for pth in written:
+            print(pth)
     return 0
 
 
@@ -1000,6 +1213,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Output JSON where supported")
 
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # -------- status --------
+    st = sub.add_parser("status", help="Show health + recent activity snapshot")
+    st.set_defaults(func=cmd_status)
 
     # -------- rebuild --------
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")

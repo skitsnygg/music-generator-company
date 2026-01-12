@@ -248,6 +248,17 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     return con
 
 
+def db_table_exists(con: sqlite3.Connection, table: str) -> bool:
+    try:
+        row = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class ColumnInfo:
     name: str
@@ -2105,11 +2116,245 @@ def cmd_run_stage_list(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# run status (NEW)
+# ---------------------------------------------------------------------------
+
+def _latest_run_id(con: sqlite3.Connection) -> Optional[str]:
+    if not db_table_exists(con, "runs"):
+        return None
+    cols = db_table_columns(con, "runs")
+    if not cols:
+        return None
+    order_col = _pick_first_existing(cols, ["updated_at", "created_at", "run_date", "run_id"])
+    if not order_col:
+        order_col = "run_id"
+    try:
+        row = con.execute(f"SELECT run_id FROM runs ORDER BY {order_col} DESC LIMIT 1").fetchone()
+        return str(row["run_id"]) if row else None
+    except Exception:
+        try:
+            row2 = con.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
+            return str(row2["run_id"]) if row2 else None
+        except Exception:
+            return None
+
+
+def _read_stages_for_run(con: sqlite3.Connection, run_id: str) -> List[Dict[str, Any]]:
+    if not db_table_exists(con, "run_stages"):
+        return []
+    try:
+        rows = con.execute(
+            "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _summary_counts(con: sqlite3.Connection) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for t in ("runs", "run_stages", "drops", "tracks", "marketing_posts", "events"):
+        if not db_table_exists(con, t):
+            continue
+        try:
+            out[t] = int(con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"])
+        except Exception:
+            continue
+    return out
+
+
+def _list_runs(con: sqlite3.Connection, limit: int) -> List[Dict[str, Any]]:
+    if not db_table_exists(con, "runs"):
+        return []
+    cols = db_table_columns(con, "runs")
+    order_col = _pick_first_existing(cols, ["updated_at", "created_at", "run_date", "run_id"]) or "run_id"
+    try:
+        rows = con.execute(
+            f"SELECT * FROM runs ORDER BY {order_col} DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        try:
+            rows2 = con.execute("SELECT * FROM runs LIMIT ?", (int(limit),)).fetchall()
+            return [dict(r) for r in rows2]
+        except Exception:
+            return []
+
+
+def _latest_evidence_files(evidence_dir: Path, limit: int = 5) -> List[Dict[str, Any]]:
+    if not evidence_dir.exists() or not evidence_dir.is_dir():
+        return []
+    candidates: List[Path] = []
+    for p in evidence_dir.glob("*.json"):
+        if p.is_file():
+            candidates.append(p)
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    out: List[Dict[str, Any]] = []
+    for p in candidates[: max(0, int(limit))]:
+        try:
+            out.append(
+                {
+                    "path": str(p),
+                    "mtime": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+                    "size": int(p.stat().st_size),
+                }
+            )
+        except Exception:
+            out.append({"path": str(p)})
+    return out
+
+
+def cmd_run_status(args: argparse.Namespace) -> int:
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    evidence_dir = Path(os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
+    con = db_connect(db_path)
+
+    # Don't force-create tables for status; just be tolerant.
+    run_id = str(args.run_id).strip() if getattr(args, "run_id", None) else ""
+    if not run_id:
+        run_id = _latest_run_id(con) or ""
+
+    counts = _summary_counts(con)
+    runs = _list_runs(con, limit=int(args.limit))
+    stages = _read_stages_for_run(con, run_id) if run_id else []
+    evidence_files = _latest_evidence_files(evidence_dir, limit=5)
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "db": db_path,
+        "run_id": run_id or None,
+        "deterministic_env": {
+            "MGC_DETERMINISTIC": os.environ.get("MGC_DETERMINISTIC"),
+            "DETERMINISTIC": os.environ.get("DETERMINISTIC"),
+            "MGC_FIXED_TIME": os.environ.get("MGC_FIXED_TIME"),
+            "MGC_CONTEXT": os.environ.get("MGC_CONTEXT"),
+            "MGC_SEED": os.environ.get("MGC_SEED"),
+            "MGC_PROVIDER_SET_VERSION": os.environ.get("MGC_PROVIDER_SET_VERSION"),
+            "MGC_EVIDENCE_DIR": os.environ.get("MGC_EVIDENCE_DIR"),
+        },
+        "counts": counts,
+        "runs": runs,
+        "stages": stages,
+        "evidence_dir": str(evidence_dir),
+        "recent_evidence_files": evidence_files,
+    }
+
+    if args.json:
+        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+        return 0
+
+    print(f"DB: {db_path}")
+    print(f"Run: {run_id or '(none)'}")
+    if counts:
+        print("Counts:")
+        for k in sorted(counts.keys()):
+            print(f"  {k}: {counts[k]}")
+    if stages:
+        print("Stages:")
+        for s in stages:
+            stage = str(s.get("stage") or "")
+            status = str(s.get("status") or "")
+            started = str(s.get("started_at") or "")
+            ended = str(s.get("ended_at") or "")
+            print(f"  {stage:18s} {status:10s} {started} {ended}".rstrip())
+    if evidence_files:
+        print(f"Recent evidence files in {evidence_dir}:")
+        for e in evidence_files:
+            print(f"  {e.get('mtime','')}  {e.get('size','')}  {e.get('path','')}".rstrip())
+    return 0
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _run_id_latest(con: sqlite3.Connection) -> Optional[str]:
+    # Prefer newest by updated_at/created_at if present; else by rowid.
+    if not _table_exists(con, "runs"):
+        return None
+    cols = set(db_table_columns(con, "runs"))
+    if "updated_at" in cols:
+        row = con.execute("SELECT run_id FROM runs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    elif "created_at" in cols:
+        row = con.execute("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    else:
+        row = con.execute("SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def cmd_run_status(args: argparse.Namespace) -> int:
+    """
+    Prints ONE JSON object to stdout describing:
+      - latest run_id (or requested run_id)
+      - run_key fields if available
+      - stage statuses (run_stages rows)
+      - most recent drop pointers for that run_id (if drops table exists)
+    """
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    run_id = (getattr(args, "run_id", None) or "").strip()
+    latest = bool(getattr(args, "latest", False))
+
+    if not run_id and latest:
+        run_id = _run_id_latest(con) or ""
+
+    if not run_id:
+        # default: latest
+        run_id = _run_id_latest(con) or ""
+
+    out: Dict[str, Any] = {
+        "db": db_path,
+        "found": False,
+        "run_id": run_id or None,
+        "run": None,
+        "stages": {"count": 0, "items": []},
+        "drop": None,
+    }
+
+    if not run_id:
+        sys.stdout.write(stable_json_dumps(out) + "\n")
+        return 1
+
+    # run row
+    if _table_exists(con, "runs"):
+        cols = set(db_table_columns(con, "runs"))
+        if "run_id" in cols:
+            row = con.execute("SELECT * FROM runs WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
+            if row is not None:
+                out["found"] = True
+                out["run"] = dict(row)
+
+    # stages
+    if _table_exists(con, "run_stages"):
+        rows = con.execute(
+            "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        out["stages"] = {"count": len(rows), "items": [dict(r) for r in rows]}
+
+    # latest drop for this run_id
+    if _table_exists(con, "drops"):
+        drop_row = _drop_latest_for_run(con, run_id)
+        if drop_row is not None:
+            out["drop"] = dict(drop_row)
+
+    sys.stdout.write(stable_json_dumps(out) + "\n")
+    return 0 if out["found"] else 1
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage)")
+    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)")
     run_p.set_defaults(_mgc_group="run")
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
 
@@ -2157,6 +2402,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     weekly.set_defaults(func=cmd_run_weekly)
+
+    status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
+    status.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
+    status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
+    status.add_argument("--json", action="store_true", help="(ignored) kept for CLI compatibility; output is always JSON")
+    status.set_defaults(func=cmd_run_status)
 
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")
