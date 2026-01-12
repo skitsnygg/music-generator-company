@@ -2216,6 +2216,8 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     if not run_id:
         run_id = _latest_run_id(con) or ""
 
+    fail_on_error = bool(getattr(args, "fail_on_error", False))
+
     counts = _summary_counts(con)
     runs = _list_runs(con, limit=int(args.limit))
     stages = _read_stages_for_run(con, run_id) if run_id else []
@@ -2302,6 +2304,8 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     run_id = (getattr(args, "run_id", None) or "").strip()
     latest = bool(getattr(args, "latest", False))
 
+    fail_on_error = bool(getattr(args, "fail_on_error", False))
+
     if not run_id and latest:
         run_id = _run_id_latest(con) or ""
 
@@ -2338,6 +2342,21 @@ def cmd_run_status(args: argparse.Namespace) -> int:
             (run_id,),
         ).fetchall()
         out["stages"] = {"count": len(rows), "items": [dict(r) for r in rows]}
+
+    # CI mode: fail if any stage is error
+    if fail_on_error:
+        any_error = False
+        for it in out["stages"].get("items", []):
+            try:
+                st = str(it.get("status") or "").lower()
+            except Exception:
+                st = ""
+            if st == "error":
+                any_error = True
+                break
+        if any_error:
+            sys.stdout.write(stable_json_dumps(out) + "\n")
+            return 2
 
     # latest drop for this run_id
     if _table_exists(con, "drops"):
@@ -2404,6 +2423,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.set_defaults(func=cmd_run_weekly)
 
     status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
+    status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
     status.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
     status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
     status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
