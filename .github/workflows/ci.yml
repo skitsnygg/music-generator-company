@@ -81,3 +81,12 @@ jobs:
           name: ci-artifacts
           path: artifacts/ci
           if-no-files-found: ignore
+
+      - name: Run determinism gate (run daily/publish/manifest)
+        shell: bash
+        env:
+          MGC_DB: fixtures/ci_db.sqlite
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+        run: |
+          bash scripts/ci_run_determinism.sh
