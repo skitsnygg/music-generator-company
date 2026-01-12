@@ -2518,6 +2518,8 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
         or "data/evidence"
     ).resolve()
 
+    fail_on_changes = bool(getattr(args, "fail_on_changes", False))
+
     kind = args.type  # drop | weekly | any
 
     if not evidence_dir.exists():
@@ -2590,7 +2592,13 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
     }
 
     sys.stdout.write(stable_json_dumps(out) + "\n")
+
+    if fail_on_changes:
+        if out["summary"]["added"] or out["summary"]["removed"] or out["summary"]["changed"]:
+            return 2
+
     return 0
+
 
 # ---------------------------------------------------------------------------
 # Argparse wiring
@@ -2617,6 +2625,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
     diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
     diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
+    diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any changes are detected (CI)")
     diff.add_argument("--json", action="store_true", help="JSON output (default)")
     diff.set_defaults(func=cmd_run_diff)
 
