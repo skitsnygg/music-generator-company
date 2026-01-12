@@ -670,6 +670,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         exclude_names=[manifest_path.name],  # (write_manifest also excludes out_path.name)
     )
 
+    if bool(getattr(args, "hash_only", False)):
+        print(str(manifest.get("tree_sha256")))
+        return 0
+
     summary = {
         "db": str(db_path),
         "stamp": stamp,
@@ -761,6 +765,12 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pm.add_argument("--artifacts-dir", default="artifacts")
     pm.add_argument("--stamp", default=None, help="Receipt stamp (default: UTC date YYYY-MM-DD)")
     pm.add_argument("--limit", type=int, default=50)
+
+    pm.add_argument(
+        "--hash-only",
+        action="store_true",
+        help="Print only manifest_tree_sha256 on success (implies --json false output format).",
+    )
 
     pm.add_argument(
         "--status",
