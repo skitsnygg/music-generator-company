@@ -94,21 +94,22 @@ jobs:
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
-      - name: Run determinism gate (run daily/publish/manifest + drop/drops)
+      - name: Run determinism gate (run daily/publish/manifest + drop/drops + replay diff)
         shell: bash
         env:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
           # Use the runtime-set env var (NOT ${{ runner.temp }} here)
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
           MGC_DB: ${{ env.MGC_DB }}
         run: |
           set -euxo pipefail
 
-          # Existing determinism checks
+          # Existing determinism checks (rebuild determinism, manifest hashing, etc.)
           bash scripts/ci_run_determinism.sh
 
-          # Drops smoke: run a deterministic drop, writing outputs to runner temp
+          # Drop smoke: run a deterministic drop, writing outputs to runner temp
           python -m mgc.main run drop \
             --context focus \
             --seed 1 \
@@ -130,6 +131,14 @@ jobs:
             python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
           fi
 
+          # NEW: Drop replay determinism + resume (run drop twice, diff stdout JSON)
+          mkdir -p "${MGC_ARTIFACTS_DIR}"
+          python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
+            > "${MGC_ARTIFACTS_DIR}/drop1.json"
+          python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
+            > "${MGC_ARTIFACTS_DIR}/drop2.json"
+          diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
+
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
         run: |
@@ -145,4 +154,7 @@ jobs:
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
+            /tmp/mgc_drop.json
+            /tmp/mgc_drops_list.json
+            /tmp/mgc_drops_show.json
           if-no-files-found: ignore
