@@ -21,7 +21,8 @@ cd "$repo_root"
 PYTHON="${PYTHON:-python}"
 DB="${MGC_DB:-${DB:-data/db.sqlite}}"
 STAMP="${STAMP:-ci}"
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
+ARTIFACTS_DIR="${MGC_ARTIFACTS_DIR:-${ARTIFACTS_DIR:-artifacts/ci}}"
+export MGC_ARTIFACTS_DIR="$ARTIFACTS_DIR"
 OUT_ROOT="${MGC_OUT_ROOT:-}"
 
 mkdir -p "$ARTIFACTS_DIR"
@@ -32,8 +33,8 @@ if [[ "$OUT_ROOT" == "data" ]]; then
   OUT_PLAYLISTS="data/playlists"
   OUT_TRACKS="data/tracks"
 else
-  OUT_PLAYLISTS="$ARTIFACTS_DIR/data/playlists"
-  OUT_TRACKS="$ARTIFACTS_DIR/data/tracks"
+  OUT_PLAYLISTS="$ARTIFACTS_DIR/rebuild/playlists"
+  OUT_TRACKS="$ARTIFACTS_DIR/rebuild/tracks"
 fi
 
 mkdir -p "$OUT_PLAYLISTS" "$OUT_TRACKS"

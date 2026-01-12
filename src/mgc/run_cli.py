@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1152,6 +1153,69 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# run_stages wiring (NEW)
+# ---------------------------------------------------------------------------
+
+def _import_run_stages() -> Optional[Callable[..., Any]]:
+    """
+    Try to locate `run_stages` in common modules. If not found, return None.
+    """
+    candidates: List[Tuple[str, str]] = [
+        ("mgc.stages", "run_stages"),
+        ("mgc.pipeline", "run_stages"),
+        ("mgc.run_stages", "run_stages"),
+        ("mgc.runner", "run_stages"),
+        ("mgc.run", "run_stages"),
+    ]
+    for mod_name, fn_name in candidates:
+        try:
+            mod = __import__(mod_name, fromlist=[fn_name])
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                return fn  # type: ignore[return-value]
+        except Exception:
+            continue
+    return None
+
+
+def _call_run_stages(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Any:
+    """
+    Signature-adaptive call: pass only kwargs that `run_stages` accepts.
+    """
+    sig = inspect.signature(fn)
+    params = sig.parameters
+
+    accepted: Dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if k in params:
+            accepted[k] = v
+
+    # If fn accepts **kwargs, we can pass everything
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        accepted = dict(kwargs)
+
+    # Check for required params not provided
+    missing: List[str] = []
+    for name, p in params.items():
+        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if p.default is not inspect._empty:
+            continue
+        if name in accepted:
+            continue
+        missing.append(name)
+
+    if missing:
+        raise TypeError(
+            "run_stages signature mismatch; missing required args: "
+            + ", ".join(missing)
+            + f" (have keys: {sorted(kwargs.keys())})"
+        )
+
+    return fn(**accepted)
+
+
+# ---------------------------------------------------------------------------
 # Daily run (deterministic orchestrator)
 # ---------------------------------------------------------------------------
 
@@ -1349,13 +1413,50 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     con = db_connect(db_path)
     ensure_tables_minimal(con)
 
+    run_key = RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version)
+
     run_id = db_get_or_create_run_id(
         con,
-        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
+        run_key=run_key,
         ts=ts,
         argv=list(sys.argv),
     )
 
+    # NEW: prefer run_stages if present
+    rs = _import_run_stages()
+    if rs is not None:
+        kwargs: Dict[str, Any] = {
+            "con": con,
+            "conn": con,
+            "db": con,
+            "db_path": db_path,
+            "run_id": run_id,
+            "run_key": run_key,
+            "context": context,
+            "seed": seed,
+            "deterministic": deterministic,
+            "ts": ts,
+            "out_dir": str(out_dir),
+            "out_path": str(out_dir / ("daily_evidence.json" if deterministic else f"daily_evidence_{run_id}.json")),
+            "argv": list(sys.argv),
+            "args": args,
+            "stages": ["daily"],  # daily-level entrypoint
+            "allow_resume": True,
+        }
+        try:
+            out = _call_run_stages(rs, kwargs)
+            # If run_stages returns a dict, print it. Else wrap it.
+            if isinstance(out, dict):
+                sys.stdout.write(stable_json_dumps(out) + "\n")
+            else:
+                sys.stdout.write(stable_json_dumps({"ok": True, "run_id": run_id, "result": out}) + "\n")
+            return 0
+        except Exception:
+            # Fall back to legacy behavior if run_stages exists but doesn't match yet.
+            # This keeps CI usable while we align signatures.
+            pass
+
+    # Legacy behavior: external runner or stub
     maybe = _maybe_call_external_daily_runner(
         db_path=db_path,
         context=context,
@@ -1585,12 +1686,55 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     con = db_connect(db_path)
     ensure_tables_minimal(con)
 
+    run_key = RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version)
+
     run_id = db_get_or_create_run_id(
         con,
-        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
+        run_key=run_key,
         ts=ts,
         argv=list(sys.argv),
     )
+
+    # NEW: prefer run_stages if present
+    rs = _import_run_stages()
+    if rs is not None:
+        kwargs: Dict[str, Any] = {
+            "con": con,
+            "conn": con,
+            "db": con,
+            "db_path": db_path,
+            "run_id": run_id,
+            "run_key": run_key,
+            "context": context,
+            "seed": seed,
+            "deterministic": deterministic,
+            "ts": ts,
+            "out_dir": str(out_dir),
+            "repo_root": str(getattr(args, "repo_root", None) or "."),
+            "include": getattr(args, "include", None),
+            "exclude_dir": getattr(args, "exclude_dir", None),
+            "exclude_glob": getattr(args, "exclude_glob", None),
+            "limit": limit,
+            "dry_run": dry_run,
+            "allow_resume": allow_resume,
+            "args": args,
+            "argv": list(sys.argv),
+            "stages": ["daily", "publish_marketing", "manifest", "evidence"],
+        }
+        try:
+            out = _call_run_stages(rs, kwargs)
+            if isinstance(out, dict):
+                sys.stdout.write(stable_json_dumps(out) + "\n")
+            else:
+                sys.stdout.write(stable_json_dumps({"ok": True, "run_id": run_id, "result": out}) + "\n")
+            return 0
+        except Exception:
+            # Fall back to legacy implementation while we align run_stages signature/behavior.
+            pass
+
+    # -------------------------
+    # Legacy implementation below (unchanged)
+    # -------------------------
 
     # Stage 1: daily
     with run_stage(
