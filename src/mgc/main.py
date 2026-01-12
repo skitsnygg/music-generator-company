@@ -1002,7 +1002,17 @@ def build_parser() -> argparse.ArgumentParser:
     mpl.add_argument("--limit", type=int, default=20)
     mpl.set_defaults(func=cmd_marketing_posts_list)
 
+    # -------- drops --------
+    try:
+        from mgc.drops_cli import register_drops_subcommand  # type: ignore
+    except Exception:
+        register_drops_subcommand = None  # type: ignore
+
+    if register_drops_subcommand:
+        register_drops_subcommand(sub)
+
     # -------- analytics passthrough --------
+
     try:
         from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
     except Exception:
