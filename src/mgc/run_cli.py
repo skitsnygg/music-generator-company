@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+
 # ----------------------------
 # small utils
 # ----------------------------
@@ -176,6 +177,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     from mgc.agents.music_agent import MusicAgent
     from mgc.agents.marketing_agent import MarketingAgent
     from mgc.playlist import build_playlist
+    from mgc.manifest import write_manifest
 
     stamp = (args.stamp or _stable_stamp_default()).strip()
     db_path = Path(args.db)
@@ -289,6 +291,25 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         print(json.dumps(run_summary, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         print(str(evidence.summary_json))
+
+    # 4) Evidence manifest (deterministic hash of the run bundle)
+    run_manifest_path = evidence.root / "_manifest.run.json"
+    run_manifest = write_manifest(
+        root_dir=evidence.root,
+        out_path=run_manifest_path,
+        generated_at=created_at,
+        include_suffixes=[".json"],
+        exclude_names=[run_manifest_path.name, evidence.summary_json.name],
+    )
+
+    # Add the hash to run summary (and rewrite run.json)
+    run_summary["manifest"] = {
+        "path": str(run_manifest_path),
+        "tree_sha256": str(run_manifest.get("tree_sha256")),
+        "file_count": int(run_manifest.get("file_count", 0) or 0),
+    }
+    _write_json(evidence.summary_json, run_summary)
+
 
     return 0
 
@@ -717,6 +738,110 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
     return 0
 
+def _sha256_text(s: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    h.update(s.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _combined_root_hash(parts: Dict[str, str]) -> str:
+    # stable canonical form: sorted keys, one per line
+    lines = []
+    for k in sorted(parts.keys()):
+        lines.append(f"{k}={parts[k]}\n")
+    return _sha256_text("".join(lines))
+
+
+def _read_optional_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = _read_json(path)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def cmd_run_manifest(args: argparse.Namespace) -> int:
+    from mgc.manifest import write_manifest
+
+    stamp = (args.stamp or _stable_stamp_default()).strip()
+    artifacts_dir = Path(args.artifacts_dir)
+
+    run_dir = artifacts_dir / "runs" / stamp
+    receipts_dir = artifacts_dir / "receipts" / stamp / "marketing"
+
+    if not run_dir.exists():
+        raise SystemExit(f"run dir not found: {run_dir}")
+
+    # Ensure run manifest exists (or rebuild it)
+    run_manifest_path = run_dir / "_manifest.run.json"
+    run_manifest = _read_optional_json(run_manifest_path)
+    if not run_manifest or args.rebuild:
+        # Hash run evidence bundle; exclude run.json and the manifest itself
+        run_manifest = write_manifest(
+            root_dir=run_dir,
+            out_path=run_manifest_path,
+            generated_at=_now_iso(),
+            include_suffixes=[".json"],
+            exclude_names=[run_manifest_path.name, "run.json"],
+        )
+
+    run_tree = str(run_manifest.get("tree_sha256") or "")
+
+    # Receipts: optional
+    receipts_tree = ""
+    receipts_manifest_path = receipts_dir / "_manifest.receipts.json"
+    receipts_manifest = _read_optional_json(receipts_manifest_path)
+
+    if args.include_receipts:
+        if receipts_dir.exists():
+            if not receipts_manifest or args.rebuild:
+                receipts_manifest = write_manifest(
+                    root_dir=receipts_dir,
+                    out_path=receipts_manifest_path,
+                    generated_at=_now_iso(),
+                    include_suffixes=[".json"],
+                    exclude_names=[receipts_manifest_path.name],
+                )
+            receipts_tree = str((receipts_manifest or {}).get("tree_sha256") or "")
+        else:
+            # keep it explicit rather than silently changing the hash basis
+            receipts_tree = ""
+
+    parts: Dict[str, str] = {"run_tree_sha256": run_tree}
+    if args.include_receipts and receipts_tree:
+        parts["receipts_tree_sha256"] = receipts_tree
+
+    root_sha = _combined_root_hash(parts)
+
+    out_path = run_dir / "_manifest.root.json"
+    root_obj: Dict[str, Any] = {
+        "version": 1,
+        "stamp": stamp,
+        "generated_at": _now_iso(),
+        "parts": parts,
+        "root_tree_sha256": root_sha,
+        "paths": {
+            "run_dir": str(run_dir),
+            "run_manifest": str(run_manifest_path),
+            "receipts_dir": str(receipts_dir),
+            "receipts_manifest": str(receipts_manifest_path),
+        },
+    }
+    _write_json(out_path, root_obj)
+
+    if bool(getattr(args, "hash_only", False)):
+        print(root_sha)
+        return 0
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(root_obj, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"[run manifest] stamp={stamp} root_tree_sha256={root_sha} out={out_path}")
+
+    return 0
+
 
 
 # ----------------------------
@@ -751,6 +876,16 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.add_argument("--lookback-playlists", type=int, default=3)
     weekly.add_argument("--json", action="store_true")
     weekly.set_defaults(func=cmd_run_daily)
+
+    rmanifest = rs.add_parser("manifest", help="Create a single root hash for a run (evidence + optional receipts)")
+    rmanifest.add_argument("--artifacts-dir", default="artifacts")
+    rmanifest.add_argument("--stamp", default=None, help="Run stamp (default: UTC date YYYY-MM-DD)")
+    rmanifest.add_argument("--include-receipts", action="store_true", help="Include publish receipts if present")
+    rmanifest.add_argument("--rebuild", action="store_true", help="Recompute manifests even if they exist")
+    rmanifest.add_argument("--hash-only", action="store_true", help="Print only the root_tree_sha256")
+    rmanifest.add_argument("--json", action="store_true")
+    rmanifest.set_defaults(func=cmd_run_manifest)
+
 
     # ---- web ----
     web = subparsers.add_parser("web", help="Build and serve a simple static web player")
