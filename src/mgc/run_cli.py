@@ -539,24 +539,15 @@ def run_stage(
 ):
     """
     Stage context manager:
-      - If allow_resume and stage already ok/skipped: mark as skipped and do not run body.
+      - If allow_resume and stage already ok/skipped: do not run body (NO DB write).
       - Otherwise: mark running, run body, then mark ok; on exception mark error.
+    Determinism:
+      - duration_ms is normalized to 0 in deterministic mode.
     """
     ensure_tables_minimal(con)
 
     existing = db_stage_get(con, run_id=run_id, stage=stage)
     if allow_resume and stage_is_done(existing):
-        ts = deterministic_now_iso(deterministic)
-        db_stage_upsert(
-            con,
-            run_id=run_id,
-            stage=stage,
-            status="skipped",
-            started_at=ts,
-            ended_at=ts,
-            duration_ms=0,
-            meta_patch={"resume": True, "note": "already complete", **(meta or {})},
-        )
         yield False
         return
 
@@ -577,6 +568,8 @@ def run_stage(
     except Exception as e:
         ended_at = deterministic_now_iso(deterministic)
         dur_ms = int((time.perf_counter() - t0) * 1000)
+        if deterministic:
+            dur_ms = 0
         db_stage_upsert(
             con,
             run_id=run_id,
@@ -590,6 +583,8 @@ def run_stage(
     else:
         ended_at = deterministic_now_iso(deterministic)
         dur_ms = int((time.perf_counter() - t0) * 1000)
+        if deterministic:
+            dur_ms = 0
         db_stage_upsert(
             con,
             run_id=run_id,
@@ -1064,15 +1059,25 @@ def iter_repo_files(
             "*.db",
         ]
 
+    def _is_excluded_dir(rel_parts: Tuple[str, ...]) -> bool:
+        return any(part in exclude_dirs for part in rel_parts)
+
     if include_globs:
         seen: set[Path] = set()
         for g in include_globs:
             for p in sorted(repo_root.glob(g)):
-                if p.is_file():
-                    rp = p.resolve()
-                    if rp not in seen:
-                        seen.add(rp)
-                        yield p
+                if not p.is_file():
+                    continue
+                try:
+                    rel_parts = p.relative_to(repo_root).parts
+                except Exception:
+                    continue
+                if _is_excluded_dir(rel_parts):
+                    continue
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    yield p
         return
 
     all_files: List[Path] = []
@@ -1081,7 +1086,7 @@ def iter_repo_files(
             rel_parts = p.relative_to(repo_root).parts
         except Exception:
             continue
-        if any(part in exclude_dirs for part in rel_parts):
+        if _is_excluded_dir(rel_parts):
             continue
         if p.is_dir():
             continue
@@ -1095,9 +1100,15 @@ def iter_repo_files(
         yield p
 
 
-def compute_manifest(repo_root: Path, *, include: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+def compute_manifest(
+    repo_root: Path,
+    *,
+    include: Optional[Sequence[str]] = None,
+    exclude_dirs: Optional[Sequence[str]] = None,
+    exclude_globs: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     entries: List[ManifestEntry] = []
-    for p in iter_repo_files(repo_root, include_globs=include):
+    for p in iter_repo_files(repo_root, include_globs=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs):
         rel = str(p.relative_to(repo_root)).replace("\\", "/")
         b = read_text_bytes(p)
         entries.append(ManifestEntry(path=rel, sha256=sha256_hex(b), size=len(b)))
@@ -1119,7 +1130,11 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
         die(f"repo_root does not exist: {repo_root}")
 
     include = args.include or None
-    manifest = compute_manifest(repo_root, include=include)
+
+    exclude_dirs = args.exclude_dir or None
+    exclude_globs = args.exclude_glob or None
+
+    manifest = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
 
     out_path = Path(args.out) if args.out else None
     text = stable_json_dumps(manifest) + "\n"
@@ -1524,6 +1539,22 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 # Drop (daily + publish + manifest) with stages and resume semantics
 # ---------------------------------------------------------------------------
 
+def _drop_latest_for_run(con: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
+    cols = db_table_columns(con, "drops")
+    if not cols:
+        return None
+
+    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on", "occurred_at"])
+    id_col = _pick_first_existing(cols, ["id", "drop_id"]) or "id"
+
+    if ts_col:
+        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {ts_col} DESC, {id_col} DESC LIMIT 1"
+    else:
+        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {id_col} DESC LIMIT 1"
+
+    return con.execute(sql, (run_id,)).fetchone()
+
+
 def cmd_run_drop(args: argparse.Namespace) -> int:
     """
     Product-level command: daily + publish-marketing + manifest + consolidated evidence.
@@ -1601,10 +1632,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 cmd_publish_marketing(pub_ns)
 
     # Resolve latest drop row for pointers
-    drop_row = con.execute(
-        "SELECT * FROM drops WHERE run_id = ? ORDER BY ts DESC, id DESC LIMIT 1",
-        (run_id,),
-    ).fetchone()
+    drop_row = _drop_latest_for_run(con, run_id)
     drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
     drop_id = str(drop_obj.get("id") or stable_uuid5("drop", run_id))
 
@@ -1627,7 +1655,8 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                     out=str(manifest_path),
                     print_hash=False,
                     include=getattr(args, "include", None),
-                    exclude=getattr(args, "exclude", None),
+                    exclude_dir=getattr(args, "exclude_dir", None),
+                    exclude_glob=getattr(args, "exclude_glob", None),
                 )
                 cmd_run_manifest(manifest_ns)
 
@@ -1672,6 +1701,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
             out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
 
+            # Best-effort persist evidence pointers into drop meta (only if drop exists)
             if drop_obj.get("id"):
                 existing_meta: Dict[str, Any] = {}
                 meta_raw = drop_obj.get("meta_json")
@@ -1686,11 +1716,15 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 existing_meta.update(evidence["paths"])
                 existing_meta.update({"run_id": run_id, "run_key": evidence["run_key"]})
 
-                con.execute(
-                    "UPDATE drops SET meta_json = ? WHERE id = ?",
-                    (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
-                )
-                con.commit()
+                cols = db_table_columns(con, "drops")
+                meta_col = _pick_first_existing(cols, ["meta_json", "metadata_json", "meta", "metadata"])
+                id_col = _pick_first_existing(cols, ["id", "drop_id"]) or "id"
+                if meta_col:
+                    con.execute(
+                        f"UPDATE drops SET {meta_col} = ? WHERE {id_col} = ?",
+                        (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
+                    )
+                    con.commit()
 
     # Emit exactly one JSON object (re-read evidence file if it exists)
     try:
@@ -1741,6 +1775,8 @@ def cmd_run_stage_set(args: argparse.Namespace) -> int:
     duration_ms = args.duration_ms
     if duration_ms is not None:
         duration_ms = int(duration_ms)
+        if deterministic:
+            duration_ms = 0
 
     error_obj: Optional[Dict[str, Any]] = None
     if args.error_json:
@@ -1849,6 +1885,8 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
     drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
     drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
+    drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
     drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     drop.set_defaults(func=cmd_run_drop)
@@ -1856,6 +1894,8 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")
     man.add_argument("--include", action="append", default=None, help="Optional glob(s) to include (can repeat)")
+    man.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude (repeatable)")
+    man.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude (repeatable)")
     man.add_argument("--out", default=None, help="Write manifest JSON to this path (else stdout)")
     man.add_argument("--print-hash", action="store_true", help="Print root_tree_sha256 to stderr")
     man.set_defaults(func=cmd_run_manifest)
@@ -1870,7 +1910,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     st_set.add_argument("status", help="pending|running|ok|error|skipped")
     st_set.add_argument("--started-at", default=None, help="ISO8601 timestamp")
     st_set.add_argument("--ended-at", default=None, help="ISO8601 timestamp")
-    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds")
+    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds (normalized to 0 in deterministic mode)")
     st_set.add_argument("--error-json", default=None, help="JSON string for error details")
     st_set.add_argument("--meta-json", default=None, help="JSON string to merge into meta_json")
     st_set.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")

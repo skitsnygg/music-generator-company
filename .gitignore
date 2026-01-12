@@ -43,3 +43,7 @@ data/
 # but keep the playlists manifest tracked
 !data/playlists/
 !data/playlists/_manifest.playlists.json
+
+# Generated playlists artifacts (committed only when explicitly forced)
+data/playlists/_manifest.playlists.json
+data/playlists/*.json

@@ -92,6 +92,82 @@ def _truthy(a: bool, b: bool) -> bool:
 
 
 # ----------------------------
+# argv preprocessing (make global flags work anywhere)
+# ----------------------------
+
+_GLOBAL_FLAG_NO_VALUE = {
+    "--json",
+    "--log-console",
+}
+
+_GLOBAL_FLAG_WITH_VALUE = {
+    "--db",
+    "--log-level",
+    "--log-file",
+}
+
+def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
+    # supports --db=path style
+    if arg.startswith("--") and "=" in arg:
+        k, v = arg.split("=", 1)
+        return k, v
+    return arg, None
+
+def _hoist_global_flags(argv: List[str]) -> List[str]:
+    """
+    Argparse normally requires global flags to appear before the subcommand.
+    CI (and humans) often do: `mgc drops list --limit 1 --json --db ...`.
+    This function hoists known global flags (and their values) to the front.
+    """
+    if not argv:
+        return argv
+
+    out: List[str] = []
+    globals_found: List[str] = []
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+
+        # Respect end-of-options marker.
+        if a == "--":
+            out.extend(argv[i:])
+            break
+
+        k, v = _split_eq(a)
+
+        # no-value globals
+        if k in _GLOBAL_FLAG_NO_VALUE:
+            globals_found.append(k)
+            i += 1
+            continue
+
+        # value globals
+        if k in _GLOBAL_FLAG_WITH_VALUE:
+            if v is not None:
+                globals_found.append(f"{k}={v}")
+                i += 1
+                continue
+
+            # consume next token as value if present
+            if i + 1 < len(argv):
+                globals_found.extend([k, argv[i + 1]])
+                i += 2
+                continue
+
+            # missing value; leave it to argparse to error (but keep it in place)
+            out.append(a)
+            i += 1
+            continue
+
+        out.append(a)
+        i += 1
+
+    # Keep global flags in the order encountered
+    return globals_found + out
+
+
+# ----------------------------
 # logging (deterministic, no duplicates)
 # ----------------------------
 
@@ -678,6 +754,26 @@ def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
         or DEFAULT_DB
     )
 
+def _resolve_artifacts_dir(default_out_dir: str) -> Path:
+    """
+    If MGC_ARTIFACTS_DIR is set, route writes/verifies to that tree so CI
+    doesn't dirty the repo working tree.
+
+    Example:
+      MGC_ARTIFACTS_DIR=artifacts/ci
+      playlists -> artifacts/ci/rebuild/playlists
+      tracks    -> artifacts/ci/rebuild/tracks
+    """
+    root = (os.environ.get("MGC_ARTIFACTS_DIR") or "").strip()
+    if not root:
+        return Path(default_out_dir)
+
+    # Keep it stable + predictable
+    base = Path(root) / "rebuild"
+    # Caller passes default_out_dir like "data/playlists" / "data/tracks"
+    leaf = Path(default_out_dir).name
+    return base / leaf
+
 
 def _determinism_check(builder) -> None:
     a = builder()
@@ -706,7 +802,8 @@ def cmd_rebuild_ls(args: argparse.Namespace) -> int:
 def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.playlists")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
-    out_dir = Path(args.out_dir)
+    out_dir = _resolve_artifacts_dir(str(args.out_dir))
+
 
     if args.stamp:
         log.debug("stamp=%s", args.stamp)
@@ -718,7 +815,10 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
         rows = _safe_select_latest_playlists_by_slug(conn)
         for r in rows:
             d = _row_to_dict(r)
-            out_path = _playlist_output_path(d, out_dir=out_dir)
+            # IMPORTANT: during rebuild, always write into out_dir (CI artifacts),
+            # do NOT honor json_path/path from the DB row.
+            slug = str(d.get("slug") or d.get("name") or "playlist")
+            out_path = Path(out_dir) / f"{_safe_slug(slug)}.json"
 
             def build_one() -> Any:
                 return _build_playlist_json_for_row(conn, d)
@@ -743,7 +843,7 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
 def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.tracks")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
-    out_dir = Path(args.out_dir)
+    out_dir = _resolve_artifacts_dir(str(args.out_dir))
     out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
 
     if args.stamp:
@@ -787,7 +887,9 @@ def _verify_playlists(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, Lis
     rows = _safe_select_latest_playlists_by_slug(conn)
     for r in rows:
         d = _row_to_dict(r)
-        path = _playlist_output_path(d, out_dir=out_dir)
+        # IMPORTANT: verify must check the same canonical rebuild path in out_dir
+        slug = str(d.get("slug") or d.get("name") or "playlist")
+        path = Path(out_dir) / f"{_safe_slug(slug)}.json"
         expected = _build_playlist_json_for_row(conn, d)
 
         if not path.exists():
@@ -839,7 +941,7 @@ def _verify_tracks(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, List[D
 def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.verify.playlists")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
-    out_dir = Path(args.out_dir)
+    out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
     if args.stamp:
         log.debug("stamp=%s", args.stamp)
@@ -863,7 +965,7 @@ def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
 def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.verify.tracks")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
-    out_dir = Path(args.out_dir)
+    out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
     if args.stamp:
         log.debug("stamp=%s", args.stamp)
@@ -899,9 +1001,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # ... all your registrations ...
-    # tracks, marketing, analytics, run/web/publish, etc.
-
     # -------- rebuild --------
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
@@ -913,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rp = rs.add_parser("playlists", help="Rebuild canonical playlist JSON files (CI)")
     rp.add_argument("--db", default=None)
-    rp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rp.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_PLAYLIST_DIR))))
     rp.add_argument("--stamp", default=None)
     rp.add_argument("--determinism-check", action="store_true")
     rp.add_argument("--write", action="store_true")
@@ -922,7 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rt = rs.add_parser("tracks", help="Rebuild canonical tracks export (CI)")
     rt.add_argument("--db", default=None)
-    rt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rt.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_TRACKS_DIR))))
     rt.add_argument("--stamp", default=None)
     rt.add_argument("--determinism-check", action="store_true")
     rt.add_argument("--write", action="store_true")
@@ -934,7 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rvp = rvs.add_parser("playlists", help="Verify playlists outputs")
     rvp.add_argument("--db", default=None)
-    rvp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rvp.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_PLAYLIST_DIR))))
     rvp.add_argument("--stamp", default=None)
     rvp.add_argument("--strict", action="store_true")
     rvp.add_argument("--json", dest="sub_json", action="store_true")
@@ -943,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rvt = rvs.add_parser("tracks", help="Verify tracks outputs")
     rvt.add_argument("--db", default=None)
-    rvt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rvt.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_TRACKS_DIR))))
     rvt.add_argument("--stamp", default=None)
     rvt.add_argument("--strict", action="store_true")
     rvt.add_argument("--json", dest="sub_json", action="store_true")
@@ -1012,7 +1111,6 @@ def build_parser() -> argparse.ArgumentParser:
         register_drops_subcommand(sub)
 
     # -------- analytics passthrough --------
-
     try:
         from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
     except Exception:
@@ -1025,19 +1123,18 @@ def build_parser() -> argparse.ArgumentParser:
     try:
         from mgc.run_cli import register_run_subcommand  # type: ignore
     except Exception as e:
-        register_run_subcommand = None  # type: ignore
-        import traceback, sys
-        print("[mgc.main] FAILED to import mgc.run_cli:", file=sys.stderr)
-        traceback.print_exc()
-    else:
-        register_run_subcommand(sub)
+        raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
+    register_run_subcommand(sub)
 
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    cooked = _hoist_global_flags(raw)
+    args = parser.parse_args(cooked)
 
     _configure_logging(level=args.log_level, log_file=args.log_file, log_console=bool(args.log_console))
 

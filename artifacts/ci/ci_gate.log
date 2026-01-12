@@ -1,0 +1,33 @@
+[ci_gate] Repo: /Users/admin/music-generator-company
+[ci_gate] MGC_DB=fixtures/ci_db.sqlite
+[ci_gate] ARTIFACTS_DIR=artifacts/ci
+[ci_gate] MGC_OUT_ROOT=
+[ci_gate] git_sha: 101fda30273f7146f8a2e4d087d82b0f907aa287
+[ci_gate] git_branch: main
+[ci_gate] python: Python 3.14.2
+[ci_gate] DB OK.
+[ci_gate] drops smoke test
+[ci_gate] py_compile
+[ci_gate] rebuild + verify
+[ci_rebuild_verify] repo_root: /Users/admin/music-generator-company
+[ci_rebuild_verify] python: python
+[ci_rebuild_verify] db: fixtures/ci_db.sqlite
+[ci_rebuild_verify] out_playlists: artifacts/ci/data/playlists
+[ci_rebuild_verify] out_tracks: artifacts/ci/data/tracks
+[ci_rebuild_verify] stamp: ci
+[ci_rebuild_verify] ARTIFACTS_DIR=artifacts/ci
+[ci_rebuild_verify] MGC_OUT_ROOT=
+[ci_rebuild_verify] == python ==
+Python 3.14.2
+[ci_rebuild_verify] == rebuild playlists (determinism check + write) ==
+[ci_rebuild_verify] == rebuild tracks (determinism check + write) ==
+[ci_rebuild_verify] == verify playlists (strict) ==
+[ci_rebuild_verify] == verify tracks (strict) ==
+[ci_rebuild_verify] OK
+[ci_rebuild_verify] outputs:
+  playlists: 1 files
+  tracks:    1 files
+[ci_gate] publish receipts determinism
+[ci_publish_determinism] run publish-marketing twice (deterministic) and compare sha256
+[ci_publish_determinism] OK: stamp=ci_publish sha256=b1446109bf20c7031799bfbdf3a2b966846cf053a520fb33228214afa5400da3
+[ci_gate] OK

@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-01-12T02:45:53.974898+00:00",
+  "parts": {
+    "receipts_tree_sha256": "b8e0b520ca290d6c7b4d9424cfabb1839c4653412903298e55f4d59dfd88cd71",
+    "run_tree_sha256": "702985bfb427ed01d5d9e2bf10c3c9f0bbc03ac016401af3f79eb0b9e13c1f5a"
+  },
+  "paths": {
+    "receipts_dir": "artifacts/receipts/2026-01-12/marketing",
+    "receipts_manifest": "artifacts/receipts/2026-01-12/marketing/_manifest.receipts.json",
+    "run_dir": "artifacts/runs/2026-01-12",
+    "run_manifest": "artifacts/runs/2026-01-12/_manifest.run.json"
+  },
+  "root_tree_sha256": "7a72efd9a97e67f58da741810423029e3e89250fd2820ab0e114f58c08993cd3",
+  "stamp": "2026-01-12",
+  "version": 1
+}

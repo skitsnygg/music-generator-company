@@ -1,0 +1,18 @@
+[ci_rebuild_verify] repo_root: /Users/admin/music-generator-company
+[ci_rebuild_verify] python: python
+[ci_rebuild_verify] db: fixtures/ci_db.sqlite
+[ci_rebuild_verify] out_playlists: artifacts/ci/data/playlists
+[ci_rebuild_verify] out_tracks: artifacts/ci/data/tracks
+[ci_rebuild_verify] stamp: ci
+[ci_rebuild_verify] ARTIFACTS_DIR=artifacts/ci
+[ci_rebuild_verify] MGC_OUT_ROOT=
+[ci_rebuild_verify] == python ==
+Python 3.14.2
+[ci_rebuild_verify] == rebuild playlists (determinism check + write) ==
+[ci_rebuild_verify] == rebuild tracks (determinism check + write) ==
+[ci_rebuild_verify] == verify playlists (strict) ==
+[ci_rebuild_verify] == verify tracks (strict) ==
+[ci_rebuild_verify] OK
+[ci_rebuild_verify] outputs:
+  playlists: 1 files
+  tracks:    1 files

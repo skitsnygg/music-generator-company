@@ -9,18 +9,26 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     env:
-      MGC_DB: fixtures/ci_db.sqlite
+      # Route all generated outputs outside the repo checkout
+      MGC_EVIDENCE_DIR: ${{ runner.temp }}/mgc_evidence
+      MGC_ARTIFACTS_DIR: ${{ runner.temp }}/artifacts/ci
+
+      # DB path is intentionally not fixed here.
+      # It will be set after the fixture DB is built.
+      # MGC_DB: (set later)
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Prepare artifacts dir (always)
+      - name: Prepare temp dirs (always)
         run: |
           set -euxo pipefail
-          mkdir -p artifacts/ci
-          echo "placeholder" > artifacts/ci/.keep
-          ls -la artifacts/ci
+          mkdir -p "${MGC_ARTIFACTS_DIR}"
+          mkdir -p "${MGC_EVIDENCE_DIR}"
+          echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
+          ls -la "${MGC_ARTIFACTS_DIR}"
+          ls -la "${MGC_EVIDENCE_DIR}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,12 +42,27 @@ jobs:
           python -m pip install -U pip
           python -m pip install -e .
 
-      - name: Build fixture DB
+      - name: Build fixture DB (copy to temp; reset repo file)
         run: |
           set -euxo pipefail
+
+          # This script currently writes fixtures/ci_db.sqlite (in-repo).
+          # We immediately copy it into runner temp and then restore the repo copy
+          # so the working tree stays clean.
           python scripts/make_fixture_db.py
+
           ls -la fixtures
           sha256sum fixtures/ci_db.sqlite
+
+          cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
+          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "${GITHUB_ENV}"
+
+          # Restore the repo checkout to avoid accidental commits / dirty tree.
+          git checkout -- fixtures/ci_db.sqlite || true
+
+          # Sanity: show which DB CI will use going forward
+          ls -la "${RUNNER_TEMP}/ci_db.sqlite"
+          sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
 
       - name: Preflight DB (must pass)
         run: |
@@ -70,17 +93,23 @@ jobs:
       - name: Run determinism gate (run daily/publish/manifest + drop/drops)
         shell: bash
         env:
-          MGC_DB: fixtures/ci_db.sqlite
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          # Ensure anything that writes evidence uses runner temp (not repo)
+          MGC_EVIDENCE_DIR: ${{ runner.temp }}/mgc_evidence
         run: |
           set -euxo pipefail
 
           # Existing determinism checks
           bash scripts/ci_run_determinism.sh
 
-          # Drops smoke: run a deterministic drop, then verify drops CLI is wired
-          python -m mgc.main run drop --context focus --seed 1 --deterministic > /tmp/mgc_drop.json
+          # Drops smoke: run a deterministic drop, writing outputs to runner temp
+          python -m mgc.main run drop \
+            --context focus \
+            --seed 1 \
+            --deterministic \
+            --out-dir "${MGC_EVIDENCE_DIR}" \
+            > /tmp/mgc_drop.json
           python -m json.tool < /tmp/mgc_drop.json > /dev/null
 
           # IMPORTANT: --json is a GLOBAL flag, so it must come before the subcommand.
@@ -96,10 +125,18 @@ jobs:
             python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
           fi
 
+      - name: Ensure working tree is clean (no generated artifacts)
+        run: |
+          set -euo pipefail
+          git status --porcelain=v1
+          test -z "$(git status --porcelain=v1)"
+
       - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ci-artifacts
-          path: artifacts/ci
+          path: |
+            ${{ runner.temp }}/artifacts/ci
+            ${{ runner.temp }}/mgc_evidence
           if-no-files-found: ignore

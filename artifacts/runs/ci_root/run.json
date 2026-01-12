@@ -1,0 +1,36 @@
+{
+  "context": "focus",
+  "created_at": "ci_rootT00:00:00+00:00",
+  "data_dir": "data",
+  "db": "fixtures/ci_db.sqlite",
+  "evidence_dir": "artifacts/runs/ci_root",
+  "manifest": {
+    "file_count": 6,
+    "path": "artifacts/runs/ci_root/_manifest.run.json",
+    "tree_sha256": "c95b83626f964a84409ac2a0e5f3432cf5d0e08c627d79d8b50f59349bd4dc42"
+  },
+  "marketing_posts": {
+    "count": 4,
+    "platforms": [
+      "instagram_reels",
+      "tiktok",
+      "x",
+      "youtube_shorts"
+    ]
+  },
+  "playlist": {
+    "id": "0dc78d6f-7830-5540-8b5e-df4490f87099",
+    "json_path": "data/playlists/focus_radio.json",
+    "slug": "focus_radio",
+    "total_duration_sec": 1140,
+    "track_count": 19
+  },
+  "provider": "stub",
+  "stamp": "ci_root",
+  "track": {
+    "full_path": "data/tracks/20260112_aadfcdec.wav",
+    "id": "aadfcdec-1efa-4633-bd11-1ae1b1986b47",
+    "preview_path": "data/previews/20260112_aadfcdec_preview.mp3",
+    "title": "Daily Drop 2026-01-12 (Sleep)"
+  }
+}

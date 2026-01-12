@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-01-12T02:47:51.712154+00:00",
+  "parts": {
+    "receipts_tree_sha256": "1da2cab1468995442c3bb3de82961cf346af3539dc5d4cd8a068dfc7ae31305b",
+    "run_tree_sha256": "c95b83626f964a84409ac2a0e5f3432cf5d0e08c627d79d8b50f59349bd4dc42"
+  },
+  "paths": {
+    "receipts_dir": "artifacts/receipts/ci_root/marketing",
+    "receipts_manifest": "artifacts/receipts/ci_root/marketing/_manifest.receipts.json",
+    "run_dir": "artifacts/runs/ci_root",
+    "run_manifest": "artifacts/runs/ci_root/_manifest.run.json"
+  },
+  "root_tree_sha256": "bc096a3a9a8796bbf42ecf6c2fa62c4b6901b5a36664b6de38489100f39b6e9b",
+  "stamp": "ci_root",
+  "version": 1
+}

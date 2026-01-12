@@ -1,0 +1,40 @@
+{
+  "algorithm": "sha256",
+  "file_count": 6,
+  "files": [
+    {
+      "bytes": 488,
+      "path": "marketing_posts/ce8ab27a-b4fb-42b9-81ae-4657e9c32f73_instagram_reels.json",
+      "sha256": "aa56e0885b5908bdf3fdcf7ebc75bc41c0aa0c0e04e9845395db6890414dd7c7"
+    },
+    {
+      "bytes": 479,
+      "path": "marketing_posts/ce8ab27a-b4fb-42b9-81ae-4657e9c32f73_tiktok.json",
+      "sha256": "8d850d1259fb3c4e7bdbe07f974a1c7f60cb5cfa73afcb5b9485e82c9210f5cf"
+    },
+    {
+      "bytes": 479,
+      "path": "marketing_posts/ce8ab27a-b4fb-42b9-81ae-4657e9c32f73_x.json",
+      "sha256": "ce164f4ed4eeb3b5c08ce2285ccef03cc235079dcd66d9c71bab73ac1f81c60a"
+    },
+    {
+      "bytes": 487,
+      "path": "marketing_posts/ce8ab27a-b4fb-42b9-81ae-4657e9c32f73_youtube_shorts.json",
+      "sha256": "ee7e7ba80eb55c4873e0b41721de11daa102e6d265a71296c4693c2c1a79112e"
+    },
+    {
+      "bytes": 1888,
+      "path": "playlist.json",
+      "sha256": "8d6cc4a1729cfbd63516a667711d90f81056fbb1b9a8c8ad38b851607d8af3ec"
+    },
+    {
+      "bytes": 372,
+      "path": "track.json",
+      "sha256": "d4c7200ab1972abe5f3d7dcbfc466481969eb1592da8db24b8ef5bd90ef98ecf"
+    }
+  ],
+  "generated_at": "2026-01-12T02:45:53.973414+00:00",
+  "root": "/Users/admin/music-generator-company/artifacts/runs/2026-01-12",
+  "tree_sha256": "702985bfb427ed01d5d9e2bf10c3c9f0bbc03ac016401af3f79eb0b9e13c1f5a",
+  "version": 1
+}

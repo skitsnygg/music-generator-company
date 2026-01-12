@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-01-12T02:17:05.743902+00:00",
+  "parts": {
+    "receipts_tree_sha256": "b8e0b520ca290d6c7b4d9424cfabb1839c4653412903298e55f4d59dfd88cd71",
+    "run_tree_sha256": "71f08df3eb782fc71d7b745bbd2322a9306a0a78ccd11eca95892e8f700f5e1a"
+  },
+  "paths": {
+    "receipts_dir": "artifacts/receipts/DETTEST/marketing",
+    "receipts_manifest": "artifacts/receipts/DETTEST/marketing/_manifest.receipts.json",
+    "run_dir": "artifacts/runs/DETTEST",
+    "run_manifest": "artifacts/runs/DETTEST/_manifest.run.json"
+  },
+  "root_tree_sha256": "fc30e0288c08dcdee9a19a06c2bf7899742e8c26ca027cdf0d2112cbaf358083",
+  "stamp": "DETTEST",
+  "version": 1
+}
