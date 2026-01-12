@@ -2180,201 +2180,73 @@ def cmd_run_stage_list(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# run status (NEW)
+# run status
 # ---------------------------------------------------------------------------
 
-def _latest_run_id(con: sqlite3.Connection) -> Optional[str]:
-    if not db_table_exists(con, "runs"):
-        return None
-    cols = db_table_columns(con, "runs")
-    if not cols:
-        return None
-    order_col = _pick_first_existing(cols, ["updated_at", "created_at", "run_date", "run_id"])
-    if not order_col:
-        order_col = "run_id"
-    try:
-        row = con.execute(f"SELECT run_id FROM runs ORDER BY {order_col} DESC LIMIT 1").fetchone()
-        return str(row["run_id"]) if row else None
-    except Exception:
-        try:
-            row2 = con.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
-            return str(row2["run_id"]) if row2 else None
-        except Exception:
-            return None
-
-
-def _read_stages_for_run(con: sqlite3.Connection, run_id: str) -> List[Dict[str, Any]]:
-    if not db_table_exists(con, "run_stages"):
-        return []
-    try:
-        rows = con.execute(
-            "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
-            (run_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    except Exception:
-        return []
-
-
-def _summary_counts(con: sqlite3.Connection) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    for t in ("runs", "run_stages", "drops", "tracks", "marketing_posts", "events"):
-        if not db_table_exists(con, t):
-            continue
-        try:
-            out[t] = int(con.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"])
-        except Exception:
-            continue
-    return out
-
-
-def _list_runs(con: sqlite3.Connection, limit: int) -> List[Dict[str, Any]]:
-    if not db_table_exists(con, "runs"):
-        return []
-    cols = db_table_columns(con, "runs")
-    order_col = _pick_first_existing(cols, ["updated_at", "created_at", "run_date", "run_id"]) or "run_id"
-    try:
-        rows = con.execute(
-            f"SELECT * FROM runs ORDER BY {order_col} DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    except Exception:
-        try:
-            rows2 = con.execute("SELECT * FROM runs LIMIT ?", (int(limit),)).fetchall()
-            return [dict(r) for r in rows2]
-        except Exception:
-            return []
-
-
-def _latest_evidence_files(evidence_dir: Path, limit: int = 5) -> List[Dict[str, Any]]:
-    if not evidence_dir.exists() or not evidence_dir.is_dir():
-        return []
-    candidates: List[Path] = []
-    for p in evidence_dir.glob("*.json"):
-        if p.is_file():
-            candidates.append(p)
-    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
-    out: List[Dict[str, Any]] = []
-    for p in candidates[: max(0, int(limit))]:
-        try:
-            out.append(
-                {
-                    "path": str(p),
-                    "mtime": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
-                    "size": int(p.stat().st_size),
-                }
-            )
-        except Exception:
-            out.append({"path": str(p)})
-    return out
-
-
-def cmd_run_status(args: argparse.Namespace) -> int:
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
-    evidence_dir = Path(os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
-    con = db_connect(db_path)
-
-    # Don't force-create tables for status; just be tolerant.
-    run_id = str(args.run_id).strip() if getattr(args, "run_id", None) else ""
-    if not run_id:
-        run_id = _latest_run_id(con) or ""
-
-    fail_on_error = bool(getattr(args, "fail_on_error", False))
-
-    counts = _summary_counts(con)
-    runs = _list_runs(con, limit=int(args.limit))
-    stages = _read_stages_for_run(con, run_id) if run_id else []
-    evidence_files = _latest_evidence_files(evidence_dir, limit=5)
-
-    payload: Dict[str, Any] = {
-        "ok": True,
-        "db": db_path,
-        "run_id": run_id or None,
-        "deterministic_env": {
-            "MGC_DETERMINISTIC": os.environ.get("MGC_DETERMINISTIC"),
-            "DETERMINISTIC": os.environ.get("DETERMINISTIC"),
-            "MGC_FIXED_TIME": os.environ.get("MGC_FIXED_TIME"),
-            "MGC_CONTEXT": os.environ.get("MGC_CONTEXT"),
-            "MGC_SEED": os.environ.get("MGC_SEED"),
-            "MGC_PROVIDER_SET_VERSION": os.environ.get("MGC_PROVIDER_SET_VERSION"),
-            "MGC_EVIDENCE_DIR": os.environ.get("MGC_EVIDENCE_DIR"),
-        },
-        "counts": counts,
-        "runs": runs,
-        "stages": stages,
-        "evidence_dir": str(evidence_dir),
-        "recent_evidence_files": evidence_files,
-    }
-
-    if args.json:
-        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
-        return 0
-
-    print(f"DB: {db_path}")
-    print(f"Run: {run_id or '(none)'}")
-    if counts:
-        print("Counts:")
-        for k in sorted(counts.keys()):
-            print(f"  {k}: {counts[k]}")
-    if stages:
-        print("Stages:")
-        for s in stages:
-            stage = str(s.get("stage") or "")
-            status = str(s.get("status") or "")
-            started = str(s.get("started_at") or "")
-            ended = str(s.get("ended_at") or "")
-            print(f"  {stage:18s} {status:10s} {started} {ended}".rstrip())
-    if evidence_files:
-        print(f"Recent evidence files in {evidence_dir}:")
-        for e in evidence_files:
-            print(f"  {e.get('mtime','')}  {e.get('size','')}  {e.get('path','')}".rstrip())
-    return 0
-
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    row = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-        (table,),
-    ).fetchone()
-    return row is not None
+    try:
+        row = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
 
 
 def _run_id_latest(con: sqlite3.Connection) -> Optional[str]:
-    # Prefer newest by updated_at/created_at if present; else by rowid.
     if not _table_exists(con, "runs"):
         return None
     cols = set(db_table_columns(con, "runs"))
-    if "updated_at" in cols:
-        row = con.execute("SELECT run_id FROM runs ORDER BY updated_at DESC LIMIT 1").fetchone()
-    elif "created_at" in cols:
-        row = con.execute("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    try:
+        if "updated_at" in cols:
+            row = con.execute("SELECT run_id FROM runs ORDER BY updated_at DESC LIMIT 1").fetchone()
+        elif "created_at" in cols:
+            row = con.execute("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+        elif "run_date" in cols:
+            row = con.execute("SELECT run_id FROM runs ORDER BY run_date DESC LIMIT 1").fetchone()
+        else:
+            row = con.execute("SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _drop_latest_for_run(con: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
+    # You already have this function earlier in the file; keep it.
+    # This stub is here ONLY if someone deletes it by accident.
+    cols = db_table_columns(con, "drops")
+    if not cols:
+        return None
+
+    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on", "occurred_at"])
+    id_col = _pick_first_existing(cols, ["id", "drop_id"]) or "id"
+    if ts_col:
+        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {ts_col} DESC, {id_col} DESC LIMIT 1"
     else:
-        row = con.execute("SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()
-    return str(row[0]) if row and row[0] else None
+        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {id_col} DESC LIMIT 1"
+    return con.execute(sql, (run_id,)).fetchone()
 
 
 def cmd_run_status(args: argparse.Namespace) -> int:
     """
-    Prints ONE JSON object to stdout describing:
-      - latest run_id (or requested run_id)
-      - run_key fields if available
-      - stage statuses (run_stages rows)
-      - most recent drop pointers for that run_id (if drops table exists)
+    Output rules:
+      - If global --json is set, emit exactly ONE JSON object.
+      - Otherwise emit a short human summary (single line).
     """
+    want_json = bool(getattr(args, "json", False))
+
     db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
     con = db_connect(db_path)
-    ensure_tables_minimal(con)
 
+    # Do not force-create tables in status; be tolerant.
     run_id = (getattr(args, "run_id", None) or "").strip()
     latest = bool(getattr(args, "latest", False))
-
     fail_on_error = bool(getattr(args, "fail_on_error", False))
 
     if not run_id and latest:
         run_id = _run_id_latest(con) or ""
-
     if not run_id:
-        # default: latest
         run_id = _run_id_latest(con) or ""
 
     out: Dict[str, Any] = {
@@ -2384,66 +2256,65 @@ def cmd_run_status(args: argparse.Namespace) -> int:
         "run": None,
         "stages": {"count": 0, "items": []},
         "drop": None,
+        "summary": {"counts": {}, "healthy": None},
     }
 
-    if not run_id:
-        sys.stdout.write(stable_json_dumps(out) + "\n")
-        return 1
-
-    # run row
-    if _table_exists(con, "runs"):
-        cols = set(db_table_columns(con, "runs"))
-        if "run_id" in cols:
+    if run_id and _table_exists(con, "runs"):
+        try:
             row = con.execute("SELECT * FROM runs WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
             if row is not None:
                 out["found"] = True
                 out["run"] = dict(row)
+        except Exception:
+            pass
 
     # stages
-    if _table_exists(con, "run_stages"):
-        rows = con.execute(
-            "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
-            (run_id,),
-        ).fetchall()
-        out["stages"] = {"count": len(rows), "items": [dict(r) for r in rows]}
+    stage_items: List[Dict[str, Any]] = []
+    if run_id and _table_exists(con, "run_stages"):
+        try:
+            rows = con.execute(
+                "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            ).fetchall()
+            stage_items = [dict(r) for r in rows]
+        except Exception:
+            stage_items = []
 
-    # Summary/health
+    out["stages"] = {"count": len(stage_items), "items": stage_items}
+
     counts: Dict[str, int] = {}
-    for it in out["stages"].get("items", []):
-        st = str(it.get("status") or "").lower()
-        if not st:
-            st = "unknown"
+    for it in stage_items:
+        st = str(it.get("status") or "").strip().lower() or "unknown"
         counts[st] = counts.get(st, 0) + 1
 
     healthy = (counts.get("error", 0) == 0)
-    out["summary"] = {
-        "counts": dict(sorted(counts.items())),
-        "healthy": healthy,
-    }
+    out["summary"] = {"counts": dict(sorted(counts.items())), "healthy": healthy}
 
-    # CI mode: fail if any stage is error
-    if fail_on_error:
-        any_error = False
-        for it in out["stages"].get("items", []):
-            try:
-                st = str(it.get("status") or "").lower()
-            except Exception:
-                st = ""
-            if st == "error":
-                any_error = True
-                break
-        if any_error:
+    # drop pointer
+    if run_id and _table_exists(con, "drops"):
+        try:
+            drow = _drop_latest_for_run(con, run_id)
+            if drow is not None:
+                out["drop"] = dict(drow)
+        except Exception:
+            pass
+
+    # CI fail mode
+    if fail_on_error and counts.get("error", 0) > 0:
+        if want_json:
             sys.stdout.write(stable_json_dumps(out) + "\n")
-            return 2
+        else:
+            print(f"run_id={run_id} status=ERROR stages_error={counts.get('error', 0)}")
+        return 2
 
-    # latest drop for this run_id
-    if _table_exists(con, "drops"):
-        drop_row = _drop_latest_for_run(con, run_id)
-        if drop_row is not None:
-            out["drop"] = dict(drop_row)
+    if want_json:
+        sys.stdout.write(stable_json_dumps(out) + "\n")
+        return 0 if out["found"] else 1
 
-    sys.stdout.write(stable_json_dumps(out) + "\n")
-    return 0 if out["found"] else 1
+    # human single line
+    rid = run_id or "(none)"
+    err = counts.get("error", 0)
+    ok = counts.get("ok", 0)
 
 def cmd_run_open(args: argparse.Namespace) -> int:
     evidence_dir = Path(
@@ -2708,130 +2579,132 @@ def _resolve_since_ok_manifest_path(evidence_dir: Path) -> Optional[Path]:
 
 def cmd_run_diff(args: argparse.Namespace) -> int:
     """
-    Diff two manifests from the evidence dir.
+    Diff manifests in the evidence dir.
 
-    Rules:
-      - If JSON mode is enabled (global or subcommand), emit EXACTLY one JSON object to stdout.
-      - In JSON mode, never print human summary to stdout (use stderr if needed).
-      - In non-JSON mode, print a single human summary line to stdout.
-      - --fail-on-changes returns exit code 2 if there are changes (respecting --allow).
+    Output rules:
+      - If global --json is set (mgc.main --json ...), emit exactly ONE JSON object.
+      - Otherwise print a human summary line:
+            +A  -R  ~M  (older=... newer=...)
+      - --summary-only: counts only (still JSON if --json is set)
+      - --fail-on-changes: exit 2 if there are any non-allowed changes
+      - --allow PATH (repeatable): allow specific changed paths when failing on changes
+      - --since PATH: compare newest against PATH (PATH is "older")
+      - --since-ok: auto-pick an older manifest from the most recent run with no stage errors
     """
-    # Treat JSON mode as "flag appears anywhere", because mgc.main has a global --json
-    # and run diff may also define a subcommand --json. This makes it bulletproof.
-    want_json = ("--json" in sys.argv) or bool(getattr(args, "json", False))
+    # NOTE: --json is a GLOBAL flag on mgc.main. We read args.json here.
+    want_json = bool(getattr(args, "json", False))
 
     evidence_dir = Path(
         getattr(args, "out_dir", None)
         or getattr(args, "evidence_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR", "data/evidence")
-        or "data/evidence"
     ).resolve()
 
-    type_filter = str(getattr(args, "type", None) or "any")
+    type_filter = str(getattr(args, "type", "any") or "any").strip().lower()
     fail_on_changes = bool(getattr(args, "fail_on_changes", False))
+    summary_only = bool(getattr(args, "summary_only", False))
     since = getattr(args, "since", None)
     since_ok = bool(getattr(args, "since_ok", False))
-    summary_only = bool(getattr(args, "summary_only", False))
+
     allow_list = getattr(args, "allow", None) or []
-    allow_set = {str(x) for x in allow_list if str(x).strip()}
+    allow_set = {str(a).replace("\\", "/") for a in allow_list if str(a).strip()}
 
-    # Find newest-first
-    files = _find_manifest_files(evidence_dir, type_filter=type_filter)
+    files = _find_manifest_files(evidence_dir, type_filter=type_filter)  # newest-first
 
-    # Pick (older=a, newer=b)
-    since_path: Optional[Path] = Path(since).resolve() if since else None
-    if since_ok and not since_path:
-        since_path = _resolve_since_ok_manifest_path(evidence_dir)
+    # Choose (older=a_path, newer=b_path)
+    since_path: Optional[Path] = None
+    if since:
+        since_path = Path(str(since)).expanduser().resolve()
+        if not since_path.exists():
+            out = {"found": False, "reason": "since_not_found", "since": str(since_path)}
+            sys.stdout.write(stable_json_dumps(out) + "\n")
+            return 0
 
-    if since_path:
         if not files:
             out = {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
-            if want_json:
-                sys.stdout.write(stable_json_dumps(out) + "\n")
-            else:
-                sys.stdout.write(f"no manifests found in {evidence_dir}\n")
+            sys.stdout.write(stable_json_dumps(out) + "\n")
             return 0
-        a_path, b_path = since_path, files[0]  # older=since, newer=latest
+
+        a_path, b_path = since_path, files[0]
+    elif since_ok:
+        since_path = _resolve_since_ok_manifest_path(evidence_dir)
+        if since_path is None:
+            out = {"found": False, "reason": "since_ok_not_found", "path": str(evidence_dir)}
+            sys.stdout.write(stable_json_dumps(out) + "\n")
+            return 0
+
+        if not files:
+            out = {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
+            sys.stdout.write(stable_json_dumps(out) + "\n")
+            return 0
+
+        a_path, b_path = since_path, files[0]
     else:
         if len(files) < 2:
             out = {"found": False, "reason": "need_at_least_two_manifests", "count": len(files), "path": str(evidence_dir)}
-            if want_json:
-                sys.stdout.write(stable_json_dumps(out) + "\n")
-            else:
-                sys.stdout.write("need at least two manifests\n")
+            sys.stdout.write(stable_json_dumps(out) + "\n")
             return 0
-        a_path, b_path = files[1], files[0]  # older, newer
+        a_path, b_path = files[1], files[0]
 
     a = _load_manifest(a_path)
     b = _load_manifest(b_path)
     diff = _diff_manifests(a, b)
 
-    # Expected diff shape:
-    # diff["added"] = [path...]
-    # diff["removed"] = [path...]
-    # diff["modified"] = [path...]
-    added = [str(p) for p in diff.get("added", [])]
-    removed = [str(p) for p in diff.get("removed", [])]
-    modified = [str(p) for p in diff.get("modified", [])]
+    added = diff.get("added", []) or []
+    removed = diff.get("removed", []) or []
+    modified = diff.get("modified", []) or []
 
-    # Apply allow filter ONLY for failing logic (still report full diff)
-    def _not_allowed(p: str) -> bool:
-        return (p not in allow_set)
+    # Count non-allowed modified paths (allow only applies to "modified" paths)
+    # If you want allow to cover added/removed too, we can broaden it later.
+    modified_paths = [str(x.get("path") or "") for x in modified if isinstance(x, dict)]
+    non_allowed_modified = [p for p in modified_paths if p and p not in allow_set]
 
-    added_na = [p for p in added if _not_allowed(p)]
-    removed_na = [p for p in removed if _not_allowed(p)]
-    modified_na = [p for p in modified if _not_allowed(p)]
-
-    changed_total = len(added) + len(removed) + len(modified)
-    changed_not_allowed = len(added_na) + len(removed_na) + len(modified_na)
-
-    summary_str = f"+{len(added)}  -{len(removed)}  ~{len(modified)}  (older={a_path.name} newer={b_path.name})"
-
-    out_obj = {
-        "found": True,
-        "evidence_dir": str(evidence_dir),
-        "older": str(a_path),
-        "newer": str(b_path),
-        "summary": {"added": len(added), "removed": len(removed), "modified": len(modified)},
-        "changed_total": changed_total,
-        "allow": sorted(allow_set),
-        "not_allowed_summary": {"added": len(added_na), "removed": len(removed_na), "modified": len(modified_na)},
-        "items": {"added": added, "removed": removed, "modified": modified},
-        "not_allowed_items": {"added": added_na, "removed": removed_na, "modified": modified_na},
+    summary = {
+        "added": len(added),
+        "removed": len(removed),
+        "modified": len(modified),
     }
 
-    # Output
-    if want_json:
-        # STRICT: exactly one JSON object to stdout
-        if summary_only:
-            # still JSON, but keep it compact
-            compact = {
-                "found": True,
-                "older": str(a_path),
-                "newer": str(b_path),
-                "summary": out_obj["summary"],
-                "not_allowed_summary": out_obj["not_allowed_summary"],
-                "allow": out_obj["allow"],
-            }
-            sys.stdout.write(stable_json_dumps(compact) + "\n")
-        else:
-            sys.stdout.write(stable_json_dumps(out_obj) + "\n")
-    else:
-        # human
-        sys.stdout.write(summary_str + "\n")
-        if not summary_only and changed_total:
-            # print details in human mode
-            for p in added:
-                sys.stdout.write(f"+ {p}\n")
-            for p in removed:
-                sys.stdout.write(f"- {p}\n")
-            for p in modified:
-                sys.stdout.write(f"~ {p}\n")
+    # Decide failure based on "changes", optionally filtered by allow-list
+    has_any_changes = (summary["added"] + summary["removed"] + summary["modified"]) > 0
+    has_blocking_changes = (summary["added"] + summary["removed"] + len(non_allowed_modified)) > 0
 
-    # Exit code policy
-    if fail_on_changes and changed_not_allowed > 0:
-        return 2
-    return 0
+    exit_code = 0
+    if fail_on_changes and has_any_changes:
+        exit_code = 2 if has_blocking_changes else 0
+
+    older_name = a_path.name
+    newer_name = b_path.name
+
+    if want_json:
+        out = {
+            "found": True,
+            "older": str(a_path),
+            "newer": str(b_path),
+            "older_name": older_name,
+            "newer_name": newer_name,
+            "type_filter": type_filter,
+            "since": str(since_path) if since_path else None,
+            "since_ok": since_ok,
+            "fail_on_changes": fail_on_changes,
+            "allow": sorted(allow_set) if allow_set else [],
+            "summary": summary,
+        }
+        if not summary_only:
+            out["diff"] = diff
+
+        # Helpful diagnostics for CI allow-list behavior
+        if allow_set:
+            out["non_allowed_modified_paths"] = non_allowed_modified
+
+        out["exit_code"] = exit_code
+        sys.stdout.write(stable_json_dumps(out) + "\n")
+        return exit_code
+
+    # Human output mode
+    line = f"+{summary['added']}  -{summary['removed']}  ~{summary['modified']}  (older={older_name} newer={newer_name})"
+    print(line)
+    return exit_code
 
 def _stage_status_okish(s: Any) -> bool:
     v = str(s or "").strip().lower()
@@ -2933,35 +2806,43 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     run_p.set_defaults(_mgc_group="run")
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
 
-    tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
-    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
-    tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
-    tail.add_argument("--json", action="store_true", help="JSON output (default)")
-    tail.set_defaults(func=cmd_run_tail)
-
     open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
-    open_p.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    open_p.add_argument("--out-dir", default=None,
+                        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
     open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
     open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
     open_p.set_defaults(func=cmd_run_open)
 
+    tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
+    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
+    tail.set_defaults(func=cmd_run_tail)
+
     diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
     diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
     diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
-    diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any changes are detected (CI)")
-    diff.add_argument("--json", action="store_true", help="JSON output (default)")
     diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
-    diff.add_argument("--since-ok", action="store_true", help="Auto-pick an older manifest from the most recent run with no stage errors")
-    diff.add_argument("--summary-only", action="store_true", help="Only output counts (+ added / - removed / ~ modified). Still JSON if --json is set.",)
-    diff.add_argument("--evidence-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence directory")
+    diff.add_argument("--since-ok", action="store_true",
+                      help="Auto-pick an older manifest from the most recent run with no stage errors")
+    diff.add_argument("--summary-only", action="store_true",
+                      help="Only output counts in JSON mode (still one-line summary in human mode)")
+    diff.add_argument("--fail-on-changes", action="store_true",
+                      help="Exit 2 if any non-allowed changes are detected (CI)")
     diff.add_argument(
         "--allow",
         action="append",
-        default=None,
-        help="Allow specific changed manifest paths (repeatable). When set with --fail-on-changes, only non-allowed changes fail.",
+        default=[],
+        help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.",
     )
     diff.set_defaults(func=cmd_run_diff)
+
+    status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
+    status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
+    status.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
+    status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
+    status.set_defaults(func=cmd_run_status)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
@@ -3007,14 +2888,6 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     weekly.set_defaults(func=cmd_run_weekly)
-
-    status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
-    status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
-    status.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
-    status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
-    status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
-    status.add_argument("--json", action="store_true", help="(ignored) kept for CLI compatibility; output is always JSON")
-    status.set_defaults(func=cmd_run_status)
 
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")

@@ -69,6 +69,7 @@ run_gate() {
 
   info "py_compile"
   "$PYTHON" -m py_compile src/mgc/main.py
+  "$PYTHON" -m py_compile src/mgc/run_cli.py
 
   info "rebuild + verify"
   MGC_DB="$DB" ARTIFACTS_DIR="$ARTIFACTS_DIR" PYTHON="$PYTHON" MGC_OUT_ROOT="${MGC_OUT_ROOT:-}" \
@@ -77,6 +78,11 @@ run_gate() {
   info "publish receipts determinism"
   MGC_DB="$DB" PYTHON="$PYTHON" ARTIFACTS_DIR="$ARTIFACTS_DIR" \
     bash scripts/ci_publish_determinism.sh "ci_publish"
+
+  info "manifest diff gate (since-ok)"
+  # Fail CI if there are any file changes between the latest manifest and the
+  # most recent "ok" manifest (or emit found:false if none eligible).
+  MGC_DB="$DB" "$PYTHON" -m mgc.main run diff --since-ok --fail-on-changes --json | "$PYTHON" -m json.tool
 
   info "OK"
 }
