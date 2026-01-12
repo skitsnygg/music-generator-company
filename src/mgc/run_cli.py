@@ -13,6 +13,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import contextlib
+import io
+
+@contextlib.contextmanager
+def _silence_stdout(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    old = sys.stdout
+    try:
+        sys.stdout = io.StringIO()
+        yield
+    finally:
+        sys.stdout = old
+
 
 # ---------------------------------------------------------------------------
 # Determinism utilities
@@ -474,6 +489,12 @@ def db_insert_event(con: sqlite3.Connection, *, event_id: str, ts: str, kind: st
         },
     )
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def db_insert_track(
     con: sqlite3.Connection,
@@ -1036,6 +1057,130 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     sys.stdout.write(stable_json_dumps(evidence) + "\n")
     return 0
 
+def cmd_run_drop(args: argparse.Namespace) -> int:
+    """
+    Product-level command: daily + publish-marketing + manifest + consolidated evidence.
+
+    Guarantees:
+      - stdout emits exactly ONE JSON object (so `json.tool` works)
+      - deterministic under --deterministic / MGC_DETERMINISTIC=1 (and MGC_FIXED_TIME)
+      - persists evidence/manifest pointers into drops.meta_json
+    """
+    deterministic = is_deterministic(args)
+
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
+    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    limit = int(getattr(args, "limit", None) or 50)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    ts = deterministic_now_iso(deterministic)
+    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Silence subcommand stdout so run drop outputs exactly one JSON object.
+    with _silence_stdout(True):
+        daily_ns = argparse.Namespace(
+            db=db_path,
+            context=context,
+            seed=seed,
+            out_dir=str(out_dir),
+            deterministic=deterministic,
+            json=False,
+        )
+        cmd_run_daily(daily_ns)
+
+    with _silence_stdout(True):
+        pub_ns = argparse.Namespace(
+            db=db_path,
+            limit=limit,
+            dry_run=dry_run,
+            deterministic=deterministic,
+            json=False,
+        )
+        cmd_publish_marketing(pub_ns)
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    drop_row = con.execute(
+        "SELECT * FROM drops WHERE context = ? AND seed = ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (context, seed),
+    ).fetchone()
+    drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
+
+    drop_id = str(drop_obj.get("id") or "")
+    out_path = out_dir / ("drop_evidence.json" if deterministic else f"drop_evidence_{drop_id}.json")
+    manifest_path = out_dir / ("manifest.json" if deterministic else f"manifest_{drop_id}.json")
+
+    # Run manifest via existing cmd_run_manifest (silenced)
+    with _silence_stdout(True):
+        manifest_ns = argparse.Namespace(
+            repo_root=str(getattr(args, "repo_root", None) or "."),
+            out=str(manifest_path),
+            print_hash=False,
+
+            # cmd_run_manifest expects these
+            include=getattr(args, "include", None),
+            exclude=getattr(args, "exclude", None),
+
+            # safe defaults in case cmd_run_manifest reads them
+            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
+            max_file_bytes=getattr(args, "max_file_bytes", None),
+
+            # keep signature-compatible if it reads these
+            deterministic=deterministic,
+            db=db_path,
+            json=False,
+        )
+        cmd_run_manifest(manifest_ns)
+
+    manifest_sha256 = _sha256_file(manifest_path)
+
+    evidence: Dict[str, Any] = {
+        "ts": ts,
+        "deterministic": deterministic,
+        "context": context,
+        "seed": seed,
+        "drop": {
+            "id": drop_obj.get("id"),
+            "run_id": drop_obj.get("run_id"),
+            "track_id": drop_obj.get("track_id"),
+            "marketing_batch_id": drop_obj.get("marketing_batch_id"),
+            "published_ts": drop_obj.get("published_ts"),
+        },
+        "paths": {
+            "evidence_path": str(out_path),
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": manifest_sha256,
+        },
+    }
+
+    # Write consolidated evidence (stable newlines)
+    out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
+
+    # Persist pointers in drops.meta_json
+    if drop_id:
+        existing_meta: Dict[str, Any] = {}
+        meta_raw = drop_obj.get("meta_json")
+        if isinstance(meta_raw, str) and meta_raw.strip():
+            try:
+                existing_meta = json.loads(meta_raw)
+            except Exception:
+                existing_meta = {}
+
+        existing_meta.update(evidence["paths"])
+
+        con.execute(
+            "UPDATE drops SET meta_json = ? WHERE id = ?",
+            (stable_json_dumps(existing_meta), drop_id),
+        )
+        con.commit()
+
+    # Emit exactly one JSON object
+    sys.stdout.write(stable_json_dumps(evidence) + "\n")
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # Marketing publish (deterministic) -- skips empty drafts, updates drops
@@ -1044,9 +1189,9 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
 
-    db_path = args.db or os.environ.get("MGC_DB") or "data/db.sqlite"
-    limit = int(args.limit or 50)
-    dry_run = bool(args.dry_run)
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    limit = int(getattr(args, "limit", None) or 50)
+    dry_run = bool(getattr(args, "dry_run", False))
 
     ts = deterministic_now_iso(deterministic)
 
@@ -1072,7 +1217,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         run_id = str(meta.get("run_id") or "")
         drop_id = str(meta.get("drop_id") or "")
 
-        publish_id = stable_uuid5("publish", post_id, platform, ts if not deterministic else "fixed")
+        publish_id = stable_uuid5("publish", post_id, platform, (ts if not deterministic else "fixed"))
 
         if not dry_run:
             db_marketing_post_set_status(
@@ -1103,15 +1248,14 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
     batch_id = stable_uuid5(
         "marketing_publish_batch",
-        ts if not deterministic else "fixed",
+        (ts if not deterministic else "fixed"),
         str(limit),
-        "dry" if dry_run else "live",
+        ("dry" if dry_run else "live"),
         str(len(skipped_ids)),
         str(len(published)),
-        "|".join(run_ids_touched) if deterministic else "nondet",
+        ("|".join(run_ids_touched) if deterministic else "nondet"),
     )
 
-    # Update drops for any run_ids we actually published
     drops_updated: Dict[str, int] = {}
     if run_ids_touched and not dry_run:
         for rid in run_ids_touched:
@@ -1151,7 +1295,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
 
-
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -1175,6 +1318,16 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
     pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
     pub.set_defaults(func=cmd_publish_marketing)
+
+    drop = run_sub.add_parser("drop", help="Run daily + publish-marketing and emit consolidated drop evidence")
+    drop.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
+    drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
+    drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
+    drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    drop.set_defaults(func=cmd_run_drop)
 
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")

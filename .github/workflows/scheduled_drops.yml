@@ -21,22 +21,60 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euxo pipefail
           python -m pip install -U pip
-          pip install -e .
+          python -m pip install -e .
 
-      - name: Run daily drop pipeline
+      - name: Force non-deterministic mode for scheduled drops
+        shell: bash
+        run: |
+          echo "MGC_DETERMINISTIC=" >> $GITHUB_ENV
+          echo "MGC_FIXED_TIME=" >> $GITHUB_ENV
+
+      - name: Prepare DB for scheduled run
+        shell: bash
         run: |
           set -euxo pipefail
-          # Stamp by UTC date (matches your default)
-          python -m mgc.main run daily --db "$MGC_DB" --context focus --json
+          mkdir -p data
+          cp -f fixtures/ci_db.sqlite data/db.sqlite
+          ls -la data
+          ls -la fixtures | head -n 50
+
+      - name: Prepare evidence/artifacts dirs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p data/evidence artifacts/runs
+          echo "placeholder" > artifacts/runs/.keep
+          ls -la data/evidence || true
+          ls -la artifacts/runs
+
+      - name: Run drop (daily + publish)
+        shell: bash
+        env:
+          MGC_DB: data/db.sqlite
+        run: |
+          set -euxo pipefail
+          python -m mgc.main run drop --context focus --seed 1 --limit 50 > artifacts/runs/drop.json
+      
+
+      - name: Manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m mgc.main run manifest --repo-root . --out artifacts/runs/manifest.json --print-hash
 
       - name: Upload evidence bundle
         uses: actions/upload-artifact@v4
         with:
-          name: mgc-run-evidence
-          path: artifacts/runs
-          if-no-files-found: error
+          name: scheduled-drop-artifacts
+          path: |
+            artifacts/runs/**
+            data/evidence/**
+            data/db.sqlite
+          if-no-files-found: warn

@@ -39,14 +39,7 @@ jobs:
           set -euxo pipefail
           python scripts/make_fixture_db.py
           ls -la fixtures
-
-      - name: Build fixture DB
-        run: |
-          set -euxo pipefail
-          python scripts/make_fixture_db.py
-          ls -la fixtures
           sha256sum fixtures/ci_db.sqlite
-
 
       - name: Preflight DB (must pass)
         run: |
@@ -74,6 +67,33 @@ jobs:
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
+      - name: Run determinism gate (run daily/publish/manifest + drop/drops)
+        shell: bash
+        env:
+          MGC_DB: fixtures/ci_db.sqlite
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+        run: |
+          set -euxo pipefail
+
+          # Existing determinism checks
+          bash scripts/ci_run_determinism.sh
+
+          # Drops smoke: run a deterministic drop, then verify drops CLI is wired
+          python -m mgc.main run drop --context focus --seed 1 > /tmp/mgc_drop.json
+          python -m json.tool < /tmp/mgc_drop.json > /dev/null
+
+          python -m mgc.main drops list --limit 1 --json > /tmp/mgc_drops_list.json
+          python -m json.tool < /tmp/mgc_drops_list.json > /dev/null
+
+          # If jq is available, this is a stronger check, but keep it optional.
+          if command -v jq >/dev/null 2>&1; then
+            DROP_ID="$(jq -r '.drop.id' /tmp/mgc_drop.json)"
+            test -n "$DROP_ID" && test "$DROP_ID" != "null"
+            python -m mgc.main drops show "$DROP_ID" --format json > /tmp/mgc_drops_show.json
+            python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
+          fi
+
       - name: Upload artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -81,12 +101,3 @@ jobs:
           name: ci-artifacts
           path: artifacts/ci
           if-no-files-found: ignore
-
-      - name: Run determinism gate (run daily/publish/manifest)
-        shell: bash
-        env:
-          MGC_DB: fixtures/ci_db.sqlite
-          MGC_DETERMINISTIC: "1"
-          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-        run: |
-          bash scripts/ci_run_determinism.sh

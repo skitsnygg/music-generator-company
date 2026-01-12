@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# CI gate: compile + deterministic checks
+# CI gate: compile + rebuild/verify + determinism checks
 #
 # Env:
 #   MGC_DB         DB path (default: data/db.sqlite)
@@ -13,7 +13,6 @@ set -euo pipefail
 #
 # Files written:
 #   $ARTIFACTS_DIR/ci_gate.log
-#   $ARTIFACTS_DIR/ci_rebuild_verify.log
 #   (plus rebuild outputs under chosen output root)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,35 +25,45 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
 mkdir -p "$ARTIFACTS_DIR"
 
 log_file="$ARTIFACTS_DIR/ci_gate.log"
-: > "$log_file"
+: >"$log_file"
 
-run() {
-  echo "[ci_gate] Repo: $repo_root"
-  echo "[ci_gate] MGC_DB=$DB"
-  echo "[ci_gate] ARTIFACTS_DIR=$ARTIFACTS_DIR"
-  echo "[ci_gate] MGC_OUT_ROOT=${MGC_OUT_ROOT:-}"
-  echo "[ci_gate] git_sha: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
-  echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-  echo "[ci_gate] python: $("$PYTHON" -V 2>&1)"
+info() { echo "[ci_gate] $*"; }
+err() { echo "[ci_gate] ERROR: $*" >&2; }
+
+run_gate() {
+  info "Repo: $repo_root"
+  info "MGC_DB=$DB"
+  info "ARTIFACTS_DIR=$ARTIFACTS_DIR"
+  info "MGC_OUT_ROOT=${MGC_OUT_ROOT:-}"
+  info "git_sha: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  info "git_branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  info "python: $("$PYTHON" -V 2>&1)"
 
   if [[ ! -f "$DB" ]]; then
-    echo "[ci_gate] ERROR: DB not found: $DB" >&2
+    err "DB not found: $DB"
     return 2
   fi
-  echo "[ci_gate] DB OK."
+  info "DB OK."
 
-  echo "[ci_gate] py_compile"
+info "drops smoke test"
+MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
+  "$PYTHON" -m mgc.main run drop --context focus --seed 1 >/dev/null
+
+MGC_DB="$DB" "$PYTHON" -m mgc.main drops list --limit 1 --json >/dev/null
+
+
+  info "py_compile"
   "$PYTHON" -m py_compile src/mgc/main.py
 
-  echo "[ci_gate] rebuild + verify"
+  info "rebuild + verify"
   MGC_DB="$DB" ARTIFACTS_DIR="$ARTIFACTS_DIR" PYTHON="$PYTHON" MGC_OUT_ROOT="${MGC_OUT_ROOT:-}" \
     bash scripts/ci_rebuild_verify.sh
 
-  echo "[ci_gate] publish receipts determinism"
+  info "publish receipts determinism"
   MGC_DB="$DB" PYTHON="$PYTHON" ARTIFACTS_DIR="$ARTIFACTS_DIR" \
     bash scripts/ci_publish_determinism.sh "ci_publish"
 
-  echo "[ci_gate] OK"
+  info "OK"
 }
 
-run 2>&1 | tee -a "$log_file"
+run_gate 2>&1 | tee -a "$log_file"
