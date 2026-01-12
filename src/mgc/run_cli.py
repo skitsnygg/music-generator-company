@@ -153,6 +153,7 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
             or row_data.get("track_id")
             or row_data.get("post_id")
             or row_data.get("event_id")
+            or row_data.get("drop_id")
             or ""
         )
         + f"|{col.name}"
@@ -180,6 +181,8 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
         return str(row_data.get("platform") or "unknown")
     if name in ("title", "name"):
         return str(row_data.get("title") or row_data.get("name") or "Untitled")
+    if name in ("context", "mood"):
+        return str(row_data.get("context") or row_data.get("mood") or "focus")
 
     if name in ("meta_json", "metadata_json", "meta", "metadata"):
         return stable_json_dumps(row_data.get("meta") or {})
@@ -274,6 +277,22 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
             mood TEXT,
             genre TEXT,
             artifact_path TEXT,
+            meta_json TEXT NOT NULL
+        )
+        """
+    )
+    # Drops: a first-class "release" tying daily run + track + marketing publish batch
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS drops (
+            id TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            context TEXT NOT NULL,
+            seed TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            track_id TEXT,
+            marketing_batch_id TEXT,
+            published_ts TEXT,
             meta_json TEXT NOT NULL
         )
         """
@@ -398,6 +417,44 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
     return ""
 
 
+def _marketing_row_meta(con: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, Any]:
+    """
+    Best-effort extraction of metadata for a marketing row across arbitrary schemas.
+    """
+    cols = row.keys()
+
+    # Prefer explicit meta-ish column if it exists
+    meta_col = _detect_marketing_meta_col(cols)
+    if meta_col:
+        meta = _load_json_maybe(row[meta_col])
+        if meta:
+            return meta
+
+    # Otherwise, attempt to parse the payload blob and see if it's a dict
+    best_payload = _best_text_payload_column(
+        con,
+        "marketing_posts",
+        reserved=[
+            "id", "post_id", "ts", "created_at",
+            "platform", "channel", "destination",
+            "status", "state",
+        ],
+    )
+    if best_payload and best_payload in set(cols):
+        v = row[best_payload]
+        meta = _load_json_maybe(v)
+        if meta:
+            return meta
+
+    # Finally, try to parse the content string itself if it looks like JSON
+    content = _marketing_row_content(con, row)
+    meta = _load_json_maybe(content)
+    if meta:
+        return meta
+
+    return {}
+
+
 def db_insert_event(con: sqlite3.Connection, *, event_id: str, ts: str, kind: str, actor: str, meta: Dict[str, Any]) -> None:
     _insert_row(
         con,
@@ -461,6 +518,93 @@ def db_insert_track(
     _insert_row(con, "tracks", data)
 
 
+def db_insert_drop(
+    con: sqlite3.Connection,
+    *,
+    drop_id: str,
+    ts: str,
+    context: str,
+    seed: str,
+    run_id: str,
+    track_id: Optional[str],
+    meta: Dict[str, Any],
+) -> None:
+    cols = db_table_columns(con, "drops")
+    if not cols:
+        raise sqlite3.OperationalError("table drops does not exist")
+
+    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
+    ctx_col = _pick_first_existing(cols, ["context", "mood"])
+    seed_col = _pick_first_existing(cols, ["seed"])
+    run_col = _pick_first_existing(cols, ["run_id"])
+    track_col = _pick_first_existing(cols, ["track_id"])
+    meta_col = _pick_first_existing(cols, ["meta_json", "metadata_json", "meta", "metadata"])
+
+    data: Dict[str, Any] = {"id": drop_id, "drop_id": drop_id}
+    if ts_col:
+        data[ts_col] = ts
+    if ctx_col:
+        data[ctx_col] = context
+    if seed_col:
+        data[seed_col] = seed
+    if run_col:
+        data[run_col] = run_id
+    if track_col and track_id is not None:
+        data[track_col] = track_id
+    if meta_col:
+        data[meta_col] = stable_json_dumps(meta)
+
+    # Also add common column names for schema variance
+    data.update(
+        {
+            "context": context,
+            "mood": context,
+            "seed": seed,
+            "run_id": run_id,
+            "track_id": track_id,
+            "meta_json": stable_json_dumps(meta),
+            "metadata_json": stable_json_dumps(meta),
+        }
+    )
+
+    _insert_row(con, "drops", data)
+
+
+def db_drop_mark_published(
+    con: sqlite3.Connection,
+    *,
+    run_id: str,
+    marketing_batch_id: str,
+    published_ts: str,
+) -> int:
+    cols = db_table_columns(con, "drops")
+    if not cols:
+        raise sqlite3.OperationalError("table drops does not exist")
+
+    run_col = _pick_first_existing(cols, ["run_id"])
+    if not run_col:
+        return 0
+
+    batch_col = _pick_first_existing(cols, ["marketing_batch_id", "batch_id"])
+    pub_ts_col = _pick_first_existing(cols, ["published_ts", "published_at", "published_time", "ts_published"])
+
+    patch: Dict[str, Any] = {}
+    if batch_col:
+        patch[batch_col] = marketing_batch_id
+    if pub_ts_col:
+        patch[pub_ts_col] = published_ts
+
+    if not patch:
+        return 0
+
+    # Update all drops with this run_id (should be 1, but keep it tolerant)
+    sql = f"UPDATE drops SET {', '.join([f'{k} = ?' for k in sorted(patch.keys())])} WHERE {run_col} = ?"
+    params = [patch[k] for k in sorted(patch.keys())] + [run_id]
+    cur = con.execute(sql, params)
+    con.commit()
+    return int(cur.rowcount or 0)
+
+
 def db_insert_marketing_post(
     con: sqlite3.Connection,
     *,
@@ -507,7 +651,6 @@ def db_insert_marketing_post(
     elif meta_col:
         data[meta_col] = stable_json_dumps(meta_to_store)
     elif best_payload:
-        # store JSON blob so later readers can extract inner "content"
         data[best_payload] = stable_json_dumps(meta_to_store) if meta_to_store else content
 
     if meta_col and meta_col not in data:
@@ -719,6 +862,7 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
     out_dir.mkdir(parents=True, exist_ok=True)
 
     run_id = stable_uuid5("daily_run", context, seed, ts if not deterministic else "fixed")
+    drop_id = stable_uuid5("drop", run_id)
 
     track_id = stable_uuid5("track", context, seed, run_id)
     title = f"{context.title()} Track {seed}"
@@ -735,7 +879,7 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
     artifact_path = (Path.cwd() / artifact_rel).resolve()
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = {"track_id": track_id, "run_id": run_id, "context": context, "seed": seed, "ts": ts, "provider": provider}
+    payload = {"track_id": track_id, "run_id": run_id, "drop_id": drop_id, "context": context, "seed": seed, "ts": ts, "provider": provider}
     artifact_bytes = stable_json_dumps(payload).encode("utf-8")
     artifact_path.write_bytes(artifact_bytes)
 
@@ -748,7 +892,28 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
         mood=mood,
         genre=genre,
         artifact_path=str(artifact_rel).replace("\\", "/"),
-        meta={"run_id": run_id, "deterministic": deterministic, "seed": seed, "context": context},
+        meta={"run_id": run_id, "drop_id": drop_id, "deterministic": deterministic, "seed": seed, "context": context},
+    )
+
+    # Insert the drop *before* marketing so it exists even if later steps fail
+    db_insert_drop(
+        con,
+        drop_id=drop_id,
+        ts=ts,
+        context=context,
+        seed=seed,
+        run_id=run_id,
+        track_id=track_id,
+        meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic, "seed": seed, "context": context},
+    )
+
+    db_insert_event(
+        con,
+        event_id=stable_uuid5("event", "drop.created", drop_id),
+        ts=ts,
+        kind="drop.created",
+        actor="system",
+        meta={"drop_id": drop_id, "run_id": run_id, "track_id": track_id, "context": context, "seed": seed},
     )
 
     db_insert_event(
@@ -757,7 +922,7 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
         ts=ts,
         kind="track.generated",
         actor="system",
-        meta={"run_id": run_id, "track_id": track_id, "artifact_path": str(artifact_rel).replace("\\", "/")},
+        meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "artifact_path": str(artifact_rel).replace("\\", "/")},
     )
 
     platforms = ["x", "youtube_shorts", "instagram_reels", "tiktok"]
@@ -772,6 +937,7 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
             "cta": "Listen now.",
             "track_id": track_id,
             "run_id": run_id,
+            "drop_id": drop_id,
         }
         content = stable_json_dumps(content_obj)
 
@@ -782,7 +948,7 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
             platform=platform,
             status="draft",
             content=content,
-            meta={"run_id": run_id, "track_id": track_id, "deterministic": deterministic},
+            meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic},
         )
 
     db_insert_event(
@@ -791,11 +957,12 @@ def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, determi
         ts=ts,
         kind="marketing.drafts.created",
         actor="system",
-        meta={"run_id": run_id, "count": len(post_ids), "post_ids": post_ids},
+        meta={"run_id": run_id, "drop_id": drop_id, "count": len(post_ids), "post_ids": post_ids},
     )
 
     evidence = {
         "run_id": run_id,
+        "drop_id": drop_id,
         "ts": ts,
         "deterministic": deterministic,
         "context": context,
@@ -838,13 +1005,27 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         con = db_connect(db_path)
         ensure_tables_minimal(con)
         run_id = str(maybe.get("run_id") or stable_uuid5("daily_run", context, seed, ts if not deterministic else "fixed"))
+        drop_id = str(maybe.get("drop_id") or stable_uuid5("drop", run_id))
+        track_id = str(maybe.get("track_id") or maybe.get("track", {}).get("id") or "")
+
+        # Ensure a drop exists even with an external runner
+        db_insert_drop(
+            con,
+            drop_id=drop_id,
+            ts=ts,
+            context=context,
+            seed=seed,
+            run_id=run_id,
+            track_id=track_id if track_id else None,
+            meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic, "seed": seed, "context": context, "external_runner": True},
+        )
         db_insert_event(
             con,
             event_id=stable_uuid5("event", "daily.external_runner", run_id),
             ts=ts,
             kind="daily.external_runner",
             actor="system",
-            meta={"run_id": run_id, "module": "external", "deterministic": deterministic},
+            meta={"run_id": run_id, "drop_id": drop_id, "module": "external", "deterministic": deterministic},
         )
         sys.stdout.write(stable_json_dumps(maybe) + "\n")
         return 0
@@ -857,7 +1038,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Marketing publish (deterministic) -- skips empty drafts
+# Marketing publish (deterministic) -- skips empty drafts, updates drops
 # ---------------------------------------------------------------------------
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
@@ -876,16 +1057,20 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
     published: List[Dict[str, Any]] = []
     skipped_ids: List[str] = []
+    run_ids_touched: List[str] = []
 
     for row in pending:
         post_id = str(_row_first(row, ["id", "post_id"], default=""))
         platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
         content = _marketing_row_content(con, row)
 
-        # Deterministic skip: empty content is always empty, order is stable
         if not content.strip():
             skipped_ids.append(post_id)
             continue
+
+        meta = _marketing_row_meta(con, row)
+        run_id = str(meta.get("run_id") or "")
+        drop_id = str(meta.get("drop_id") or "")
 
         publish_id = stable_uuid5("publish", post_id, platform, ts if not deterministic else "fixed")
 
@@ -906,10 +1091,16 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "published_ts": ts,
                 "dry_run": dry_run,
                 "content": content,
+                "run_id": run_id,
+                "drop_id": drop_id,
             }
         )
 
-    # Keep the batch id deterministic for the same inputs; include skipped count but not IDs
+        if run_id:
+            run_ids_touched.append(run_id)
+
+    run_ids_touched = sorted(set([r for r in run_ids_touched if r]))
+
     batch_id = stable_uuid5(
         "marketing_publish_batch",
         ts if not deterministic else "fixed",
@@ -917,7 +1108,19 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "dry" if dry_run else "live",
         str(len(skipped_ids)),
         str(len(published)),
+        "|".join(run_ids_touched) if deterministic else "nondet",
     )
+
+    # Update drops for any run_ids we actually published
+    drops_updated: Dict[str, int] = {}
+    if run_ids_touched and not dry_run:
+        for rid in run_ids_touched:
+            drops_updated[rid] = db_drop_mark_published(
+                con,
+                run_id=rid,
+                marketing_batch_id=batch_id,
+                published_ts=ts,
+            )
 
     db_insert_event(
         con,
@@ -930,6 +1133,8 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "count": len(published),
             "dry_run": dry_run,
             "skipped_empty": len(skipped_ids),
+            "run_ids": run_ids_touched,
+            "drops_updated": drops_updated,
         },
     )
 
@@ -939,6 +1144,8 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "count": len(published),
         "skipped_empty": len(skipped_ids),
         "skipped_ids": skipped_ids,
+        "run_ids": run_ids_touched,
+        "drops_updated": drops_updated,
         "items": published,
     }
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
