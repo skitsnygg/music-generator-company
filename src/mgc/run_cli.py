@@ -2522,6 +2522,9 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
 
     kind = args.type  # drop | weekly | any
 
+    since = getattr(args, "since", None)
+    since_path = Path(str(since)).expanduser().resolve() if since else None
+
     if not evidence_dir.exists():
         sys.stdout.write(stable_json_dumps({
             "found": False,
@@ -2543,13 +2546,33 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
         files.extend(evidence_dir.glob(pat))
 
     files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
-    if len(files) < 2:
-        sys.stdout.write(stable_json_dumps({
-            "found": False,
-            "reason": "need_at_least_two_manifests",
-            "count": len(files),
-        }) + "\n")
-        return 0
+    if since_path is not None:
+        if not since_path.exists():
+            sys.stdout.write(stable_json_dumps({
+                "found": False,
+                "reason": "since_manifest_missing",
+                "since": str(since_path),
+            }) + "\n")
+            return 0
+        if not files:
+            sys.stdout.write(stable_json_dumps({
+                "found": False,
+                "reason": "no_manifests_found",
+                "path": str(evidence_dir),
+            }) + "\n")
+            return 0
+
+        a_path, b_path = since_path, files[0]  # older=since, newer=latest
+    else:
+        if len(files) < 2:
+            sys.stdout.write(stable_json_dumps({
+                "found": False,
+                "reason": "need_at_least_two_manifests",
+                "count": len(files),
+            }) + "\n")
+            return 0
+
+        a_path, b_path = files[1], files[0]  # older, newer
 
     a_path, b_path = files[1], files[0]  # older, newer
     a = _load_manifest(a_path)
@@ -2627,6 +2650,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
     diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any changes are detected (CI)")
     diff.add_argument("--json", action="store_true", help="JSON output (default)")
+    diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
     diff.set_defaults(func=cmd_run_diff)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
