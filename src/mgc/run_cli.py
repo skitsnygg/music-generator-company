@@ -2446,6 +2446,55 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     return 0 if out["found"] else 1
 
 
+def cmd_run_open(args: argparse.Namespace) -> int:
+    evidence_dir = Path(
+        args.out_dir
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).resolve()
+
+    kind = args.type  # drop | weekly | any
+    n = int(args.n or 1)
+
+    if not evidence_dir.exists():
+        return 1
+
+    patterns = []
+    if kind == "drop":
+        patterns = ["drop_evidence*.json"]
+    elif kind == "weekly":
+        patterns = ["weekly_evidence*.json"]
+    else:
+        patterns = ["drop_evidence*.json", "weekly_evidence*.json"]
+
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(evidence_dir.glob(pat))
+
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return 1
+
+    selected = files[:n]
+
+    for p in selected:
+        print(str(p))
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                paths = payload.get("paths", {})
+                if isinstance(paths, dict):
+                    manifest_path = paths.get("manifest_path")
+                    if isinstance(manifest_path, str) and manifest_path.strip():
+                        mp = Path(manifest_path)
+                        if mp.exists():
+                            print(str(mp))
+        except Exception:
+            pass
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -2461,6 +2510,12 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
     tail.add_argument("--json", action="store_true", help="JSON output (default)")
     tail.set_defaults(func=cmd_run_tail)
+
+    open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
+    open_p.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
+    open_p.set_defaults(func=cmd_run_open)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
