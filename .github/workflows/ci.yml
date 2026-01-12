@@ -8,20 +8,24 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    env:
-      # Route all generated outputs outside the repo checkout
-      MGC_EVIDENCE_DIR: ${{ runner.temp }}/mgc_evidence
-      MGC_ARTIFACTS_DIR: ${{ runner.temp }}/artifacts/ci
 
-      # DB path is intentionally not fixed here.
-      # It will be set after the fixture DB is built.
-      # MGC_DB: (set later)
+    env:
+      # MGC_DB will be set dynamically after we build/copy the fixture DB
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Set temp dirs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
+          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci"
+
       - name: Prepare temp dirs (always)
+        shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "${MGC_ARTIFACTS_DIR}"
@@ -37,18 +41,19 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euxo pipefail
           python -m pip install -U pip
           python -m pip install -e .
 
       - name: Build fixture DB (copy to temp; reset repo file)
+        shell: bash
         run: |
           set -euxo pipefail
 
           # This script currently writes fixtures/ci_db.sqlite (in-repo).
-          # We immediately copy it into runner temp and then restore the repo copy
-          # so the working tree stays clean.
+          # Copy it into runner temp and then restore the repo copy so the tree stays clean.
           python scripts/make_fixture_db.py
 
           ls -la fixtures
@@ -65,6 +70,7 @@ jobs:
           sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
 
       - name: Preflight DB (must pass)
+        shell: bash
         run: |
           set -euxo pipefail
           echo "HEAD=$(git rev-parse HEAD)"
@@ -85,6 +91,7 @@ jobs:
           PY
 
       - name: Run CI gate (twice)
+        shell: bash
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
@@ -95,8 +102,10 @@ jobs:
         env:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-          # Ensure anything that writes evidence uses runner temp (not repo)
-          MGC_EVIDENCE_DIR: ${{ runner.temp }}/mgc_evidence
+          # Use the runtime-set env var (NOT ${{ runner.temp }} here)
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_DB: ${{ env.MGC_DB }}
         run: |
           set -euxo pipefail
 
@@ -126,6 +135,7 @@ jobs:
           fi
 
       - name: Ensure working tree is clean (no generated artifacts)
+        shell: bash
         run: |
           set -euo pipefail
           git status --porcelain=v1
@@ -137,6 +147,6 @@ jobs:
         with:
           name: ci-artifacts
           path: |
-            ${{ runner.temp }}/artifacts/ci
-            ${{ runner.temp }}/mgc_evidence
+            ${{ env.MGC_ARTIFACTS_DIR }}
+            ${{ env.MGC_EVIDENCE_DIR }}
           if-no-files-found: ignore
