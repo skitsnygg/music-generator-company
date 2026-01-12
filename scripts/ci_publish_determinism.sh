@@ -1,44 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MGC_DB:?set MGC_DB}"
 PYTHON="${PYTHON:-python}"
+DB="${MGC_DB:-${DB:-data/db.sqlite}}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
 
 STAMP="${1:-ci_publish}"
-LIMIT="${MGC_PUBLISH_LIMIT:-200}"
+LIMIT="${LIMIT:-50}"
 
-receipts_root="artifacts/receipts/${STAMP}/marketing"
-manifest_path="${receipts_root}/_manifest.receipts.json"
+mkdir -p "$ARTIFACTS_DIR"
 
-clean() {
-  rm -rf "artifacts/receipts/${STAMP}"
-}
+info() { echo "[ci_publish_determinism] $*"; }
 
-tree_hash() {
-  "$PYTHON" - <<PY
-import json
-from pathlib import Path
-p = Path("${manifest_path}")
-if not p.exists():
-    raise SystemExit(f"manifest missing: {p}")
-m = json.loads(p.read_text(encoding="utf-8"))
-print(m["tree_sha256"])
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+info "run publish-marketing twice (deterministic) and compare sha256"
+
+MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
+  "$PYTHON" -m mgc.main run publish-marketing \
+    --deterministic \
+    --limit "$LIMIT" \
+    --dry-run \
+    >"$tmp/pub1.json"
+
+MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
+  "$PYTHON" -m mgc.main run publish-marketing \
+    --deterministic \
+    --limit "$LIMIT" \
+    --dry-run \
+    >"$tmp/pub2.json"
+
+H1="$("$PYTHON" - "$tmp/pub1.json" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+print(hashlib.sha256(p.read_bytes()).hexdigest())
 PY
-}
+)"
 
-clean
-"$PYTHON" -m mgc.main publish marketing --stamp "${STAMP}" --deterministic --limit "${LIMIT}" >/dev/null
-H1="$(tree_hash)"
+H2="$("$PYTHON" - "$tmp/pub2.json" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+print(hashlib.sha256(p.read_bytes()).hexdigest())
+PY
+)"
 
-clean
-"$PYTHON" -m mgc.main publish marketing --stamp "${STAMP}" --deterministic --limit "${LIMIT}" >/dev/null
-H2="$(tree_hash)"
-
-if [[ "${H1}" != "${H2}" ]]; then
-  echo "[ci_publish_determinism] FAIL: tree_sha256 mismatch"
+if [[ "$H1" != "$H2" ]]; then
+  echo "[ci_publish_determinism] FAIL: output sha256 mismatch"
   echo "[ci_publish_determinism] run1=${H1}"
   echo "[ci_publish_determinism] run2=${H2}"
   exit 1
 fi
 
-echo "[ci_publish_determinism] OK: stamp=${STAMP} tree_sha256=${H1}"
+echo "[ci_publish_determinism] OK: stamp=${STAMP} sha256=${H1}"

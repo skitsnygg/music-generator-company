@@ -5,7 +5,6 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -44,12 +43,43 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def _as_bool(v: Any) -> bool:
-    return bool(v) is True
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _propagate_parent_json(args: argparse.Namespace) -> None:
+    """
+    If the user ran: `mgc drops --json list ...`, argparse sets drops_json on the
+    drops parent parser. Depending on how defaults were applied, the list/show
+    parser's own `--json` may still be False.
+
+    We make behavior unambiguous by propagating parent json intent into the
+    subcommand json flag before formatting decisions.
+    """
+    if _as_bool(getattr(args, "drops_json", False)):
+        # subcommand flag name
+        if hasattr(args, "json"):
+            setattr(args, "json", True)
+        else:
+            # be tolerant if handler expects a different field name later
+            setattr(args, "json", True)
 
 
 def _wants_json(args: argparse.Namespace) -> bool:
-    # supports either per-command --json or the global mgc.main --json if present
-    return _as_bool(getattr(args, "json", False)) or (str(getattr(args, "format", "")).lower() == "json")
+    # supports:
+    # - mgc drops list --json
+    # - mgc drops --json list
+    # - mgc drops list --format json
+    _propagate_parent_json(args)
+
+    if _as_bool(getattr(args, "json", False)):
+        return True
+
+    # optional legacy convenience
+    return str(getattr(args, "format", "")).lower() == "json"
 
 
 def cmd_drops_list(args: argparse.Namespace) -> int:
@@ -61,7 +91,7 @@ def cmd_drops_list(args: argparse.Namespace) -> int:
     con = db_connect(path)
     cols = table_columns(con, "drops")
     if not cols:
-        print(stable_json_dumps({"error": "drops table not found", "db": path}) + "\n")
+        sys.stdout.write(stable_json_dumps({"error": "drops table not found", "db": path}) + "\n")
         return 2
 
     ts_col = _pick_first(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
@@ -105,8 +135,14 @@ def cmd_drops_list(args: argparse.Namespace) -> int:
         _pick_first(cols, ["published_ts", "published_at"]) or "published_ts",
     ]
 
-    # header
-    print("  ".join([c.ljust(36) if c in ("id", "drop_id", "run_id", "track_id", "marketing_batch_id") else c for c in show_cols]))
+    print(
+        "  ".join(
+            [
+                c.ljust(36) if c in ("id", "drop_id", "run_id", "track_id", "marketing_batch_id") else c
+                for c in show_cols
+            ]
+        )
+    )
     print("-" * 140)
     for it in items:
         parts: List[str] = []
@@ -140,7 +176,6 @@ def cmd_drops_show(args: argparse.Namespace) -> int:
 
     obj = _row_to_dict(row)
 
-    # pretty print if not json
     if _wants_json(args):
         sys.stdout.write(stable_json_dumps(obj) + "\n")
         return 0
@@ -148,7 +183,6 @@ def cmd_drops_show(args: argparse.Namespace) -> int:
     for k in sorted(obj.keys()):
         v = obj[k]
         if isinstance(v, str) and k.endswith("_json"):
-            # try to pretty print JSON blobs
             try:
                 parsed = json.loads(v) if v.strip() else None
             except Exception:
@@ -164,17 +198,27 @@ def cmd_drops_show(args: argparse.Namespace) -> int:
 def register_drops_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drops = subparsers.add_parser("drops", help="Inspect drops (daily releases)")
     drops.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
-    drops.add_argument("--json", action="store_true", help="Output JSON")
+
+    # drops-level json flag (works as: mgc drops --json list ...)
+    drops.add_argument("--json", dest="drops_json", action="store_true", help="Output JSON")
+    drops.set_defaults(drops_json=False)
+
     drops_sub = drops.add_subparsers(dest="drops_cmd", required=True)
 
     ls = drops_sub.add_parser("list", help="List drops")
     ls.add_argument("--limit", type=int, default=20)
     ls.add_argument("--context", default=None)
     ls.add_argument("--seed", default=None)
+
+    # subcommand-level json flag (works as: mgc drops list --json)
+    ls.add_argument("--json", action="store_true", help="Output JSON")
     ls.add_argument("--format", choices=["table", "json"], default="table")
     ls.set_defaults(func=cmd_drops_list)
 
     sh = drops_sub.add_parser("show", help="Show a single drop")
     sh.add_argument("id", help="Drop id")
+
+    # subcommand-level json flag (works as: mgc drops show ID --json)
+    sh.add_argument("--json", action="store_true", help="Output JSON")
     sh.add_argument("--format", choices=["pretty", "json"], default="pretty")
     sh.set_defaults(func=cmd_drops_show)
