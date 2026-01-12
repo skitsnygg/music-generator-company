@@ -302,31 +302,14 @@ def _load_json_maybe(s: Any) -> Dict[str, Any]:
 def _detect_marketing_content_col(cols: Sequence[str]) -> Optional[str]:
     return _pick_first_existing(
         cols,
-        [
-            "content",
-            "body",
-            "text",
-            "draft",
-            "caption",
-            "copy",
-            "post_text",
-            "message",
-        ],
+        ["content", "body", "text", "draft", "caption", "copy", "post_text", "message"],
     )
 
 
 def _detect_marketing_meta_col(cols: Sequence[str]) -> Optional[str]:
     return _pick_first_existing(
         cols,
-        [
-            "meta_json",
-            "metadata_json",
-            "meta",
-            "metadata",
-            "meta_blob",
-            "payload",
-            "payload_json",
-        ],
+        ["meta_json", "metadata_json", "meta", "metadata", "meta_blob", "payload", "payload_json"],
     )
 
 
@@ -354,10 +337,6 @@ def _best_text_payload_column(con: sqlite3.Connection, table: str, reserved: Seq
 
 
 def _extract_inner_content_from_blob(s: str) -> Optional[str]:
-    """
-    If s is a JSON object string that contains a 'content' field, return that.
-    This cleans up the common case where we stored meta_json but later read it as the payload blob.
-    """
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
@@ -387,19 +366,10 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
         con,
         "marketing_posts",
         reserved=[
-            "id",
-            "post_id",
-            "ts",
-            "created_at",
-            "platform",
-            "channel",
-            "destination",
-            "status",
-            "state",
-            "meta_json",
-            "metadata_json",
-            "meta",
-            "metadata",
+            "id", "post_id", "ts", "created_at",
+            "platform", "channel", "destination",
+            "status", "state",
+            "meta_json", "metadata_json", "meta", "metadata",
         ],
     )
     if best_payload and best_payload in set(cols):
@@ -415,7 +385,6 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
         meta = _load_json_maybe(row[meta_col])
         for k in ("content", "body", "text", "draft", "caption", "copy", "post_text", "message"):
             if k in meta and meta[k] is not None:
-                # If it's a dict, serialize deterministically; if it's a string, return as-is.
                 if isinstance(meta[k], dict):
                     return stable_json_dumps(meta[k])
                 return str(meta[k])
@@ -538,6 +507,7 @@ def db_insert_marketing_post(
     elif meta_col:
         data[meta_col] = stable_json_dumps(meta_to_store)
     elif best_payload:
+        # store JSON blob so later readers can extract inner "content"
         data[best_payload] = stable_json_dumps(meta_to_store) if meta_to_store else content
 
     if meta_col and meta_col not in data:
@@ -887,7 +857,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Marketing publish (deterministic)
+# Marketing publish (deterministic) -- skips empty drafts
 # ---------------------------------------------------------------------------
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
@@ -905,10 +875,17 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     pending = db_marketing_posts_pending(con, limit=limit)
 
     published: List[Dict[str, Any]] = []
+    skipped_ids: List[str] = []
+
     for row in pending:
         post_id = str(_row_first(row, ["id", "post_id"], default=""))
         platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
         content = _marketing_row_content(con, row)
+
+        # Deterministic skip: empty content is always empty, order is stable
+        if not content.strip():
+            skipped_ids.append(post_id)
+            continue
 
         publish_id = stable_uuid5("publish", post_id, platform, ts if not deterministic else "fixed")
 
@@ -932,22 +909,38 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             }
         )
 
+    # Keep the batch id deterministic for the same inputs; include skipped count but not IDs
     batch_id = stable_uuid5(
         "marketing_publish_batch",
         ts if not deterministic else "fixed",
         str(limit),
         "dry" if dry_run else "live",
+        str(len(skipped_ids)),
+        str(len(published)),
     )
+
     db_insert_event(
         con,
         event_id=stable_uuid5("event", "marketing.published", batch_id),
         ts=ts,
         kind="marketing.published",
         actor="system",
-        meta={"batch_id": batch_id, "count": len(published), "dry_run": dry_run},
+        meta={
+            "batch_id": batch_id,
+            "count": len(published),
+            "dry_run": dry_run,
+            "skipped_empty": len(skipped_ids),
+        },
     )
 
-    out_obj = {"batch_id": batch_id, "ts": ts, "count": len(published), "items": published}
+    out_obj = {
+        "batch_id": batch_id,
+        "ts": ts,
+        "count": len(published),
+        "skipped_empty": len(skipped_ids),
+        "skipped_ids": skipped_ids,
+        "items": published,
+    }
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
 
