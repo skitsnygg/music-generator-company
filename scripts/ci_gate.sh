@@ -79,10 +79,10 @@ run_gate() {
   MGC_DB="$DB" PYTHON="$PYTHON" ARTIFACTS_DIR="$ARTIFACTS_DIR" \
     bash scripts/ci_publish_determinism.sh "ci_publish"
 
-  info "manifest diff gate (since-ok)"
-  # Fail CI if there are any file changes between the latest manifest and the
+  info "manifest diff gate (since-ok, strict JSON)"
+  # Fail CI if there are any non-allowed changes between the latest manifest and the
   # most recent "ok" manifest (or emit found:false if none eligible).
-  MGC_DB="$DB" "$PYTHON" -m mgc.main run diff --since-ok --fail-on-changes --json | "$PYTHON" -m json.tool
+  MGC_DB="$DB" "$PYTHON" -m mgc.main --json run diff --since-ok --fail-on-changes --summary-only | "$PYTHON" -m json.tool
 
   info "OK"
 }
