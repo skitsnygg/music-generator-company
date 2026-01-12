@@ -2343,6 +2343,20 @@ def cmd_run_status(args: argparse.Namespace) -> int:
         ).fetchall()
         out["stages"] = {"count": len(rows), "items": [dict(r) for r in rows]}
 
+    # Summary/health
+    counts: Dict[str, int] = {}
+    for it in out["stages"].get("items", []):
+        st = str(it.get("status") or "").lower()
+        if not st:
+            st = "unknown"
+        counts[st] = counts.get(st, 0) + 1
+
+    healthy = (counts.get("error", 0) == 0)
+    out["summary"] = {
+        "counts": dict(sorted(counts.items())),
+        "healthy": healthy,
+    }
+
     # CI mode: fail if any stage is error
     if fail_on_error:
         any_error = False
