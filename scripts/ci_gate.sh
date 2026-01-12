@@ -45,12 +45,13 @@ run_gate() {
   fi
   info "DB OK."
 
-info "drops smoke test"
-MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
-  "$PYTHON" -m mgc.main run drop --context focus --seed 1 >/dev/null
+  info "drops smoke test"
+  MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
+    "$PYTHON" -m mgc.main run drop --context focus --seed 1 >/dev/null
 
-MGC_DB="$DB" "$PYTHON" -m mgc.main drops list --limit 1 --json >/dev/null
-
+  # IMPORTANT: --json is a global flag on the top-level parser, so it must appear
+  # before the subcommand unless the subcommand also defines it.
+  MGC_DB="$DB" "$PYTHON" -m mgc.main --json drops list --limit 1 >/dev/null
 
   info "py_compile"
   "$PYTHON" -m py_compile src/mgc/main.py

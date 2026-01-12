@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
+import socket
 import sqlite3
 import sys
 import uuid
@@ -13,8 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import contextlib
-import io
 
 @contextlib.contextmanager
 def _silence_stdout(enabled: bool = True):
@@ -83,6 +84,92 @@ def read_text_bytes(path: Path) -> bytes:
         return s.encode("utf-8")
     except Exception:
         return b
+
+
+# ---------------------------------------------------------------------------
+# Canonical run identity (run_key -> run_id)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RunKey:
+    run_date: str                 # YYYY-MM-DD
+    context: str                  # focus/workout/sleep
+    seed: str                     # keep string for schema tolerance
+    provider_set_version: str     # e.g. "v1"
+
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_get_or_create_run_id(
+    con: sqlite3.Connection,
+    *,
+    run_key: RunKey,
+    ts: str,
+    argv: Optional[List[str]] = None,
+) -> str:
+    """
+    Canonical rule: same (run_date, context, seed, provider_set_version) => same run_id.
+    Enforced by UNIQUE INDEX in DB. Returns existing run_id or creates one.
+    """
+    con.execute("PRAGMA foreign_keys = ON;")
+
+    row = con.execute(
+        """
+        SELECT run_id
+          FROM runs
+         WHERE run_date = ? AND context = ? AND seed = ? AND provider_set_version = ?
+         LIMIT 1
+        """,
+        (run_key.run_date, run_key.context, run_key.seed, run_key.provider_set_version),
+    ).fetchone()
+    if row:
+        return str(row[0])
+
+    run_id = str(uuid.uuid4())
+    created_at = ts if isinstance(ts, str) and ts else _now_iso_utc()
+    updated_at = created_at
+    argv_json = stable_json_dumps(argv) if argv is not None else None
+
+    try:
+        con.execute(
+            """
+            INSERT INTO runs (
+              run_id, run_date, context, seed, provider_set_version,
+              created_at, updated_at,
+              hostname, argv_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                run_key.run_date,
+                run_key.context,
+                run_key.seed,
+                run_key.provider_set_version,
+                created_at,
+                updated_at,
+                socket.gethostname(),
+                argv_json,
+            ),
+        )
+        con.commit()
+        return run_id
+    except sqlite3.IntegrityError:
+        # Lost a race; read the winner.
+        row2 = con.execute(
+            """
+            SELECT run_id
+              FROM runs
+             WHERE run_date = ? AND context = ? AND seed = ? AND provider_set_version = ?
+             LIMIT 1
+            """,
+            (run_key.run_date, run_key.context, run_key.seed, run_key.provider_set_version),
+        ).fetchone()
+        if not row2:
+            raise
+        return str(row2[0])
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +346,54 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
     Creates minimal tables *only if missing*. We do not migrate existing schemas.
     """
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON;")
+
+    # Canonical runs table (run_key -> run_id)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            run_date TEXT NOT NULL,
+            context TEXT NOT NULL,
+            seed TEXT NOT NULL,
+            provider_set_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            hostname TEXT,
+            argv_json TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_run_key
+        ON runs(run_date, context, seed, provider_set_version)
+        """
+    )
+
+    # Stage table reserved for next milestone step (resume/observability)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_stages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT,
+            ended_at TEXT,
+            duration_ms INTEGER,
+            error_json TEXT,
+            meta_json TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_stages_unique
+        ON run_stages(run_id, stage)
+        """
+    )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -489,12 +624,14 @@ def db_insert_event(con: sqlite3.Connection, *, event_id: str, ts: str, kind: st
         },
     )
 
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 def db_insert_track(
     con: sqlite3.Connection,
@@ -879,13 +1016,21 @@ def _maybe_call_external_daily_runner(*, db_path: str, context: str, seed: str, 
     return None
 
 
-def _stub_daily_run(*, con: sqlite3.Connection, context: str, seed: str, deterministic: bool, ts: str, out_dir: Path) -> Dict[str, Any]:
+def _stub_daily_run(
+    *,
+    con: sqlite3.Connection,
+    context: str,
+    seed: str,
+    deterministic: bool,
+    ts: str,
+    out_dir: Path,
+    run_id: str,
+) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    run_id = stable_uuid5("daily_run", context, seed, ts if not deterministic else "fixed")
     drop_id = stable_uuid5("drop", run_id)
-
     track_id = stable_uuid5("track", context, seed, run_id)
+
     title = f"{context.title()} Track {seed}"
     provider = "stub"
     mood = context
@@ -1010,10 +1155,23 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     db_path = args.db or os.environ.get("MGC_DB") or "data/db.sqlite"
     context = args.context or os.environ.get("MGC_CONTEXT") or "focus"
     seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
 
     ts = deterministic_now_iso(deterministic)
+    run_date = ts.split("T", 1)[0]
+
     out_dir = Path(args.out_dir or "data/evidence").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    run_id = db_get_or_create_run_id(
+        con,
+        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
+        ts=ts,
+        argv=list(sys.argv),
+    )
 
     maybe = _maybe_call_external_daily_runner(
         db_path=db_path,
@@ -1023,9 +1181,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         ts=ts,
     )
     if maybe is not None:
-        con = db_connect(db_path)
-        ensure_tables_minimal(con)
-        run_id = str(maybe.get("run_id") or stable_uuid5("daily_run", context, seed, ts if not deterministic else "fixed"))
+        external_run_id = str(maybe.get("run_id") or "")
         drop_id = str(maybe.get("drop_id") or stable_uuid5("drop", run_id))
         track_id = str(maybe.get("track_id") or maybe.get("track", {}).get("id") or "")
 
@@ -1038,7 +1194,16 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             seed=seed,
             run_id=run_id,
             track_id=track_id if track_id else None,
-            meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic, "seed": seed, "context": context, "external_runner": True},
+            meta={
+                "run_id": run_id,
+                "external_run_id": external_run_id,
+                "drop_id": drop_id,
+                "track_id": track_id,
+                "deterministic": deterministic,
+                "seed": seed,
+                "context": context,
+                "external_runner": True,
+            },
         )
         db_insert_event(
             con,
@@ -1046,16 +1211,33 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             ts=ts,
             kind="daily.external_runner",
             actor="system",
-            meta={"run_id": run_id, "drop_id": drop_id, "module": "external", "deterministic": deterministic},
+            meta={
+                "run_id": run_id,
+                "external_run_id": external_run_id,
+                "drop_id": drop_id,
+                "module": "external",
+                "deterministic": deterministic,
+            },
         )
-        sys.stdout.write(stable_json_dumps(maybe) + "\n")
+        out = dict(maybe)
+        out.setdefault("run_id", run_id)  # canonical
+        out.setdefault("run_date", run_date)
+        out.setdefault("provider_set_version", provider_set_version)
+        sys.stdout.write(stable_json_dumps(out) + "\n")
         return 0
 
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-    evidence = _stub_daily_run(con=con, context=context, seed=seed, deterministic=deterministic, ts=ts, out_dir=out_dir)
+    evidence = _stub_daily_run(
+        con=con,
+        context=context,
+        seed=seed,
+        deterministic=deterministic,
+        ts=ts,
+        out_dir=out_dir,
+        run_id=run_id,
+    )
     sys.stdout.write(stable_json_dumps(evidence) + "\n")
     return 0
+
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
     """
@@ -1071,10 +1253,14 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
     context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
     seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
+
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
     ts = deterministic_now_iso(deterministic)
+    run_date = ts.split("T", 1)[0]
+
     out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1103,13 +1289,22 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     con = db_connect(db_path)
     ensure_tables_minimal(con)
 
+    # STEP 4: resolve canonical run_id for THIS drop run_key
+    run_id = db_get_or_create_run_id(
+        con,
+        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
+        ts=ts,
+        argv=list(sys.argv),
+    )
+
     drop_row = con.execute(
-        "SELECT * FROM drops WHERE context = ? AND seed = ? ORDER BY ts DESC, id DESC LIMIT 1",
-        (context, seed),
+        "SELECT * FROM drops WHERE run_id = ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (run_id,),
     ).fetchone()
     drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
 
-    drop_id = str(drop_obj.get("id") or "")
+    drop_id = str(drop_obj.get("id") or stable_uuid5("drop", run_id))
+
     out_path = out_dir / ("drop_evidence.json" if deterministic else f"drop_evidence_{drop_id}.json")
     manifest_path = out_dir / ("manifest.json" if deterministic else f"manifest_{drop_id}.json")
 
@@ -1119,16 +1314,10 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             repo_root=str(getattr(args, "repo_root", None) or "."),
             out=str(manifest_path),
             print_hash=False,
-
-            # cmd_run_manifest expects these
             include=getattr(args, "include", None),
             exclude=getattr(args, "exclude", None),
-
-            # safe defaults in case cmd_run_manifest reads them
             follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
             max_file_bytes=getattr(args, "max_file_bytes", None),
-
-            # keep signature-compatible if it reads these
             deterministic=deterministic,
             db=db_path,
             json=False,
@@ -1140,11 +1329,16 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     evidence: Dict[str, Any] = {
         "ts": ts,
         "deterministic": deterministic,
-        "context": context,
-        "seed": seed,
+        "run_key": {
+            "run_date": run_date,
+            "context": context,
+            "seed": seed,
+            "provider_set_version": provider_set_version,
+        },
+        "run_id": run_id,
         "drop": {
-            "id": drop_obj.get("id"),
-            "run_id": drop_obj.get("run_id"),
+            "id": drop_obj.get("id") or drop_id,
+            "run_id": drop_obj.get("run_id") or run_id,
             "track_id": drop_obj.get("track_id"),
             "marketing_batch_id": drop_obj.get("marketing_batch_id"),
             "published_ts": drop_obj.get("published_ts"),
@@ -1160,20 +1354,23 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
 
     # Persist pointers in drops.meta_json
-    if drop_id:
+    if drop_obj.get("id"):
         existing_meta: Dict[str, Any] = {}
         meta_raw = drop_obj.get("meta_json")
         if isinstance(meta_raw, str) and meta_raw.strip():
             try:
                 existing_meta = json.loads(meta_raw)
+                if not isinstance(existing_meta, dict):
+                    existing_meta = {}
             except Exception:
                 existing_meta = {}
 
         existing_meta.update(evidence["paths"])
+        existing_meta.update({"run_id": run_id, "run_key": evidence["run_key"]})
 
         con.execute(
             "UPDATE drops SET meta_json = ? WHERE id = ?",
-            (stable_json_dumps(existing_meta), drop_id),
+            (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
         )
         con.commit()
 
@@ -1294,6 +1491,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     }
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
+
 
 # ---------------------------------------------------------------------------
 # Argparse wiring

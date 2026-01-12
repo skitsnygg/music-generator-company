@@ -80,17 +80,19 @@ jobs:
           bash scripts/ci_run_determinism.sh
 
           # Drops smoke: run a deterministic drop, then verify drops CLI is wired
-          python -m mgc.main run drop --context focus --seed 1 > /tmp/mgc_drop.json
+          python -m mgc.main run drop --context focus --seed 1 --deterministic > /tmp/mgc_drop.json
           python -m json.tool < /tmp/mgc_drop.json > /dev/null
 
-          python -m mgc.main drops list --limit 1 --json > /tmp/mgc_drops_list.json
+          # IMPORTANT: --json is a GLOBAL flag, so it must come before the subcommand.
+          python -m mgc.main --json drops list --limit 1 > /tmp/mgc_drops_list.json
           python -m json.tool < /tmp/mgc_drops_list.json > /dev/null
 
-          # If jq is available, this is a stronger check, but keep it optional.
+          # Optional stronger check with jq
           if command -v jq >/dev/null 2>&1; then
             DROP_ID="$(jq -r '.drop.id' /tmp/mgc_drop.json)"
             test -n "$DROP_ID" && test "$DROP_ID" != "null"
-            python -m mgc.main drops show "$DROP_ID" --format json > /tmp/mgc_drops_show.json
+
+            python -m mgc.main --json drops show "$DROP_ID" > /tmp/mgc_drops_show.json
             python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
           fi
 
