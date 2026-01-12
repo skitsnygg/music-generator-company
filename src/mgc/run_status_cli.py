@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
@@ -29,31 +29,6 @@ def _silence_stdout(enabled: bool = True):
         yield
     finally:
         sys.stdout = old
-
-
-@contextlib.contextmanager
-def _temp_env(patch: Dict[str, Optional[str]]):
-    """
-    Temporarily set/unset environment variables.
-    patch values:
-      - str: set
-      - None: unset
-    """
-    old: Dict[str, Optional[str]] = {}
-    try:
-        for k, v in patch.items():
-            old[k] = os.environ.get(k)
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        yield
-    finally:
-        for k, v in old.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -112,35 +87,6 @@ def read_text_bytes(path: Path) -> bytes:
         return s.encode("utf-8")
     except Exception:
         return b
-
-
-def _parse_iso_utc(s: str, *, fallback: str = "2020-01-01T00:00:00+00:00") -> datetime:
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        dt = datetime.fromisoformat(fallback.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-
-
-def _iso_add_days(ts_iso: str, days: int) -> str:
-    dt = _parse_iso_utc(ts_iso)
-    return (dt + timedelta(days=int(days))).astimezone(timezone.utc).isoformat()
-
-
-def _week_start_date(run_date_yyyy_mm_dd: str) -> str:
-    # Monday as week start (ISO style)
-    try:
-        dt = datetime.strptime(run_date_yyyy_mm_dd, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception:
-        dt = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    weekday = dt.weekday()  # Monday=0
-    ws = dt - timedelta(days=weekday)
-    return ws.date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -1804,204 +1750,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Weekly run (7 dailies + publish + manifest + consolidated evidence)
-# ---------------------------------------------------------------------------
-
-def cmd_run_weekly(args: argparse.Namespace) -> int:
-    """
-    Weekly umbrella command:
-      - Runs 7 daily runs (each has its own canonical daily run_id)
-      - Publishes marketing once (covers all pending drafts)
-      - Writes manifest once
-      - Writes weekly evidence JSON
-      - Records stages under the weekly umbrella run_id:
-          daily_0..daily_6, publish_marketing, manifest, evidence
-      - Resume semantics per-stage unless --no-resume
-    """
-    deterministic = is_deterministic(args)
-
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
-    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
-    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
-
-    limit = int(getattr(args, "limit", None) or 50)
-    dry_run = bool(getattr(args, "dry_run", False))
-    allow_resume = not bool(getattr(args, "no_resume", False))
-
-    ts0 = deterministic_now_iso(deterministic)
-    run_date0 = ts0.split("T", 1)[0]
-    week_start = _week_start_date(run_date0)
-
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-
-    # Weekly umbrella run_id keyed by week_start date.
-    weekly_run_id = db_get_or_create_run_id(
-        con,
-        run_key=RunKey(run_date=week_start, context=context, seed=seed, provider_set_version=provider_set_version),
-        ts=ts0,
-        argv=list(sys.argv),
-    )
-
-    daily_results: List[Dict[str, Any]] = []
-
-    # Run 7 dailies as distinct calendar days, starting from week_start.
-    # In deterministic mode, we force MGC_FIXED_TIME per day so cmd_run_daily produces distinct run_date/run_id.
-    for i in range(7):
-        stage_name = f"daily_{i}"
-        day_dt = datetime.strptime(week_start, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=i)
-        day_ts = day_dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-        with run_stage(
-            con,
-            run_id=weekly_run_id,
-            stage=stage_name,
-            deterministic=deterministic,
-            allow_resume=allow_resume,
-            meta={"context": context, "seed": seed, "day_index": i, "day_ts": day_ts, "week_start": week_start},
-        ) as should_run:
-            if should_run:
-                with _silence_stdout(True):
-                    # Ensure deterministic daily uses a distinct day.
-                    patch = {"MGC_FIXED_TIME": day_ts} if deterministic else {}
-                    with _temp_env(patch):
-                        daily_ns = argparse.Namespace(
-                            db=db_path,
-                            context=context,
-                            seed=seed,
-                            out_dir=str(out_dir),
-                            deterministic=deterministic,
-                        )
-                        cmd_run_daily(daily_ns)
-
-        # Best-effort: resolve that day's canonical daily run_id and attach pointers.
-        # This is deterministic because run_id is canonical for (run_date, context, seed, provider_set_version).
-        day_run_id = db_get_or_create_run_id(
-            con,
-            run_key=RunKey(run_date=day_dt.date().isoformat(), context=context, seed=seed, provider_set_version=provider_set_version),
-            ts=(day_ts if deterministic else ts0),
-            argv=None,
-        )
-        drop_row = _drop_latest_for_run(con, day_run_id)
-        drop_obj = dict(drop_row) if drop_row else {}
-        daily_results.append(
-            {
-                "day_index": i,
-                "run_date": day_dt.date().isoformat(),
-                "ts": day_ts,
-                "run_id": day_run_id,
-                "drop": {
-                    "id": drop_obj.get("id"),
-                    "track_id": drop_obj.get("track_id"),
-                    "marketing_batch_id": drop_obj.get("marketing_batch_id"),
-                    "published_ts": drop_obj.get("published_ts"),
-                },
-            }
-        )
-
-    # Publish once
-    with run_stage(
-        con,
-        run_id=weekly_run_id,
-        stage="publish_marketing",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"limit": limit, "dry_run": dry_run},
-    ) as should_run:
-        if should_run:
-            with _silence_stdout(True):
-                pub_ns = argparse.Namespace(
-                    db=db_path,
-                    limit=limit,
-                    dry_run=dry_run,
-                    deterministic=deterministic,
-                )
-                cmd_publish_marketing(pub_ns)
-
-    # Manifest once
-    weekly_evidence_path = out_dir / ("weekly_evidence.json" if deterministic else f"weekly_evidence_{weekly_run_id}.json")
-    weekly_manifest_path = out_dir / ("weekly_manifest.json" if deterministic else f"weekly_manifest_{weekly_run_id}.json")
-
-    with run_stage(
-        con,
-        run_id=weekly_run_id,
-        stage="manifest",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"repo_root": str(getattr(args, "repo_root", None) or ".")},
-    ) as should_run:
-        if should_run:
-            with _silence_stdout(True):
-                manifest_ns = argparse.Namespace(
-                    repo_root=str(getattr(args, "repo_root", None) or "."),
-                    out=str(weekly_manifest_path),
-                    print_hash=False,
-                    include=getattr(args, "include", None),
-                    exclude_dir=getattr(args, "exclude_dir", None),
-                    exclude_glob=getattr(args, "exclude_glob", None),
-                )
-                cmd_run_manifest(manifest_ns)
-
-    manifest_sha256 = _sha256_file(weekly_manifest_path)
-
-    # Evidence once
-    with run_stage(
-        con,
-        run_id=weekly_run_id,
-        stage="evidence",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"evidence_path": str(weekly_evidence_path), "manifest_path": str(weekly_manifest_path)},
-    ) as should_run:
-        if should_run:
-            evidence: Dict[str, Any] = {
-                "ts": ts0,
-                "deterministic": deterministic,
-                "run_key": {
-                    "week_start": week_start,
-                    "context": context,
-                    "seed": seed,
-                    "provider_set_version": provider_set_version,
-                },
-                "weekly_run_id": weekly_run_id,
-                "days": daily_results,
-                "paths": {
-                    "evidence_path": str(weekly_evidence_path),
-                    "manifest_path": str(weekly_manifest_path),
-                    "manifest_sha256": manifest_sha256,
-                },
-                "stages": {"allow_resume": allow_resume},
-            }
-            weekly_evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
-
-    # Emit exactly one JSON object
-    try:
-        sys.stdout.write(weekly_evidence_path.read_text(encoding="utf-8"))
-    except Exception:
-        sys.stdout.write(
-            stable_json_dumps(
-                {
-                    "ts": ts0,
-                    "deterministic": deterministic,
-                    "weekly_run_id": weekly_run_id,
-                    "run_key": {"week_start": week_start, "context": context, "seed": seed, "provider_set_version": provider_set_version},
-                    "paths": {
-                        "evidence_path": str(weekly_evidence_path),
-                        "manifest_path": str(weekly_manifest_path),
-                        "manifest_sha256": manifest_sha256,
-                    },
-                }
-            )
-            + "\n"
-        )
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # run stage CLI (set/get/list) for resume + debugging
 # ---------------------------------------------------------------------------
 
@@ -2108,10 +1856,11 @@ def cmd_run_stage_list(args: argparse.Namespace) -> int:
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
-def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage)")
-    run_p.set_defaults(_mgc_group="run")
-    run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
+def register_run_status_subcommand(run_sub):
+    p = run_sub.add_parser("status", help="Show status of latest run")
+    p.add_argument("--db", ...)
+    p.add_argument("--run-id", ...)
+    p.set_defaults(func=cmd_run_status)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
@@ -2138,25 +1887,10 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
     drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
     drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude (repeatable)")
     drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     drop.set_defaults(func=cmd_run_drop)
-
-    weekly = run_sub.add_parser("weekly", help="Run 7 dailies + one publish-marketing + one manifest; emit weekly evidence")
-    weekly.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
-    weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
-    weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
-    weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
-    weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
-    weekly.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
-    weekly.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
-    weekly.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
-    weekly.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    weekly.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
-    weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
-    weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
-    weekly.set_defaults(func=cmd_run_weekly)
 
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")
@@ -2193,6 +1927,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     st_ls.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
     st_ls.add_argument("run_id", help="Canonical run_id")
     st_ls.set_defaults(func=cmd_run_stage_list)
+
+    # ---- NEW: run status (read-only) ----
+    try:
+        from mgc.run_status_cli import register_run_status_subcommand  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"[mgc.run_cli] ERROR: failed to import mgc.run_status_cli: {e}") from e
+    register_run_status_subcommand(run_sub)
 
 
 def _build_parser() -> argparse.ArgumentParser:
