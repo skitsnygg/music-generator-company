@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# CI gate: compile + deterministic rebuild/verify
+# CI gate: compile + deterministic checks
 #
 # Env:
 #   MGC_DB         DB path (default: data/db.sqlite)
@@ -28,7 +28,7 @@ mkdir -p "$ARTIFACTS_DIR"
 log_file="$ARTIFACTS_DIR/ci_gate.log"
 : > "$log_file"
 
-{
+run() {
   echo "[ci_gate] Repo: $repo_root"
   echo "[ci_gate] MGC_DB=$DB"
   echo "[ci_gate] ARTIFACTS_DIR=$ARTIFACTS_DIR"
@@ -39,9 +39,8 @@ log_file="$ARTIFACTS_DIR/ci_gate.log"
 
   if [[ ! -f "$DB" ]]; then
     echo "[ci_gate] ERROR: DB not found: $DB" >&2
-    exit 2
+    return 2
   fi
-
   echo "[ci_gate] DB OK."
 
   echo "[ci_gate] py_compile"
@@ -51,5 +50,11 @@ log_file="$ARTIFACTS_DIR/ci_gate.log"
   MGC_DB="$DB" ARTIFACTS_DIR="$ARTIFACTS_DIR" PYTHON="$PYTHON" MGC_OUT_ROOT="${MGC_OUT_ROOT:-}" \
     bash scripts/ci_rebuild_verify.sh
 
+  echo "[ci_gate] publish receipts determinism"
+  MGC_DB="$DB" PYTHON="$PYTHON" ARTIFACTS_DIR="$ARTIFACTS_DIR" \
+    bash scripts/ci_publish_determinism.sh "ci_publish"
+
   echo "[ci_gate] OK"
-} 2>&1 | tee -a "$log_file"
+}
+
+run 2>&1 | tee -a "$log_file"
