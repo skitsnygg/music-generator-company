@@ -573,10 +573,13 @@ def _update_marketing_post_status(
 
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
+    # NEW: manifest hashing
+    from mgc.manifest import write_manifest
+
     db_path = Path(args.db)
     stamp = (args.stamp or _stable_stamp_default()).strip()
 
-    deterministic = bool(args.deterministic) or _is_truthy_env("MGC_DETERMINISTIC")
+    deterministic = bool(getattr(args, "deterministic", False)) or _is_truthy_env("MGC_DETERMINISTIC")
 
     receipts_dir = Path(args.artifacts_dir) / "receipts" / stamp / "marketing"
     _ensure_dir(receipts_dir)
@@ -584,22 +587,24 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     if not db_path.exists():
         raise SystemExit(f"DB not found: {db_path}")
 
-    status_filter = (args.status or "").strip().lower() or None
+    status_filter = (getattr(args, "status", None) or "").strip().lower() or None
     if not status_filter:
-        status_filter = "planned" if args.only_planned else "any"
+        status_filter = "planned" if bool(getattr(args, "only_planned", False)) else "any"
     if status_filter not in {"planned", "published", "any"}:
         raise SystemExit(f"invalid --status: {status_filter}")
 
     published_at = _deterministic_published_at(stamp) if deterministic else _now_iso()
 
-    # Deterministic: always overwrite receipts (filesystem state can't change outputs)
-    force = True if deterministic else bool(args.force)
+    # Deterministic mode: always overwrite receipts (filesystem state can't affect results)
+    force = True if deterministic else bool(getattr(args, "force", False))
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         posts = _load_marketing_posts(conn, limit=int(args.limit), status_filter=status_filter)
 
         results: List[Dict[str, Any]] = []
+        written = 0
+        skipped_existing = 0
 
         for p in posts:
             post_id = str(p.get("id", ""))
@@ -620,10 +625,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "platform": platform,
                 "track_id": track_id,
                 "status_before": status_before,
-                "status_after": "published" if args.commit else status_before,
+                "status_after": "published" if bool(getattr(args, "commit", False)) else status_before,
                 "published_at": published_at,
                 "simulated": True,
-                "committed": bool(args.commit),
+                "committed": bool(getattr(args, "commit", False)),
                 "permalink": _simulated_permalink(platform, post_id),
                 "caption": caption,
                 "hashtags": hashtags,
@@ -631,12 +636,14 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             }
 
             out = receipts_dir / platform.lower() / f"{post_id}.json"
+
             if out.exists() and not force:
-                pass
+                skipped_existing += 1
             else:
                 _write_json(out, receipt)
+                written += 1
 
-            if args.commit:
+            if bool(getattr(args, "commit", False)):
                 _update_marketing_post_status(conn, post_id=post_id, new_status="published", published_at=published_at)
 
             results.append(
@@ -646,36 +653,52 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                     "status_before": status_before,
                     "receipt_path": str(out),
                     "permalink": receipt["permalink"],
-                    "committed": bool(args.commit),
+                    "committed": bool(getattr(args, "commit", False)),
                 }
             )
 
-        if args.commit:
+        if bool(getattr(args, "commit", False)):
             conn.commit()
 
-    summary: Dict[str, Any] = {
+    # NEW: write manifest after receipts exist
+    manifest_path = receipts_dir / "_manifest.receipts.json"
+    manifest = write_manifest(
+        root_dir=receipts_dir,
+        out_path=manifest_path,
+        generated_at=published_at,
+        include_suffixes=[".json"],
+        exclude_names=[manifest_path.name],  # (write_manifest also excludes out_path.name)
+    )
+
+    summary = {
         "db": str(db_path),
         "stamp": stamp,
         "published_at": published_at,
         "status_filter": status_filter,
         "limit": int(args.limit),
-        "commit": bool(args.commit),
+        "commit": bool(getattr(args, "commit", False)),
         "deterministic": deterministic,
         "force": force,
         "receipts_dir": str(receipts_dir),
+        "manifest_path": str(manifest_path),
+        "manifest_tree_sha256": str(manifest.get("tree_sha256")),
         "rows_selected": len(posts),
+        "receipts_written": written,
+        "receipts_skipped_existing": skipped_existing,
         "results": results,
     }
 
-    if args.json:
+    if bool(getattr(args, "json", False)):
         print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         print(
             f"[publish marketing] status={status_filter} selected={len(posts)} "
-            f"commit={bool(args.commit)} deterministic={deterministic} receipts_dir={receipts_dir}"
+            f"written={written} skipped_existing={skipped_existing} commit={bool(getattr(args, 'commit', False))} "
+            f"deterministic={deterministic} tree_sha256={manifest.get('tree_sha256')} receipts_dir={receipts_dir}"
         )
 
     return 0
+
 
 
 # ----------------------------
