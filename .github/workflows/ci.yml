@@ -9,9 +9,6 @@ jobs:
   ci:
     runs-on: ubuntu-latest
 
-    env:
-      # MGC_DB will be set dynamically after we build/copy the fixture DB
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -103,7 +100,6 @@ jobs:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
           # Use the runtime-set env var (NOT ${{ runner.temp }} here)
-          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_DB: ${{ env.MGC_DB }}
         run: |
