@@ -1813,6 +1813,70 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         )
     return 0
 
+def cmd_run_tail(args: argparse.Namespace) -> int:
+    evidence_dir = Path(
+        args.out_dir
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).resolve()
+
+    kind = args.type  # drop | weekly | any
+    n = int(args.n or 1)
+
+    if not evidence_dir.exists():
+        sys.stdout.write(stable_json_dumps({
+            "found": False,
+            "reason": "evidence_dir_missing",
+            "path": str(evidence_dir),
+        }) + "\n")
+        return 0
+
+    patterns = []
+    if kind == "drop":
+        patterns = ["drop_evidence*.json"]
+    elif kind == "weekly":
+        patterns = ["weekly_evidence*.json"]
+    else:
+        patterns = ["drop_evidence*.json", "weekly_evidence*.json"]
+
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(evidence_dir.glob(pat))
+
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    if not files:
+        sys.stdout.write(stable_json_dumps({
+            "found": False,
+            "reason": "no_evidence_files",
+            "path": str(evidence_dir),
+        }) + "\n")
+        return 0
+
+    selected = files[:n]
+    items: List[Dict[str, Any]] = []
+
+    for p in selected:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            payload = {"error": str(e)}
+
+        items.append({
+            "file": str(p),
+            "mtime": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+            "payload": payload,
+        })
+
+    out = {
+        "found": True,
+        "count": len(items),
+        "items": items,
+    }
+
+    sys.stdout.write(stable_json_dumps(out) + "\n")
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # Weekly run (7 dailies + publish + manifest + consolidated evidence)
@@ -2390,6 +2454,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)")
     run_p.set_defaults(_mgc_group="run")
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
+
+    tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
+    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
+    tail.add_argument("--json", action="store_true", help="JSON output (default)")
+    tail.set_defaults(func=cmd_run_tail)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
