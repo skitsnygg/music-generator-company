@@ -1008,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
 
-    # -------- run pipeline --------
+    # -------- run / web / publish --------
     try:
         from mgc.run_cli import register_run_subcommand  # type: ignore
     except Exception:
