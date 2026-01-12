@@ -2510,117 +2510,418 @@ def _load_manifest(path: Path) -> Dict[str, Any]:
         "entries": by_path,
     }
 
+def _manifest_entries_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Return {path -> entry_dict} for manifest["entries"].
+    Each entry is expected to have: path, sha256, size (size optional).
+    """
+    entries = manifest.get("entries", [])
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(entries, list):
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            p = e.get("path")
+            if isinstance(p, str) and p:
+                out[p] = e
+    return out
+
+
+def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Diff two manifest objects.
+    Returns:
+      {
+        "added":    [{"path":..., "sha256":..., "size":...}, ...],
+        "removed":  [{"path":..., "sha256":..., "size":...}, ...],
+        "modified": [{"path":..., "a": {...}, "b": {...}}, ...],
+      }
+    """
+    am = _manifest_entries_map(a)
+    bm = _manifest_entries_map(b)
+
+    a_paths = set(am.keys())
+    b_paths = set(bm.keys())
+
+    added_paths = sorted(b_paths - a_paths)
+    removed_paths = sorted(a_paths - b_paths)
+    common_paths = sorted(a_paths & b_paths)
+
+    added: List[Dict[str, Any]] = []
+    removed: List[Dict[str, Any]] = []
+    modified: List[Dict[str, Any]] = []
+
+    for p in added_paths:
+        e = bm[p]
+        added.append(
+            {
+                "path": p,
+                "sha256": e.get("sha256"),
+                "size": e.get("size"),
+            }
+        )
+
+    for p in removed_paths:
+        e = am[p]
+        removed.append(
+            {
+                "path": p,
+                "sha256": e.get("sha256"),
+                "size": e.get("size"),
+            }
+        )
+
+    for p in common_paths:
+        ea = am[p]
+        eb = bm[p]
+        if (ea.get("sha256") != eb.get("sha256")) or (ea.get("size") != eb.get("size")):
+            modified.append(
+                {
+                    "path": p,
+                    "a": {"sha256": ea.get("sha256"), "size": ea.get("size")},
+                    "b": {"sha256": eb.get("sha256"), "size": eb.get("size")},
+                }
+            )
+
+    return {"added": added, "removed": removed, "modified": modified}
+
+def _find_manifest_files(evidence_dir: Path, *, type_filter: str = "any") -> List[Path]:
+    """
+    Return manifest files newest-first from evidence_dir.
+
+    type_filter:
+      - "drop":   only manifest*.json (excludes weekly_manifest*.json)
+      - "weekly": only weekly_manifest*.json
+      - "any":    both
+    """
+    if not isinstance(evidence_dir, Path):
+        evidence_dir = Path(str(evidence_dir))
+
+    if not evidence_dir.exists() or not evidence_dir.is_dir():
+        return []
+
+    # We only care about manifest JSON files written by run drop/weekly.
+    # Names we expect:
+    #   manifest.json
+    #   manifest_<drop_id>.json
+    #   weekly_manifest.json
+    #   weekly_manifest_<weekly_run_id>.json
+    paths: List[Path] = []
+    for p in evidence_dir.glob("*manifest*.json"):
+        if not p.is_file():
+            continue
+        name = p.name
+        is_weekly = name.startswith("weekly_manifest")
+        is_drop = name.startswith("manifest") and not is_weekly
+
+        if type_filter == "weekly" and not is_weekly:
+            continue
+        if type_filter == "drop" and not is_drop:
+            continue
+
+        paths.append(p)
+
+    def _mtime_key(p: Path) -> Tuple[float, str]:
+        try:
+            return (p.stat().st_mtime, p.name)
+        except Exception:
+            return (0.0, p.name)
+
+    # newest-first
+    paths.sort(key=_mtime_key, reverse=True)
+    return paths
+
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _resolve_since_ok_manifest_path(evidence_dir: Path) -> Optional[Path]:
+    """
+    Pick an "older" manifest from the most recent run that has NO stage errors in the DB.
+
+    Strategy:
+      - Scan evidence JSON files (drop_evidence*.json, weekly_evidence*.json) newest-first
+      - For each, extract run_id / weekly_run_id and manifest_path
+      - Query run_stages for that run_id; if no rows with status='error', accept
+      - Return manifest path as a Path (absolute if evidence wrote absolute; else relative to evidence_dir)
+    """
+    db_path = os.environ.get("MGC_DB") or "data/db.sqlite"
+
+    # Prefer most recent evidence files
+    candidates: List[Path] = []
+    try:
+        candidates.extend(sorted(evidence_dir.glob("drop_evidence*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
+        candidates.extend(sorted(evidence_dir.glob("weekly_evidence*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
+    except Exception:
+        candidates = []
+
+    if not candidates:
+        return None
+
+    con = None
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+
+        for ev_path in candidates:
+            ev = _read_json_file(ev_path)
+            if not isinstance(ev, dict):
+                continue
+
+            run_id = str(ev.get("run_id") or ev.get("weekly_run_id") or "").strip()
+            paths = ev.get("paths") if isinstance(ev.get("paths"), dict) else {}
+            manifest_raw = str(paths.get("manifest_path") or "").strip()
+
+            if not run_id or not manifest_raw:
+                continue
+
+            # If run_stages table doesn't exist (or other DB issue), we can't prove "ok".
+            try:
+                row = con.execute(
+                    "SELECT COUNT(1) AS n FROM run_stages WHERE run_id = ? AND LOWER(status) = 'error'",
+                    (run_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                continue
+
+            n_err = int(row["n"] if row and row["n"] is not None else 0)
+            if n_err != 0:
+                continue
+
+            mp = Path(manifest_raw)
+            if not mp.is_absolute():
+                mp = (evidence_dir / mp).resolve()
+
+            if mp.exists() and mp.is_file():
+                return mp
+
+        return None
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 def cmd_run_diff(args: argparse.Namespace) -> int:
+    """
+    Diff two manifests from the evidence dir.
+
+    Rules:
+      - If JSON mode is enabled (global or subcommand), emit EXACTLY one JSON object to stdout.
+      - In JSON mode, never print human summary to stdout (use stderr if needed).
+      - In non-JSON mode, print a single human summary line to stdout.
+      - --fail-on-changes returns exit code 2 if there are changes (respecting --allow).
+    """
+    # Treat JSON mode as "flag appears anywhere", because mgc.main has a global --json
+    # and run diff may also define a subcommand --json. This makes it bulletproof.
+    want_json = ("--json" in sys.argv) or bool(getattr(args, "json", False))
+
     evidence_dir = Path(
-        args.out_dir
-        or os.environ.get("MGC_EVIDENCE_DIR")
+        getattr(args, "out_dir", None)
+        or getattr(args, "evidence_dir", None)
+        or os.environ.get("MGC_EVIDENCE_DIR", "data/evidence")
         or "data/evidence"
     ).resolve()
 
+    type_filter = str(getattr(args, "type", None) or "any")
     fail_on_changes = bool(getattr(args, "fail_on_changes", False))
-
-    kind = args.type  # drop | weekly | any
-
     since = getattr(args, "since", None)
-    since_path = Path(str(since)).expanduser().resolve() if since else None
+    since_ok = bool(getattr(args, "since_ok", False))
+    summary_only = bool(getattr(args, "summary_only", False))
+    allow_list = getattr(args, "allow", None) or []
+    allow_set = {str(x) for x in allow_list if str(x).strip()}
 
-    if not evidence_dir.exists():
-        sys.stdout.write(stable_json_dumps({
-            "found": False,
-            "reason": "evidence_dir_missing",
-            "path": str(evidence_dir),
-        }) + "\n")
-        return 0
+    # Find newest-first
+    files = _find_manifest_files(evidence_dir, type_filter=type_filter)
 
-    patterns = []
-    if kind == "drop":
-        patterns = ["manifest*.json"]
-    elif kind == "weekly":
-        patterns = ["weekly_manifest*.json"]
-    else:
-        patterns = ["manifest*.json", "weekly_manifest*.json"]
+    # Pick (older=a, newer=b)
+    since_path: Optional[Path] = Path(since).resolve() if since else None
+    if since_ok and not since_path:
+        since_path = _resolve_since_ok_manifest_path(evidence_dir)
 
-    files: List[Path] = []
-    for pat in patterns:
-        files.extend(evidence_dir.glob(pat))
-
-    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
-    if since_path is not None:
-        if not since_path.exists():
-            sys.stdout.write(stable_json_dumps({
-                "found": False,
-                "reason": "since_manifest_missing",
-                "since": str(since_path),
-            }) + "\n")
-            return 0
+    if since_path:
         if not files:
-            sys.stdout.write(stable_json_dumps({
-                "found": False,
-                "reason": "no_manifests_found",
-                "path": str(evidence_dir),
-            }) + "\n")
+            out = {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
+            if want_json:
+                sys.stdout.write(stable_json_dumps(out) + "\n")
+            else:
+                sys.stdout.write(f"no manifests found in {evidence_dir}\n")
             return 0
-
         a_path, b_path = since_path, files[0]  # older=since, newer=latest
     else:
         if len(files) < 2:
-            sys.stdout.write(stable_json_dumps({
-                "found": False,
-                "reason": "need_at_least_two_manifests",
-                "count": len(files),
-            }) + "\n")
+            out = {"found": False, "reason": "need_at_least_two_manifests", "count": len(files), "path": str(evidence_dir)}
+            if want_json:
+                sys.stdout.write(stable_json_dumps(out) + "\n")
+            else:
+                sys.stdout.write("need at least two manifests\n")
             return 0
-
         a_path, b_path = files[1], files[0]  # older, newer
 
-    a_path, b_path = files[1], files[0]  # older, newer
     a = _load_manifest(a_path)
     b = _load_manifest(b_path)
+    diff = _diff_manifests(a, b)
 
-    a_entries = a["entries"]
-    b_entries = b["entries"]
+    # Expected diff shape:
+    # diff["added"] = [path...]
+    # diff["removed"] = [path...]
+    # diff["modified"] = [path...]
+    added = [str(p) for p in diff.get("added", [])]
+    removed = [str(p) for p in diff.get("removed", [])]
+    modified = [str(p) for p in diff.get("modified", [])]
 
-    added = sorted([p for p in b_entries.keys() if p not in a_entries])
-    removed = sorted([p for p in a_entries.keys() if p not in b_entries])
+    # Apply allow filter ONLY for failing logic (still report full diff)
+    def _not_allowed(p: str) -> bool:
+        return (p not in allow_set)
 
-    changed: Dict[str, Any] = {}
-    for p in sorted(set(a_entries.keys()) & set(b_entries.keys())):
-        if a_entries[p] != b_entries[p]:
-            changed[p] = {
-                "old": a_entries[p],
-                "new": b_entries[p],
-            }
+    added_na = [p for p in added if _not_allowed(p)]
+    removed_na = [p for p in removed if _not_allowed(p)]
+    modified_na = [p for p in modified if _not_allowed(p)]
 
-    out = {
+    changed_total = len(added) + len(removed) + len(modified)
+    changed_not_allowed = len(added_na) + len(removed_na) + len(modified_na)
+
+    summary_str = f"+{len(added)}  -{len(removed)}  ~{len(modified)}  (older={a_path.name} newer={b_path.name})"
+
+    out_obj = {
         "found": True,
-        "manifests": {
-            "older": {
-                "path": a["path"],
-                "root_tree_sha256": a.get("root_tree_sha256"),
-            },
-            "newer": {
-                "path": b["path"],
-                "root_tree_sha256": b.get("root_tree_sha256"),
-            },
-        },
-        "summary": {
-            "added": len(added),
-            "removed": len(removed),
-            "changed": len(changed),
-        },
-        "added": added,
-        "removed": removed,
-        "changed": changed,
+        "evidence_dir": str(evidence_dir),
+        "older": str(a_path),
+        "newer": str(b_path),
+        "summary": {"added": len(added), "removed": len(removed), "modified": len(modified)},
+        "changed_total": changed_total,
+        "allow": sorted(allow_set),
+        "not_allowed_summary": {"added": len(added_na), "removed": len(removed_na), "modified": len(modified_na)},
+        "items": {"added": added, "removed": removed, "modified": modified},
+        "not_allowed_items": {"added": added_na, "removed": removed_na, "modified": modified_na},
     }
 
-    sys.stdout.write(stable_json_dumps(out) + "\n")
+    # Output
+    if want_json:
+        # STRICT: exactly one JSON object to stdout
+        if summary_only:
+            # still JSON, but keep it compact
+            compact = {
+                "found": True,
+                "older": str(a_path),
+                "newer": str(b_path),
+                "summary": out_obj["summary"],
+                "not_allowed_summary": out_obj["not_allowed_summary"],
+                "allow": out_obj["allow"],
+            }
+            sys.stdout.write(stable_json_dumps(compact) + "\n")
+        else:
+            sys.stdout.write(stable_json_dumps(out_obj) + "\n")
+    else:
+        # human
+        sys.stdout.write(summary_str + "\n")
+        if not summary_only and changed_total:
+            # print details in human mode
+            for p in added:
+                sys.stdout.write(f"+ {p}\n")
+            for p in removed:
+                sys.stdout.write(f"- {p}\n")
+            for p in modified:
+                sys.stdout.write(f"~ {p}\n")
 
-    if fail_on_changes:
-        if out["summary"]["added"] or out["summary"]["removed"] or out["summary"]["changed"]:
-            return 2
-
+    # Exit code policy
+    if fail_on_changes and changed_not_allowed > 0:
+        return 2
     return 0
+
+def _stage_status_okish(s: Any) -> bool:
+    v = str(s or "").strip().lower()
+    return v in ("ok", "skipped")
+
+
+def _run_is_okish(con: sqlite3.Connection, run_id: str) -> bool:
+    # If run_stages table missing, we can't verify; treat as not-okish for safety.
+    try:
+        con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_stages' LIMIT 1").fetchone()
+    except Exception:
+        return False
+
+    rows = con.execute(
+        "SELECT stage, status FROM run_stages WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+
+    if not rows:
+        return False
+
+    # Hard fail if any error
+    for r in rows:
+        if str(r["status"] or "").strip().lower() == "error":
+            return False
+
+    # Prefer runs that at least have manifest + evidence ok/skipped
+    st = {str(r["stage"]): r["status"] for r in rows}
+    if "manifest" in st and "evidence" in st:
+        return _stage_status_okish(st["manifest"]) and _stage_status_okish(st["evidence"])
+
+    # Otherwise "no errors" is acceptable
+    return True
+
+
+def _evidence_run_id_from_manifest_path(manifest_path: Path) -> Optional[str]:
+    # We infer run_id by looking for a sibling evidence JSON that references this manifest_path.
+    # This avoids needing filename conventions.
+    try:
+        evidence_dir = manifest_path.parent
+        candidates = list(evidence_dir.glob("drop_evidence*.json")) + list(evidence_dir.glob("weekly_evidence*.json"))
+        candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+        for ev in candidates:
+            try:
+                payload = json.loads(ev.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                paths = payload.get("paths", {})
+                if isinstance(paths, dict) and str(paths.get("manifest_path") or "") == str(manifest_path):
+                    # weekly evidence uses weekly_run_id; drop evidence uses run_id
+                    rid = payload.get("run_id") or payload.get("weekly_run_id")
+                    if rid:
+                        return str(rid)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _pick_since_ok_manifest(
+    *,
+    db_path: str,
+    evidence_dir: Path,
+    manifest_files_newest_first: List[Path],
+) -> Optional[Path]:
+    # Choose the most recent manifest (NOT the newest one) whose run has no stage errors.
+    # We skip index 0 because that's the newest "b" side.
+    if len(manifest_files_newest_first) < 2:
+        return None
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        for mp in manifest_files_newest_first[1:]:
+            run_id = _evidence_run_id_from_manifest_path(mp)
+            if not run_id:
+                continue
+            try:
+                if _run_is_okish(con, run_id):
+                    return mp
+            except Exception:
+                continue
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2651,6 +2952,15 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any changes are detected (CI)")
     diff.add_argument("--json", action="store_true", help="JSON output (default)")
     diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
+    diff.add_argument("--since-ok", action="store_true", help="Auto-pick an older manifest from the most recent run with no stage errors")
+    diff.add_argument("--summary-only", action="store_true", help="Only output counts (+ added / - removed / ~ modified). Still JSON if --json is set.",)
+    diff.add_argument("--evidence-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence directory")
+    diff.add_argument(
+        "--allow",
+        action="append",
+        default=None,
+        help="Allow specific changed manifest paths (repeatable). When set with --fail-on-changes, only non-allowed changes fail.",
+    )
     diff.set_defaults(func=cmd_run_diff)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
