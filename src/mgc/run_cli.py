@@ -51,7 +51,6 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    # rows: (cid, name, type, notnull, dflt_value, pk)
     return [r[1] for r in rows]
 
 
@@ -74,6 +73,29 @@ def _try_json_loads(s: Any) -> Any:
         except Exception:
             return None
     return None
+
+
+def _is_truthy_env(name: str) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _deterministic_published_at(stamp: str) -> str:
+    """
+    Deterministic timestamp for receipts.
+
+    Precedence:
+      1) SOURCE_DATE_EPOCH (standard for reproducible builds)
+      2) stamp-based midnight UTC: YYYY-MM-DDT00:00:00+00:00
+    """
+    sde = (os.environ.get("SOURCE_DATE_EPOCH") or "").strip()
+    if sde:
+        try:
+            epoch = int(sde)
+            return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+    return f"{stamp}T00:00:00+00:00"
 
 
 @dataclass(frozen=True)
@@ -437,7 +459,7 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
 
 
 # ----------------------------
-# publish simulation + receipts (with audit mode)
+# publish simulation + receipts (deterministic)
 # ----------------------------
 
 def _simulated_permalink(platform: str, post_id: str) -> str:
@@ -481,8 +503,15 @@ def _load_marketing_posts(
     q = f"SELECT {', '.join(select_cols)} FROM marketing_posts "
     if where:
         q += "WHERE " + " AND ".join(where) + " "
-    if "created_at" in cols:
+
+    # Deterministic ordering
+    if "created_at" in cols and "id" in cols:
+        q += "ORDER BY datetime(created_at) ASC, id ASC "
+    elif "created_at" in cols:
         q += "ORDER BY datetime(created_at) ASC "
+    elif "id" in cols:
+        q += "ORDER BY id ASC "
+
     q += "LIMIT ?"
     params.append(int(limit))
 
@@ -509,7 +538,6 @@ def _update_marketing_post_status(
     if "status" not in cols:
         return
 
-    # idempotent: don't double-publish
     cur = conn.execute(
         "SELECT status FROM marketing_posts WHERE id = ? LIMIT 1",
         (post_id,),
@@ -547,6 +575,9 @@ def _update_marketing_post_status(
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
     stamp = (args.stamp or _stable_stamp_default()).strip()
+
+    deterministic = bool(args.deterministic) or _is_truthy_env("MGC_DETERMINISTIC")
+
     receipts_dir = Path(args.artifacts_dir) / "receipts" / stamp / "marketing"
     _ensure_dir(receipts_dir)
 
@@ -559,15 +590,16 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     if status_filter not in {"planned", "published", "any"}:
         raise SystemExit(f"invalid --status: {status_filter}")
 
-    published_at = _now_iso()
+    published_at = _deterministic_published_at(stamp) if deterministic else _now_iso()
+
+    # Deterministic: always overwrite receipts (filesystem state can't change outputs)
+    force = True if deterministic else bool(args.force)
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         posts = _load_marketing_posts(conn, limit=int(args.limit), status_filter=status_filter)
 
         results: List[Dict[str, Any]] = []
-        written = 0
-        skipped_existing = 0
 
         for p in posts:
             post_id = str(p.get("id", ""))
@@ -599,12 +631,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             }
 
             out = receipts_dir / platform.lower() / f"{post_id}.json"
-
-            if out.exists() and not args.force:
-                skipped_existing += 1
+            if out.exists() and not force:
+                pass
             else:
                 _write_json(out, receipt)
-                written += 1
 
             if args.commit:
                 _update_marketing_post_status(conn, post_id=post_id, new_status="published", published_at=published_at)
@@ -617,25 +647,23 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                     "receipt_path": str(out),
                     "permalink": receipt["permalink"],
                     "committed": bool(args.commit),
-                    "receipt_written": (not out.exists()) or bool(args.force),
                 }
             )
 
         if args.commit:
             conn.commit()
 
-    summary = {
+    summary: Dict[str, Any] = {
         "db": str(db_path),
         "stamp": stamp,
         "published_at": published_at,
         "status_filter": status_filter,
         "limit": int(args.limit),
         "commit": bool(args.commit),
-        "force": bool(args.force),
+        "deterministic": deterministic,
+        "force": force,
         "receipts_dir": str(receipts_dir),
         "rows_selected": len(posts),
-        "receipts_written": written,
-        "receipts_skipped_existing": skipped_existing,
         "results": results,
     }
 
@@ -644,7 +672,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     else:
         print(
             f"[publish marketing] status={status_filter} selected={len(posts)} "
-            f"written={written} skipped_existing={skipped_existing} commit={bool(args.commit)}"
+            f"commit={bool(args.commit)} deterministic={deterministic} receipts_dir={receipts_dir}"
         )
 
     return 0
@@ -711,7 +739,6 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pm.add_argument("--stamp", default=None, help="Receipt stamp (default: UTC date YYYY-MM-DD)")
     pm.add_argument("--limit", type=int, default=50)
 
-    # Filters
     pm.add_argument(
         "--status",
         default=None,
@@ -720,8 +747,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     )
     pm.add_argument("--only-planned", action="store_true", help="Legacy alias for --status planned")
 
-    # Actions
     pm.add_argument("--commit", action="store_true", help="Update DB status to published (still simulated)")
     pm.add_argument("--force", action="store_true", help="Overwrite receipts if they already exist")
+    pm.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Deterministic receipts (stable published_at + stable ordering + always overwrite). "
+             "Also enabled by MGC_DETERMINISTIC=1. Uses SOURCE_DATE_EPOCH if set.",
+    )
     pm.add_argument("--json", action="store_true")
     pm.set_defaults(func=cmd_publish_marketing)
