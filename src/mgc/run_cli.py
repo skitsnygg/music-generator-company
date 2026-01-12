@@ -10,11 +10,12 @@ import os
 import socket
 import sqlite3
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 
 @contextlib.contextmanager
@@ -44,12 +45,14 @@ def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
 def deterministic_now_iso(deterministic: bool) -> str:
     fixed = (os.environ.get("MGC_FIXED_TIME") or "").strip()
     if fixed:
+        # epoch seconds
         try:
             if fixed.isdigit():
                 dt = datetime.fromtimestamp(int(fixed), tz=timezone.utc)
                 return dt.isoformat()
         except Exception:
             pass
+        # ISO8601
         try:
             dt = datetime.fromisoformat(fixed.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -180,7 +183,7 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-def die(msg: str, code: int = 2) -> "NoReturn":
+def die(msg: str, code: int = 2) -> NoReturn:
     eprint(msg)
     raise SystemExit(code)
 
@@ -348,7 +351,6 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON;")
 
-    # Canonical runs table (run_key -> run_id)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -371,7 +373,6 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
         """
     )
 
-    # Stage table reserved for next milestone step (resume/observability)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS run_stages (
@@ -431,7 +432,6 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
         )
         """
     )
-    # Drops: a first-class "release" tying daily run + track + marketing publish batch
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS drops (
@@ -449,6 +449,160 @@ def ensure_tables_minimal(con: sqlite3.Connection) -> None:
     )
     con.commit()
 
+
+# ---------------------------------------------------------------------------
+# Run stage tracking (resume/observability)
+# ---------------------------------------------------------------------------
+
+def _json_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _json_merge(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out
+
+
+def db_stage_get(con: sqlite3.Connection, *, run_id: str, stage: str) -> Optional[sqlite3.Row]:
+    cols = db_table_columns(con, "run_stages")
+    if not cols:
+        return None
+    return con.execute(
+        "SELECT * FROM run_stages WHERE run_id = ? AND stage = ? LIMIT 1",
+        (run_id, stage),
+    ).fetchone()
+
+
+def db_stage_upsert(
+    con: sqlite3.Connection,
+    *,
+    run_id: str,
+    stage: str,
+    status: str,
+    started_at: Optional[str] = None,
+    ended_at: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    error: Optional[Dict[str, Any]] = None,
+    meta_patch: Optional[Dict[str, Any]] = None,
+) -> None:
+    ensure_tables_minimal(con)
+
+    existing = db_stage_get(con, run_id=run_id, stage=stage)
+    existing_meta: Dict[str, Any] = {}
+    if existing is not None:
+        raw = existing["meta_json"]
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    existing_meta = parsed
+            except Exception:
+                existing_meta = {}
+    merged_meta = _json_merge(existing_meta, meta_patch or {}) if (existing_meta or meta_patch) else {}
+
+    row_data: Dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage,
+        "status": status,
+    }
+    if started_at is not None:
+        row_data["started_at"] = started_at
+    if ended_at is not None:
+        row_data["ended_at"] = ended_at
+    if duration_ms is not None:
+        row_data["duration_ms"] = int(duration_ms)
+    if error is not None:
+        row_data["error_json"] = stable_json_dumps(error)
+    if meta_patch is not None or existing_meta:
+        row_data["meta_json"] = stable_json_dumps(merged_meta)
+
+    _insert_row(con, "run_stages", row_data)
+
+
+def stage_is_done(row: Optional[sqlite3.Row]) -> bool:
+    if row is None:
+        return False
+    s = str(row["status"] or "").lower()
+    return s in ("ok", "skipped")
+
+
+@contextlib.contextmanager
+def run_stage(
+    con: sqlite3.Connection,
+    *,
+    run_id: str,
+    stage: str,
+    deterministic: bool,
+    allow_resume: bool = True,
+    meta: Optional[Dict[str, Any]] = None,
+):
+    """
+    Stage context manager:
+      - If allow_resume and stage already ok/skipped: mark as skipped and do not run body.
+      - Otherwise: mark running, run body, then mark ok; on exception mark error.
+    """
+    ensure_tables_minimal(con)
+
+    existing = db_stage_get(con, run_id=run_id, stage=stage)
+    if allow_resume and stage_is_done(existing):
+        ts = deterministic_now_iso(deterministic)
+        db_stage_upsert(
+            con,
+            run_id=run_id,
+            stage=stage,
+            status="skipped",
+            started_at=ts,
+            ended_at=ts,
+            duration_ms=0,
+            meta_patch={"resume": True, "note": "already complete", **(meta or {})},
+        )
+        yield False
+        return
+
+    started_at = deterministic_now_iso(deterministic)
+    t0 = time.perf_counter()
+
+    db_stage_upsert(
+        con,
+        run_id=run_id,
+        stage=stage,
+        status="running",
+        started_at=started_at,
+        meta_patch={"resume": False, **(meta or {})},
+    )
+
+    try:
+        yield True
+    except Exception as e:
+        ended_at = deterministic_now_iso(deterministic)
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        db_stage_upsert(
+            con,
+            run_id=run_id,
+            stage=stage,
+            status="error",
+            ended_at=ended_at,
+            duration_ms=dur_ms,
+            error={"type": type(e).__name__, "message": str(e)},
+        )
+        raise
+    else:
+        ended_at = deterministic_now_iso(deterministic)
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        db_stage_upsert(
+            con,
+            run_id=run_id,
+            stage=stage,
+            status="ok",
+            ended_at=ended_at,
+            duration_ms=dur_ms,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Marketing schema-tolerant helpers
+# ---------------------------------------------------------------------------
 
 def _row_first(row: sqlite3.Row, candidates: Sequence[str], default: Any = "") -> Any:
     keys = set(row.keys())
@@ -520,7 +674,6 @@ def _extract_inner_content_from_blob(s: str) -> Optional[str]:
 def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
     cols = row.keys()
 
-    # 1) explicit content-like columns
     content_col = _detect_marketing_content_col(cols)
     if content_col:
         v = row[content_col]
@@ -530,7 +683,6 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
         inner = _extract_inner_content_from_blob(s)
         return inner if inner is not None else s
 
-    # 2) best available TEXT-ish payload column (schema unknown)
     best_payload = _best_text_payload_column(
         con,
         "marketing_posts",
@@ -548,7 +700,6 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
             inner = _extract_inner_content_from_blob(s)
             return inner if inner is not None else s
 
-    # 3) meta-ish columns
     meta_col = _detect_marketing_meta_col(cols)
     if meta_col:
         meta = _load_json_maybe(row[meta_col])
@@ -568,19 +719,14 @@ def _marketing_row_content(con: sqlite3.Connection, row: sqlite3.Row) -> str:
 
 
 def _marketing_row_meta(con: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, Any]:
-    """
-    Best-effort extraction of metadata for a marketing row across arbitrary schemas.
-    """
     cols = row.keys()
 
-    # Prefer explicit meta-ish column if it exists
     meta_col = _detect_marketing_meta_col(cols)
     if meta_col:
         meta = _load_json_maybe(row[meta_col])
         if meta:
             return meta
 
-    # Otherwise, attempt to parse the payload blob and see if it's a dict
     best_payload = _best_text_payload_column(
         con,
         "marketing_posts",
@@ -596,7 +742,6 @@ def _marketing_row_meta(con: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, 
         if meta:
             return meta
 
-    # Finally, try to parse the content string itself if it looks like JSON
     content = _marketing_row_content(con, row)
     meta = _load_json_maybe(content)
     if meta:
@@ -604,6 +749,10 @@ def _marketing_row_meta(con: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, 
 
     return {}
 
+
+# ---------------------------------------------------------------------------
+# DB writes for events/tracks/drops/marketing
+# ---------------------------------------------------------------------------
 
 def db_insert_event(con: sqlite3.Connection, *, event_id: str, ts: str, kind: str, actor: str, meta: Dict[str, Any]) -> None:
     _insert_row(
@@ -712,7 +861,6 @@ def db_insert_drop(
     if meta_col:
         data[meta_col] = stable_json_dumps(meta)
 
-    # Also add common column names for schema variance
     data.update(
         {
             "context": context,
@@ -755,7 +903,6 @@ def db_drop_mark_published(
     if not patch:
         return 0
 
-    # Update all drops with this run_id (should be 1, but keep it tolerant)
     sql = f"UPDATE drops SET {', '.join([f'{k} = ?' for k in sorted(patch.keys())])} WHERE {run_col} = ?"
     params = [patch[k] for k in sorted(patch.keys())] + [run_id]
     cur = con.execute(sql, params)
@@ -993,7 +1140,14 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
 # Daily run (deterministic orchestrator)
 # ---------------------------------------------------------------------------
 
-def _maybe_call_external_daily_runner(*, db_path: str, context: str, seed: str, deterministic: bool, ts: str) -> Optional[Dict[str, Any]]:
+def _maybe_call_external_daily_runner(
+    *,
+    db_path: str,
+    context: str,
+    seed: str,
+    deterministic: bool,
+    ts: str
+) -> Optional[Dict[str, Any]]:
     candidates: List[Tuple[str, str]] = [
         ("mgc.daily", "run_daily"),
         ("mgc.music_agent", "run_daily"),
@@ -1045,7 +1199,15 @@ def _stub_daily_run(
     artifact_path = (Path.cwd() / artifact_rel).resolve()
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = {"track_id": track_id, "run_id": run_id, "drop_id": drop_id, "context": context, "seed": seed, "ts": ts, "provider": provider}
+    payload = {
+        "track_id": track_id,
+        "run_id": run_id,
+        "drop_id": drop_id,
+        "context": context,
+        "seed": seed,
+        "ts": ts,
+        "provider": provider,
+    }
     artifact_bytes = stable_json_dumps(payload).encode("utf-8")
     artifact_path.write_bytes(artifact_bytes)
 
@@ -1061,7 +1223,6 @@ def _stub_daily_run(
         meta={"run_id": run_id, "drop_id": drop_id, "deterministic": deterministic, "seed": seed, "context": context},
     )
 
-    # Insert the drop *before* marketing so it exists even if later steps fail
     db_insert_drop(
         con,
         drop_id=drop_id,
@@ -1070,7 +1231,14 @@ def _stub_daily_run(
         seed=seed,
         run_id=run_id,
         track_id=track_id,
-        meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic, "seed": seed, "context": context},
+        meta={
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "track_id": track_id,
+            "deterministic": deterministic,
+            "seed": seed,
+            "context": context,
+        },
     )
 
     db_insert_event(
@@ -1143,9 +1311,9 @@ def _stub_daily_run(
         },
         "marketing_drafts": [{"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)],
     }
+
     evidence_path = out_dir / ("daily_evidence.json" if deterministic else f"daily_evidence_{run_id}.json")
     evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
-
     return evidence
 
 
@@ -1185,7 +1353,6 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         drop_id = str(maybe.get("drop_id") or stable_uuid5("drop", run_id))
         track_id = str(maybe.get("track_id") or maybe.get("track", {}).get("id") or "")
 
-        # Ensure a drop exists even with an external runner
         db_insert_drop(
             con,
             drop_id=drop_id,
@@ -1220,7 +1387,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             },
         )
         out = dict(maybe)
-        out.setdefault("run_id", run_id)  # canonical
+        out.setdefault("run_id", run_id)
         out.setdefault("run_date", run_date)
         out.setdefault("provider_set_version", provider_set_version)
         sys.stdout.write(stable_json_dumps(out) + "\n")
@@ -1239,148 +1406,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run_drop(args: argparse.Namespace) -> int:
-    """
-    Product-level command: daily + publish-marketing + manifest + consolidated evidence.
-
-    Guarantees:
-      - stdout emits exactly ONE JSON object (so `json.tool` works)
-      - deterministic under --deterministic / MGC_DETERMINISTIC=1 (and MGC_FIXED_TIME)
-      - persists evidence/manifest pointers into drops.meta_json
-    """
-    deterministic = is_deterministic(args)
-
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
-    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
-    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
-
-    limit = int(getattr(args, "limit", None) or 50)
-    dry_run = bool(getattr(args, "dry_run", False))
-
-    ts = deterministic_now_iso(deterministic)
-    run_date = ts.split("T", 1)[0]
-
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Silence subcommand stdout so run drop outputs exactly one JSON object.
-    with _silence_stdout(True):
-        daily_ns = argparse.Namespace(
-            db=db_path,
-            context=context,
-            seed=seed,
-            out_dir=str(out_dir),
-            deterministic=deterministic,
-            json=False,
-        )
-        cmd_run_daily(daily_ns)
-
-    with _silence_stdout(True):
-        pub_ns = argparse.Namespace(
-            db=db_path,
-            limit=limit,
-            dry_run=dry_run,
-            deterministic=deterministic,
-            json=False,
-        )
-        cmd_publish_marketing(pub_ns)
-
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-
-    # STEP 4: resolve canonical run_id for THIS drop run_key
-    run_id = db_get_or_create_run_id(
-        con,
-        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
-        ts=ts,
-        argv=list(sys.argv),
-    )
-
-    drop_row = con.execute(
-        "SELECT * FROM drops WHERE run_id = ? ORDER BY ts DESC, id DESC LIMIT 1",
-        (run_id,),
-    ).fetchone()
-    drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
-
-    drop_id = str(drop_obj.get("id") or stable_uuid5("drop", run_id))
-
-    out_path = out_dir / ("drop_evidence.json" if deterministic else f"drop_evidence_{drop_id}.json")
-    manifest_path = out_dir / ("manifest.json" if deterministic else f"manifest_{drop_id}.json")
-
-    # Run manifest via existing cmd_run_manifest (silenced)
-    with _silence_stdout(True):
-        manifest_ns = argparse.Namespace(
-            repo_root=str(getattr(args, "repo_root", None) or "."),
-            out=str(manifest_path),
-            print_hash=False,
-            include=getattr(args, "include", None),
-            exclude=getattr(args, "exclude", None),
-            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
-            max_file_bytes=getattr(args, "max_file_bytes", None),
-            deterministic=deterministic,
-            db=db_path,
-            json=False,
-        )
-        cmd_run_manifest(manifest_ns)
-
-    manifest_sha256 = _sha256_file(manifest_path)
-
-    evidence: Dict[str, Any] = {
-        "ts": ts,
-        "deterministic": deterministic,
-        "run_key": {
-            "run_date": run_date,
-            "context": context,
-            "seed": seed,
-            "provider_set_version": provider_set_version,
-        },
-        "run_id": run_id,
-        "drop": {
-            "id": drop_obj.get("id") or drop_id,
-            "run_id": drop_obj.get("run_id") or run_id,
-            "track_id": drop_obj.get("track_id"),
-            "marketing_batch_id": drop_obj.get("marketing_batch_id"),
-            "published_ts": drop_obj.get("published_ts"),
-        },
-        "paths": {
-            "evidence_path": str(out_path),
-            "manifest_path": str(manifest_path),
-            "manifest_sha256": manifest_sha256,
-        },
-    }
-
-    # Write consolidated evidence (stable newlines)
-    out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
-
-    # Persist pointers in drops.meta_json
-    if drop_obj.get("id"):
-        existing_meta: Dict[str, Any] = {}
-        meta_raw = drop_obj.get("meta_json")
-        if isinstance(meta_raw, str) and meta_raw.strip():
-            try:
-                existing_meta = json.loads(meta_raw)
-                if not isinstance(existing_meta, dict):
-                    existing_meta = {}
-            except Exception:
-                existing_meta = {}
-
-        existing_meta.update(evidence["paths"])
-        existing_meta.update({"run_id": run_id, "run_key": evidence["run_key"]})
-
-        con.execute(
-            "UPDATE drops SET meta_json = ? WHERE id = ?",
-            (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
-        )
-        con.commit()
-
-    # Emit exactly one JSON object
-    sys.stdout.write(stable_json_dumps(evidence) + "\n")
-    return 0
-
-
 # ---------------------------------------------------------------------------
-# Marketing publish (deterministic) -- skips empty drafts, updates drops
+# Marketing publish (deterministic)
 # ---------------------------------------------------------------------------
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
@@ -1494,11 +1521,307 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Drop (daily + publish + manifest) with stages and resume semantics
+# ---------------------------------------------------------------------------
+
+def cmd_run_drop(args: argparse.Namespace) -> int:
+    """
+    Product-level command: daily + publish-marketing + manifest + consolidated evidence.
+
+    Guarantees:
+      - stdout emits exactly ONE JSON object (so `json.tool` works)
+      - deterministic under --deterministic / MGC_DETERMINISTIC=1 (and MGC_FIXED_TIME)
+      - stages recorded into run_stages (daily, publish_marketing, manifest, evidence)
+      - resume: skips stages already ok/skipped, unless --no-resume
+    """
+    deterministic = is_deterministic(args)
+
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
+    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
+
+    limit = int(getattr(args, "limit", None) or 50)
+    dry_run = bool(getattr(args, "dry_run", False))
+    allow_resume = not bool(getattr(args, "no_resume", False))
+
+    ts = deterministic_now_iso(deterministic)
+    run_date = ts.split("T", 1)[0]
+
+    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    run_id = db_get_or_create_run_id(
+        con,
+        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
+        ts=ts,
+        argv=list(sys.argv),
+    )
+
+    # Stage 1: daily
+    with run_stage(
+        con,
+        run_id=run_id,
+        stage="daily",
+        deterministic=deterministic,
+        allow_resume=allow_resume,
+        meta={"context": context, "seed": seed},
+    ) as should_run:
+        if should_run:
+            with _silence_stdout(True):
+                daily_ns = argparse.Namespace(
+                    db=db_path,
+                    context=context,
+                    seed=seed,
+                    out_dir=str(out_dir),
+                    deterministic=deterministic,
+                )
+                cmd_run_daily(daily_ns)
+
+    # Stage 2: publish-marketing
+    with run_stage(
+        con,
+        run_id=run_id,
+        stage="publish_marketing",
+        deterministic=deterministic,
+        allow_resume=allow_resume,
+        meta={"limit": limit, "dry_run": dry_run},
+    ) as should_run:
+        if should_run:
+            with _silence_stdout(True):
+                pub_ns = argparse.Namespace(
+                    db=db_path,
+                    limit=limit,
+                    dry_run=dry_run,
+                    deterministic=deterministic,
+                )
+                cmd_publish_marketing(pub_ns)
+
+    # Resolve latest drop row for pointers
+    drop_row = con.execute(
+        "SELECT * FROM drops WHERE run_id = ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
+    drop_id = str(drop_obj.get("id") or stable_uuid5("drop", run_id))
+
+    out_path = out_dir / ("drop_evidence.json" if deterministic else f"drop_evidence_{drop_id}.json")
+    manifest_path = out_dir / ("manifest.json" if deterministic else f"manifest_{drop_id}.json")
+
+    # Stage 3: manifest
+    with run_stage(
+        con,
+        run_id=run_id,
+        stage="manifest",
+        deterministic=deterministic,
+        allow_resume=allow_resume,
+        meta={"repo_root": str(getattr(args, "repo_root", None) or ".")},
+    ) as should_run:
+        if should_run:
+            with _silence_stdout(True):
+                manifest_ns = argparse.Namespace(
+                    repo_root=str(getattr(args, "repo_root", None) or "."),
+                    out=str(manifest_path),
+                    print_hash=False,
+                    include=getattr(args, "include", None),
+                    exclude=getattr(args, "exclude", None),
+                )
+                cmd_run_manifest(manifest_ns)
+
+    manifest_sha256 = _sha256_file(manifest_path)
+
+    # Stage 4: evidence write + persist pointers
+    with run_stage(
+        con,
+        run_id=run_id,
+        stage="evidence",
+        deterministic=deterministic,
+        allow_resume=allow_resume,
+        meta={"evidence_path": str(out_path), "manifest_path": str(manifest_path)},
+    ) as should_run:
+        if should_run:
+            evidence: Dict[str, Any] = {
+                "ts": ts,
+                "deterministic": deterministic,
+                "run_key": {
+                    "run_date": run_date,
+                    "context": context,
+                    "seed": seed,
+                    "provider_set_version": provider_set_version,
+                },
+                "run_id": run_id,
+                "drop": {
+                    "id": drop_obj.get("id") or drop_id,
+                    "run_id": drop_obj.get("run_id") or run_id,
+                    "track_id": drop_obj.get("track_id"),
+                    "marketing_batch_id": drop_obj.get("marketing_batch_id"),
+                    "published_ts": drop_obj.get("published_ts"),
+                },
+                "paths": {
+                    "evidence_path": str(out_path),
+                    "manifest_path": str(manifest_path),
+                    "manifest_sha256": manifest_sha256,
+                },
+                "stages": {
+                    "allow_resume": allow_resume,
+                },
+            }
+
+            out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
+
+            if drop_obj.get("id"):
+                existing_meta: Dict[str, Any] = {}
+                meta_raw = drop_obj.get("meta_json")
+                if isinstance(meta_raw, str) and meta_raw.strip():
+                    try:
+                        existing_meta = json.loads(meta_raw)
+                        if not isinstance(existing_meta, dict):
+                            existing_meta = {}
+                    except Exception:
+                        existing_meta = {}
+
+                existing_meta.update(evidence["paths"])
+                existing_meta.update({"run_id": run_id, "run_key": evidence["run_key"]})
+
+                con.execute(
+                    "UPDATE drops SET meta_json = ? WHERE id = ?",
+                    (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
+                )
+                con.commit()
+
+    # Emit exactly one JSON object (re-read evidence file if it exists)
+    try:
+        sys.stdout.write(out_path.read_text(encoding="utf-8"))
+    except Exception:
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "ts": ts,
+                    "deterministic": deterministic,
+                    "run_id": run_id,
+                    "drop_id": drop_id,
+                    "paths": {
+                        "evidence_path": str(out_path),
+                        "manifest_path": str(manifest_path),
+                        "manifest_sha256": manifest_sha256,
+                    },
+                }
+            )
+            + "\n"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run stage CLI (set/get/list) for resume + debugging
+# ---------------------------------------------------------------------------
+
+def cmd_run_stage_set(args: argparse.Namespace) -> int:
+    deterministic = is_deterministic(args)
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    run_id = str(args.run_id).strip()
+    stage = str(args.stage).strip()
+    status = str(args.status).strip().lower()
+
+    if not run_id:
+        die("run_id required")
+    if not stage:
+        die("stage required")
+    if status not in ("pending", "running", "ok", "error", "skipped"):
+        die("status must be one of: pending, running, ok, error, skipped")
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    started_at = args.started_at
+    ended_at = args.ended_at
+    duration_ms = args.duration_ms
+    if duration_ms is not None:
+        duration_ms = int(duration_ms)
+
+    error_obj: Optional[Dict[str, Any]] = None
+    if args.error_json:
+        try:
+            parsed = json.loads(args.error_json)
+            error_obj = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except Exception:
+            error_obj = {"raw": args.error_json}
+
+    meta_patch: Optional[Dict[str, Any]] = None
+    if args.meta_json:
+        try:
+            parsed = json.loads(args.meta_json)
+            meta_patch = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except Exception:
+            meta_patch = {"raw": args.meta_json}
+
+    if started_at is None and status in ("running", "ok", "error", "skipped"):
+        started_at = deterministic_now_iso(deterministic)
+    if ended_at is None and status in ("ok", "error", "skipped"):
+        ended_at = deterministic_now_iso(deterministic)
+
+    db_stage_upsert(
+        con,
+        run_id=run_id,
+        stage=stage,
+        status=status,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_ms=duration_ms,
+        error=error_obj,
+        meta_patch=meta_patch,
+    )
+
+    sys.stdout.write(
+        stable_json_dumps(
+            {
+                "ok": True,
+                "run_id": run_id,
+                "stage": stage,
+                "status": status,
+            }
+        )
+        + "\n"
+    )
+    return 0
+
+
+def cmd_run_stage_get(args: argparse.Namespace) -> int:
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    run_id = str(args.run_id).strip()
+    stage = str(args.stage).strip()
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+    row = db_stage_get(con, run_id=run_id, stage=stage)
+    if row is None:
+        sys.stdout.write(stable_json_dumps({"found": False, "run_id": run_id, "stage": stage}) + "\n")
+        return 1
+    sys.stdout.write(stable_json_dumps({"found": True, "item": dict(row)}) + "\n")
+    return 0
+
+
+def cmd_run_stage_list(args: argparse.Namespace) -> int:
+    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    run_id = str(args.run_id).strip()
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+    rows = con.execute(
+        "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
+        (run_id,),
+    ).fetchall()
+    sys.stdout.write(stable_json_dumps({"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, manifest)")
+    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, manifest, stage)")
     run_p.set_defaults(_mgc_group="run")
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
 
@@ -1517,13 +1840,16 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
     pub.set_defaults(func=cmd_publish_marketing)
 
-    drop = run_sub.add_parser("drop", help="Run daily + publish-marketing and emit consolidated drop evidence")
+    drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
     drop.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
     drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
     drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
     drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
+    drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
+    drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     drop.set_defaults(func=cmd_run_drop)
 
@@ -1534,10 +1860,33 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     man.add_argument("--print-hash", action="store_true", help="Print root_tree_sha256 to stderr")
     man.set_defaults(func=cmd_run_manifest)
 
+    stage = run_sub.add_parser("stage", help="Inspect or set run stage state (resume/observability)")
+    stage_sub = stage.add_subparsers(dest="stage_cmd", required=True)
 
-# ---------------------------------------------------------------------------
-# Standalone entry (optional)
-# ---------------------------------------------------------------------------
+    st_set = stage_sub.add_parser("set", help="Upsert a stage row")
+    st_set.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_set.add_argument("run_id", help="Canonical run_id")
+    st_set.add_argument("stage", help="Stage name (e.g. daily, publish_marketing, manifest, evidence)")
+    st_set.add_argument("status", help="pending|running|ok|error|skipped")
+    st_set.add_argument("--started-at", default=None, help="ISO8601 timestamp")
+    st_set.add_argument("--ended-at", default=None, help="ISO8601 timestamp")
+    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds")
+    st_set.add_argument("--error-json", default=None, help="JSON string for error details")
+    st_set.add_argument("--meta-json", default=None, help="JSON string to merge into meta_json")
+    st_set.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    st_set.set_defaults(func=cmd_run_stage_set)
+
+    st_get = stage_sub.add_parser("get", help="Get a stage row")
+    st_get.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_get.add_argument("run_id", help="Canonical run_id")
+    st_get.add_argument("stage", help="Stage name")
+    st_get.set_defaults(func=cmd_run_stage_get)
+
+    st_ls = stage_sub.add_parser("list", help="List all stages for a run_id")
+    st_ls.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_ls.add_argument("run_id", help="Canonical run_id")
+    st_ls.set_defaults(func=cmd_run_stage_list)
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mgc-run-cli", description="MGC run_cli helpers")
