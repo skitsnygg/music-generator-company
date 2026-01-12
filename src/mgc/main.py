@@ -899,6 +899,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # ... all your registrations ...
+    # tracks, marketing, analytics, run/web/publish, etc.
+
     # -------- rebuild --------
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
@@ -1011,10 +1014,12 @@ def build_parser() -> argparse.ArgumentParser:
     # -------- run / web / publish --------
     try:
         from mgc.run_cli import register_run_subcommand  # type: ignore
-    except Exception:
+    except Exception as e:
         register_run_subcommand = None  # type: ignore
-
-    if register_run_subcommand:
+        import traceback, sys
+        print("[mgc.main] FAILED to import mgc.run_cli:", file=sys.stderr)
+        traceback.print_exc()
+    else:
         register_run_subcommand(sub)
 
     return p
