@@ -2445,7 +2445,6 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     sys.stdout.write(stable_json_dumps(out) + "\n")
     return 0 if out["found"] else 1
 
-
 def cmd_run_open(args: argparse.Namespace) -> int:
     evidence_dir = Path(
         args.out_dir
@@ -2494,6 +2493,104 @@ def cmd_run_open(args: argparse.Namespace) -> int:
 
     return 0
 
+def _load_manifest(path: Path) -> Dict[str, Any]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    entries = obj.get("entries", []) if isinstance(obj, dict) else []
+    by_path = {}
+    for e in entries:
+        p = e.get("path")
+        if p:
+            by_path[p] = {
+                "sha256": e.get("sha256"),
+                "size": e.get("size"),
+            }
+    return {
+        "path": str(path),
+        "root_tree_sha256": obj.get("root_tree_sha256"),
+        "entries": by_path,
+    }
+
+
+def cmd_run_diff(args: argparse.Namespace) -> int:
+    evidence_dir = Path(
+        args.out_dir
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).resolve()
+
+    kind = args.type  # drop | weekly | any
+
+    if not evidence_dir.exists():
+        sys.stdout.write(stable_json_dumps({
+            "found": False,
+            "reason": "evidence_dir_missing",
+            "path": str(evidence_dir),
+        }) + "\n")
+        return 0
+
+    patterns = []
+    if kind == "drop":
+        patterns = ["manifest*.json"]
+    elif kind == "weekly":
+        patterns = ["weekly_manifest*.json"]
+    else:
+        patterns = ["manifest*.json", "weekly_manifest*.json"]
+
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(evidence_dir.glob(pat))
+
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    if len(files) < 2:
+        sys.stdout.write(stable_json_dumps({
+            "found": False,
+            "reason": "need_at_least_two_manifests",
+            "count": len(files),
+        }) + "\n")
+        return 0
+
+    a_path, b_path = files[1], files[0]  # older, newer
+    a = _load_manifest(a_path)
+    b = _load_manifest(b_path)
+
+    a_entries = a["entries"]
+    b_entries = b["entries"]
+
+    added = sorted([p for p in b_entries.keys() if p not in a_entries])
+    removed = sorted([p for p in a_entries.keys() if p not in b_entries])
+
+    changed: Dict[str, Any] = {}
+    for p in sorted(set(a_entries.keys()) & set(b_entries.keys())):
+        if a_entries[p] != b_entries[p]:
+            changed[p] = {
+                "old": a_entries[p],
+                "new": b_entries[p],
+            }
+
+    out = {
+        "found": True,
+        "manifests": {
+            "older": {
+                "path": a["path"],
+                "root_tree_sha256": a.get("root_tree_sha256"),
+            },
+            "newer": {
+                "path": b["path"],
+                "root_tree_sha256": b.get("root_tree_sha256"),
+            },
+        },
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+        },
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+    }
+
+    sys.stdout.write(stable_json_dumps(out) + "\n")
+    return 0
 
 # ---------------------------------------------------------------------------
 # Argparse wiring
@@ -2516,6 +2613,12 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
     open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
     open_p.set_defaults(func=cmd_run_open)
+
+    diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
+    diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
+    diff.add_argument("--json", action="store_true", help="JSON output (default)")
+    diff.set_defaults(func=cmd_run_diff)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
