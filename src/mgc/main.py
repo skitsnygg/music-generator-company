@@ -212,22 +212,41 @@ def _clear_all_non_root_handlers() -> None:
         logger_obj.propagate = True
 
 
-def _configure_logging(*, level: str, log_file: Optional[str], log_console: bool) -> None:
+def _configure_logging(
+    *,
+    level: str,
+    log_file: Optional[str],
+    log_console: bool,
+    json_mode: bool = False,
+) -> None:
+    """
+    Logging policy:
+    - Always log to file if --log-file is set.
+    - Console logs go to STDERR (never stdout).
+    - If json_mode is True, do NOT log to console at all (keep stdout pure JSON).
+    - If no log_file is set, default to console stderr.
+    - If log_file is set, console stderr is only enabled with --log-console.
+    """
     _clear_all_non_root_handlers()
 
     fmt = _UTCFormatter(LOG_FMT, datefmt=LOG_DATEFMT)
     handlers: List[logging.Handler] = []
 
+    # File handler (optional)
     if log_file:
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
         handlers.append(fh)
 
-        if log_console:
+    # Console handler (stderr only), disabled in JSON mode
+    if not json_mode:
+        if (not log_file) or log_console:
             sh = logging.StreamHandler(stream=sys.stderr)
             sh.setFormatter(fmt)
             handlers.append(sh)
-    else:
+
+    # If somehow no handlers got added, fall back to stderr (still not stdout)
+    if not handlers:
         sh = logging.StreamHandler(stream=sys.stderr)
         sh.setFormatter(fmt)
         handlers.append(sh)
@@ -962,8 +981,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 # rebuild commands (CI contract)
 # ----------------------------
 
-def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
-    return arg_db or global_db or os.environ.get("MGC_DB") or DEFAULT_DB
+def _resolve_db_path(global_db: str) -> str:
+    return global_db or os.environ.get("MGC_DB") or DEFAULT_DB
 
 
 def _resolve_artifacts_dir(default_out_dir: str) -> Path:
@@ -983,7 +1002,7 @@ def _determinism_check(builder) -> None:
 
 
 def cmd_rebuild_ls(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db_path = _resolve_db_path(args.db)
     db = DBConn(Path(db_path))
 
     out: Dict[str, Any] = {"db": str(db.path), "tables": [], "counts": {}}
@@ -1002,7 +1021,7 @@ def cmd_rebuild_ls(args: argparse.Namespace) -> int:
 
 def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.playlists")
-    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db_path = _resolve_db_path(args.db)
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
     if args.stamp:
@@ -1030,7 +1049,7 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
 
             written.append(str(out_path))
 
-    if _truthy(args.json, args.sub_json):
+    if args.json:
         print(json.dumps({"written": written}, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         for pth in written:
@@ -1040,7 +1059,7 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
 
 def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
     log = logging.getLogger("mgc.rebuild.tracks")
-    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db_path = _resolve_db_path(args.db)
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
     out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
 
@@ -1050,7 +1069,7 @@ def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
     db = DBConn(Path(db_path))
     with db.connect() as conn:
         if not _table_exists(conn, "tracks"):
-            if _truthy(args.json, args.sub_json):
+            if args.json:
                 print(json.dumps({"written": []}, indent=2, ensure_ascii=False, sort_keys=True))
             return 0
 
@@ -1073,7 +1092,7 @@ def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
         if args.write:
             write_json_file(out_path, data)
 
-    if _truthy(args.json, args.sub_json):
+    if args.json:
         print(json.dumps({"written": [str(out_path)]}, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         print(str(out_path))
@@ -1081,7 +1100,7 @@ def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
 
 
 def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db_path = _resolve_db_path(args.db)
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
     db = DBConn(Path(db_path))
@@ -1108,11 +1127,9 @@ def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
                 diffs.append({"path": str(path), "reason": "content_diff"})
 
     payload = {"diffs": diffs, "diff_count": len(diffs)}
-    if _truthy(args.json, args.sub_json):
-        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
-    else:
-        for d in diffs:
-            print(f"{d['path']} {d['reason']}")
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(
+        f"{d['path']} {d['reason']}" for d in diffs
+    ))
 
     if diffs and args.strict:
         return 2
@@ -1120,7 +1137,7 @@ def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
 
 
 def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
+    db_path = _resolve_db_path(args.db)
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
     out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
 
@@ -1155,11 +1172,9 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
                     diffs.append({"path": str(out_path), "reason": "content_diff"})
 
     payload = {"diffs": diffs, "diff_count": len(diffs)}
-    if _truthy(args.json, args.sub_json):
-        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
-    else:
-        for d in diffs:
-            print(f"{d['path']} {d['reason']}")
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(
+        f"{d['path']} {d['reason']}" for d in diffs
+    ))
 
     if diffs and args.strict:
         return 2
@@ -1173,6 +1188,7 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
 
+    # GLOBALS ONLY: do NOT repeat these on subparsers (argparse can overwrite globals with subparser defaults)
     p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
     p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
     p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
@@ -1190,46 +1206,36 @@ def build_parser() -> argparse.ArgumentParser:
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
 
     rls = rs.add_parser("ls", help="Show rebuild/status info (CI expects this)")
-    rls.add_argument("--db", default=None)
-    rls.add_argument("--json", dest="sub_json", action="store_true")
     rls.set_defaults(func=cmd_rebuild_ls)
 
     rp = rs.add_parser("playlists", help="Rebuild canonical playlist JSON files (CI)")
-    rp.add_argument("--db", default=None)
-    rp.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_PLAYLIST_DIR))))
+    rp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
     rp.add_argument("--stamp", default=None)
     rp.add_argument("--determinism-check", action="store_true")
     rp.add_argument("--write", action="store_true")
-    rp.add_argument("--json", dest="sub_json", action="store_true")
     rp.set_defaults(func=cmd_rebuild_playlists)
 
     rt = rs.add_parser("tracks", help="Rebuild canonical tracks export (CI)")
-    rt.add_argument("--db", default=None)
-    rt.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_TRACKS_DIR))))
+    rt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
     rt.add_argument("--stamp", default=None)
     rt.add_argument("--determinism-check", action="store_true")
     rt.add_argument("--write", action="store_true")
-    rt.add_argument("--json", dest="sub_json", action="store_true")
     rt.set_defaults(func=cmd_rebuild_tracks)
 
     rv = rs.add_parser("verify", help="Verify rebuilt outputs match DB + files (CI expects this)")
     rvs = rv.add_subparsers(dest="verify_cmd", required=True)
 
     rvp = rvs.add_parser("playlists", help="Verify playlists outputs")
-    rvp.add_argument("--db", default=None)
-    rvp.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_PLAYLIST_DIR))))
+    rvp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
     rvp.add_argument("--stamp", default=None)
     rvp.add_argument("--strict", action="store_true")
-    rvp.add_argument("--json", dest="sub_json", action="store_true")
     rvp.add_argument("rest", nargs=argparse.REMAINDER)
     rvp.set_defaults(func=cmd_rebuild_verify_playlists)
 
     rvt = rvs.add_parser("tracks", help="Verify tracks outputs")
-    rvt.add_argument("--db", default=None)
-    rvt.add_argument("--out-dir", default=str(_resolve_artifacts_dir(str(DEFAULT_TRACKS_DIR))))
+    rvt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
     rvt.add_argument("--stamp", default=None)
     rvt.add_argument("--strict", action="store_true")
-    rvt.add_argument("--json", dest="sub_json", action="store_true")
     rvt.add_argument("rest", nargs=argparse.REMAINDER)
     rvt.set_defaults(func=cmd_rebuild_verify_tracks)
 
@@ -1285,7 +1291,7 @@ def build_parser() -> argparse.ArgumentParser:
     mpl.add_argument("--limit", type=int, default=20)
     mpl.set_defaults(func=cmd_marketing_posts_list)
 
-    # -------- drops --------
+    # -------- drops (optional) --------
     try:
         from mgc.drops_cli import register_drops_subcommand  # type: ignore
     except Exception:
@@ -1293,7 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
     if register_drops_subcommand:
         register_drops_subcommand(sub)
 
-    # -------- analytics passthrough --------
+    # -------- analytics (optional) --------
     try:
         from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
     except Exception:
@@ -1301,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
 
-    # -------- web --------
+    # -------- web (optional) --------
     try:
         from mgc.web_cli import register_web_subcommand  # type: ignore
     except Exception:
@@ -1309,7 +1315,7 @@ def build_parser() -> argparse.ArgumentParser:
     if register_web_subcommand:
         register_web_subcommand(sub)
 
-    # -------- run --------
+    # -------- run (required) --------
     try:
         from mgc.run_cli import register_run_subcommand  # type: ignore
     except Exception as e:
@@ -1326,16 +1332,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cooked = _hoist_global_flags(raw)
     args = parser.parse_args(cooked)
 
-    _configure_logging(level=args.log_level, log_file=args.log_file, log_console=bool(args.log_console))
-
+    _configure_logging(
+        level=args.log_level,
+        log_file=args.log_file,
+        log_console=bool(args.log_console),
+        json_mode=bool(getattr(args, "json", False)),
+    )
     log = logging.getLogger("mgc")
     log.debug("argv=%s", sys.argv if argv is None else ["mgc", *argv])
     log.debug("db=%s", args.db)
-
-    # handy for subcommands that accept --db and also want to fall back to the global
-    setattr(args, "global_db", getattr(args, "db", None))
-    if not hasattr(args, "sub_json"):
-        setattr(args, "sub_json", False)
 
     func = getattr(args, "func", None)
     if not func:
