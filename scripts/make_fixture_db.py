@@ -32,10 +32,11 @@ def main() -> int:
         cur = con.cursor()
 
         # ------------------------------------------------------------------
-        # Schema: match CURRENT run_cli.py db_insert_* expectations
+        # Schema: match CURRENT run_cli.py expectations
         # ------------------------------------------------------------------
         cur.executescript(
             """
+            -- Tracks
             CREATE TABLE IF NOT EXISTS tracks (
               track_id TEXT PRIMARY KEY,
               ts TEXT NOT NULL,
@@ -46,7 +47,9 @@ def main() -> int:
               artifact_path TEXT,
               meta TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_tracks_ts ON tracks(ts);
 
+            -- Drops
             CREATE TABLE IF NOT EXISTS drops (
               drop_id TEXT PRIMARY KEY,
               ts TEXT NOT NULL,
@@ -56,7 +59,9 @@ def main() -> int:
               track_id TEXT,
               meta TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_drops_ts ON drops(ts);
 
+            -- Events
             CREATE TABLE IF NOT EXISTS events (
               event_id TEXT PRIMARY KEY,
               ts TEXT NOT NULL,
@@ -64,16 +69,23 @@ def main() -> int:
               actor TEXT,
               meta TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+            CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 
+            -- Marketing posts
+            -- IMPORTANT: runtime query expects column 'id'
             CREATE TABLE IF NOT EXISTS marketing_posts (
-              post_id TEXT PRIMARY KEY,
+              id TEXT PRIMARY KEY,
               ts TEXT NOT NULL,
               platform TEXT,
               status TEXT,
               content TEXT,
               meta TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_marketing_posts_ts ON marketing_posts(ts);
+            CREATE INDEX IF NOT EXISTS idx_marketing_posts_status ON marketing_posts(status);
 
+            -- Playlists (minimal)
             CREATE TABLE IF NOT EXISTS playlists (
               playlist_id TEXT PRIMARY KEY,
               ts TEXT,
@@ -81,11 +93,6 @@ def main() -> int:
               payload TEXT,
               meta TEXT
             );
-
-            CREATE INDEX IF NOT EXISTS idx_tracks_ts ON tracks(ts);
-            CREATE INDEX IF NOT EXISTS idx_drops_ts ON drops(ts);
-            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
-            CREATE INDEX IF NOT EXISTS idx_marketing_posts_ts ON marketing_posts(ts);
             CREATE INDEX IF NOT EXISTS idx_playlists_ts ON playlists(ts);
             """
         )
@@ -98,8 +105,11 @@ def main() -> int:
         track_id = "00000000-0000-0000-0000-000000000001"
         drop_id = "10000000-0000-0000-0000-000000000001"
         run_id = "20000000-0000-0000-0000-000000000001"
+        event_id = "30000000-0000-0000-0000-000000000001"
+        post_id = "40000000-0000-0000-0000-000000000001"
+        playlist_id = "50000000-0000-0000-0000-000000000001"
 
-        # Seed a track row (artifact_path doesn't need to exist for DB)
+        # Track seed row
         cur.execute(
             """
             INSERT INTO tracks (
@@ -118,7 +128,7 @@ def main() -> int:
             ),
         )
 
-        # Seed a drop row (so "drops list" has something even before tests run)
+        # Drop seed row
         cur.execute(
             """
             INSERT INTO drops (
@@ -136,7 +146,7 @@ def main() -> int:
             ),
         )
 
-        # Seed an event row
+        # Event seed row
         cur.execute(
             """
             INSERT INTO events (
@@ -144,7 +154,7 @@ def main() -> int:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
-                "30000000-0000-0000-0000-000000000001",
+                event_id,
                 ts,
                 "fixture.seeded",
                 "fixture",
@@ -152,15 +162,15 @@ def main() -> int:
             ),
         )
 
-        # Seed a marketing post row
+        # Marketing seed row (status=draft so pending query can find it)
         cur.execute(
             """
             INSERT INTO marketing_posts (
-              post_id, ts, platform, status, content, meta
+              id, ts, platform, status, content, meta
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                "40000000-0000-0000-0000-000000000001",
+                post_id,
                 ts,
                 "x",
                 "draft",
@@ -169,7 +179,7 @@ def main() -> int:
             ),
         )
 
-        # Seed a playlist row (payload is free-form JSON your code can ignore or use)
+        # Playlist seed row (payload shape is not critical; keep deterministic)
         cur.execute(
             """
             INSERT INTO playlists (
@@ -177,7 +187,7 @@ def main() -> int:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
-                "50000000-0000-0000-0000-000000000001",
+                playlist_id,
                 ts,
                 "focus",
                 stable_json(
@@ -189,11 +199,7 @@ def main() -> int:
                         "context": "focus",
                         "track_count": 1,
                         "tracks": [
-                            {
-                                "id": track_id,
-                                "title": "CI Seed Track",
-                                "artifact_path": "data/tracks/ci_seed_track.wav",
-                            }
+                            {"id": track_id, "title": "CI Seed Track", "artifact_path": "data/tracks/ci_seed_track.wav"}
                         ],
                     }
                 ),
