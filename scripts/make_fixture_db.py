@@ -31,9 +31,9 @@ def main() -> int:
         con.execute("PRAGMA synchronous = FULL;")
         cur = con.cursor()
 
-        # ---------------------------------------------------------------------
-        # Schema: match CURRENT code expectations (db_insert_* + run/drop paths)
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Schema: match CURRENT run_cli.py db_insert_* expectations
+        # ------------------------------------------------------------------
         cur.executescript(
             """
             CREATE TABLE IF NOT EXISTS tracks (
@@ -90,16 +90,16 @@ def main() -> int:
             """
         )
 
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Seed data: minimal deterministic set
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         ts = now_iso_fixed()
 
         track_id = "00000000-0000-0000-0000-000000000001"
         drop_id = "10000000-0000-0000-0000-000000000001"
         run_id = "20000000-0000-0000-0000-000000000001"
 
-        # Track row (artifact_path is a relative path string; file doesn't need to exist for DB)
+        # Seed a track row (artifact_path doesn't need to exist for DB)
         cur.execute(
             """
             INSERT INTO tracks (
@@ -114,16 +114,11 @@ def main() -> int:
                 "focus",
                 "ci_genre",
                 "data/tracks/ci_seed_track.wav",
-                stable_json(
-                    {
-                        "fixture": True,
-                        "note": "seed row for CI; run/drop will write additional rows",
-                    }
-                ),
+                stable_json({"fixture": True}),
             ),
         )
 
-        # Drop row
+        # Seed a drop row (so "drops list" has something even before tests run)
         cur.execute(
             """
             INSERT INTO drops (
@@ -137,17 +132,11 @@ def main() -> int:
                 "ci_seed",
                 run_id,
                 track_id,
-                stable_json(
-                    {
-                        "fixture": True,
-                        "note": "seed row for CI",
-                        "provider": "stub",
-                    }
-                ),
+                stable_json({"fixture": True, "provider": "stub"}),
             ),
         )
 
-        # Event row
+        # Seed an event row
         cur.execute(
             """
             INSERT INTO events (
@@ -163,7 +152,7 @@ def main() -> int:
             ),
         )
 
-        # Marketing post seed
+        # Seed a marketing post row
         cur.execute(
             """
             INSERT INTO marketing_posts (
@@ -180,7 +169,7 @@ def main() -> int:
             ),
         )
 
-        # Playlist seed (payload is up to your code; keep tiny and deterministic)
+        # Seed a playlist row (payload is free-form JSON your code can ignore or use)
         cur.execute(
             """
             INSERT INTO playlists (
@@ -214,7 +203,7 @@ def main() -> int:
 
         con.commit()
 
-        # Stabilize file size/layout
+        # Stabilize file layout/size for determinism
         try:
             cur.execute("VACUUM;")
             con.commit()
