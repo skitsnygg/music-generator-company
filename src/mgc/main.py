@@ -1449,57 +1449,197 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # Wrapper expected by the rest of main.py / error messages.
-    return _build_parser()
+    p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
 
+    # GLOBALS ONLY: do NOT repeat these on subparsers (argparse can overwrite globals with subparser defaults)
+    p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
+    p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
+    p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
+    p.add_argument("--log-console", action="store_true")
+    p.add_argument("--json", action="store_true", help="Output JSON where supported")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # -------- status --------
+    st = sub.add_parser("status", help="Show health + recent activity snapshot")
+    st.set_defaults(func=cmd_status)
+
+    # -------- rebuild --------
+    rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
+    rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
+
+    rls = rs.add_parser("ls", help="Show rebuild/status info (CI expects this)")
+    rls.set_defaults(func=cmd_rebuild_ls)
+
+    rp = rs.add_parser("playlists", help="Rebuild canonical playlist JSON files (CI)")
+    rp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rp.add_argument("--stamp", default=None)
+    rp.add_argument("--determinism-check", action="store_true")
+    rp.add_argument("--write", action="store_true")
+    rp.set_defaults(func=cmd_rebuild_playlists)
+
+    rt = rs.add_parser("tracks", help="Rebuild canonical tracks export (CI)")
+    rt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rt.add_argument("--stamp", default=None)
+    rt.add_argument("--determinism-check", action="store_true")
+    rt.add_argument("--write", action="store_true")
+    rt.set_defaults(func=cmd_rebuild_tracks)
+
+    rv = rs.add_parser("verify", help="Verify rebuilt outputs match DB + files (CI expects this)")
+    rvs = rv.add_subparsers(dest="verify_cmd", required=True)
+
+    rvp = rvs.add_parser("playlists", help="Verify playlists outputs")
+    rvp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    rvp.add_argument("--stamp", default=None)
+    rvp.add_argument("--strict", action="store_true")
+    rvp.add_argument("rest", nargs=argparse.REMAINDER)
+    rvp.set_defaults(func=cmd_rebuild_verify_playlists)
+
+    rvt = rvs.add_parser("tracks", help="Verify tracks outputs")
+    rvt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
+    rvt.add_argument("--stamp", default=None)
+    rvt.add_argument("--strict", action="store_true")
+    rvt.add_argument("rest", nargs=argparse.REMAINDER)
+    rvt.set_defaults(func=cmd_rebuild_verify_tracks)
+
+    # -------- playlists --------
+    playlists = sub.add_parser("playlists", help="Inspect playlists")
+    ps = playlists.add_subparsers(dest="playlists_cmd", required=True)
+
+    pl = ps.add_parser("list", help="List playlists")
+    pl.add_argument("--limit", type=int, default=20)
+    pl.add_argument("--slug", default=None)
+    pl.set_defaults(func=cmd_playlists_list)
+
+    ph = ps.add_parser("history", help="Show playlist history for a slug (or id)")
+    ph.add_argument("target")
+    ph.add_argument("--limit", type=int, default=20)
+    ph.set_defaults(func=cmd_playlists_history)
+
+    pr = ps.add_parser("reveal", help="Print playlist JSON for a playlist id")
+    pr.add_argument("id")
+    pr.set_defaults(func=cmd_playlists_reveal)
+
+    pe = ps.add_parser("export", help="Export recent playlist JSON files")
+    pe.add_argument("--limit", type=int, default=1)
+    pe.add_argument("--slug", default=None)
+    pe.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
+    pe.set_defaults(func=cmd_playlists_export)
+
+    # -------- tracks --------
+    tracks = sub.add_parser("tracks", help="Inspect track library")
+    ts = tracks.add_subparsers(dest="tracks_cmd", required=True)
+
+    tl = ts.add_parser("list", help="List tracks")
+    tl.add_argument("--limit", type=int, default=20)
+    tl.add_argument("--mood", default=None)
+    tl.add_argument("--genre", default=None)
+    tl.set_defaults(func=cmd_tracks_list)
+
+    tshow = ts.add_parser("show", help="Show track details")
+    tshow.add_argument("id")
+    tshow.set_defaults(func=cmd_tracks_show)
+
+    tstats = ts.add_parser("stats", help="Track library stats")
+    tstats.set_defaults(func=cmd_tracks_stats)
+
+    # -------- marketing --------
+    marketing = sub.add_parser("marketing", help="Marketing tools")
+    ms = marketing.add_subparsers(dest="marketing_cmd", required=True)
+
+    mposts = ms.add_parser("posts", help="Marketing posts")
+    mps = mposts.add_subparsers(dest="posts_cmd", required=True)
+
+    mpl = mps.add_parser("list", help="List marketing posts")
+    mpl.add_argument("--limit", type=int, default=20)
+    mpl.set_defaults(func=cmd_marketing_posts_list)
+
+    # -------- drops (optional) --------
+    try:
+        from mgc.drops_cli import register_drops_subcommand  # type: ignore
+    except Exception:
+        register_drops_subcommand = None  # type: ignore
+    if register_drops_subcommand:
+        register_drops_subcommand(sub)
+
+    # -------- analytics (optional) --------
+    try:
+        from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
+    except Exception:
+        register_analytics_subcommand = None  # type: ignore
+    if register_analytics_subcommand:
+        register_analytics_subcommand(sub)
+
+    # -------- web (REQUIRED by workflows) --------
+    try:
+        import mgc.web_cli as _web_cli  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.web_cli: {e}") from e
+
+    # web_cli registrar name drift tolerance
+    _web_registrar = None
+    for _name in (
+            "register_web_subcommand",
+            "register_web_subparser",
+            "register_web_cli",
+            "register_web",
+            "register_subcommand",
+            "register",
+    ):
+        _maybe = getattr(_web_cli, _name, None)
+        if callable(_maybe):
+            _web_registrar = _maybe
+            break
+
+    if _web_registrar is None:
+        # show the user what *is* available to reduce guesswork
+        _pub = [
+            n for n in dir(_web_cli)
+            if not n.startswith("_") and callable(getattr(_web_cli, n, None))
+        ]
+        raise SystemExit(
+            "[mgc.main] ERROR: mgc.web_cli imported, but no web registrar function found. "
+            "Expected one of: register_web_subcommand/register_web_subparser/register_web_cli/"
+            "register_web/register_subcommand/register. "
+            f"Callable exports: {_pub}"
+        )
+
+    _web_registrar(sub)
+
+    # -------- run (REQUIRED) --------
+    try:
+        from mgc.run_cli import register_run_subcommand  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
+    register_run_subcommand(sub)
+
+    return p
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """
-    CLI entrypoint.
-
-    Guarantees:
-      - supports global flag hoisting (e.g. `mgc rebuild ls --json`)
-      - configures logging before dispatch
-      - returns an int exit code
-    """
+    # Parser
     parser = build_parser()
 
+    # argv normalization (CI may pass global flags after subcommands)
     raw = list(argv) if argv is not None else sys.argv[1:]
     cooked = _hoist_global_flags(raw)
 
-    try:
-        args = parser.parse_args(cooked)
-    except SystemExit as e:
-        # argparse uses SystemExit for -h / parse errors
-        code = int(getattr(e, "code", 2) or 0)
-        return code
+    args = parser.parse_args(cooked)
 
-    # Logging should be configured after parsing so we can respect flags/env.
+    # Logging
     _configure_logging(
-        level=getattr(args, "log_level", os.environ.get("MGC_LOG_LEVEL", "INFO")),
-        log_file=getattr(args, "log_file", os.environ.get("MGC_LOG_FILE")),
+        level=getattr(args, "log_level", "INFO"),
+        log_file=getattr(args, "log_file", None),
         log_console=bool(getattr(args, "log_console", False)),
         json_mode=bool(getattr(args, "json", False)),
     )
 
-    log = logging.getLogger("mgc")
-    log.debug("argv=%s", (sys.argv if argv is None else ["mgc", *list(argv)]))
-    log.debug("db=%s", getattr(args, "db", None))
-
-    func = getattr(args, "func", None)
-    if not callable(func):
+    # Dispatch
+    fn = getattr(args, "func", None)
+    if not callable(fn):
         parser.print_help()
         return 2
+    return int(fn(args))
 
-    try:
-        return int(func(args))
-    except BrokenPipeError:
-        # Allow piping to `head`, `jq`, etc. without stack traces.
-        try:
-            sys.stdout.flush()
-        except Exception:
-            pass
-        return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
