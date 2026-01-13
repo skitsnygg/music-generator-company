@@ -139,7 +139,7 @@ jobs:
             > "${MGC_ARTIFACTS_DIR}/drop2.json"
           diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
 
-      - name: Web player build (generate real playlist-with-tracks; mp3 + validate)
+      - name: Web player build (playlist from deterministic drop artifacts; must be non-empty)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -152,11 +152,7 @@ jobs:
           SRC_DIR="${RUNNER_TEMP}/mgc_web_src"
           mkdir -p "${OUT_DIR}" "${SRC_DIR}"
 
-          # IMPORTANT:
-          # `mgc rebuild playlists --json` can emit a summary JSON with track_count=0.
-          # For the web build we need an actual playlist JSON that includes a non-empty `tracks` list.
-          #
-          # So we run a deterministic drop into SRC_DIR, then scan for a JSON file that contains tracks.
+          # Generate real artifacts deterministically into SRC_DIR
           python -m mgc.main run drop \
             --context focus \
             --seed 1 \
@@ -165,6 +161,7 @@ jobs:
             > "${SRC_DIR}/drop_stdout.json"
           python -m json.tool < "${SRC_DIR}/drop_stdout.json" >/dev/null
 
+          # Find a JSON file with a non-empty tracks list
           PLAYLIST_JSON="$(
             SRC_DIR="${SRC_DIR}" python - <<'PY'
           import json, os, pathlib, sys
@@ -172,7 +169,7 @@ jobs:
           root = pathlib.Path(os.environ["SRC_DIR"])
           candidates = []
 
-          def tracks_in(obj):
+          def get_tracks(obj):
               if isinstance(obj, dict):
                   if isinstance(obj.get("tracks"), list):
                       return obj["tracks"]
@@ -186,26 +183,24 @@ jobs:
                   data = json.loads(p.read_text(encoding="utf-8"))
               except Exception:
                   continue
-              tr = tracks_in(data)
+              tr = get_tracks(data)
               if tr and len(tr) > 0:
                   candidates.append(p)
 
           if not candidates:
               print("ERROR: no playlist JSON with non-empty tracks found under", root, file=sys.stderr)
-              # Helpful diagnostics
               all_json = sorted(root.rglob("*.json"))
               print("JSON files present:", file=sys.stderr)
               for p in all_json[:200]:
                   try:
                       data = json.loads(p.read_text(encoding="utf-8"))
-                      tr = tracks_in(data)
+                      tr = get_tracks(data)
                       n = len(tr) if isinstance(tr, list) else 0
                   except Exception:
                       n = -1
                   print(f"  - {p} (tracks={n})", file=sys.stderr)
               sys.exit(2)
 
-          # Pick the largest (usually the “full” playlist export, not a tiny status blob)
           best = sorted(candidates, key=lambda x: x.stat().st_size, reverse=True)[0]
           print(str(best))
           PY
@@ -225,11 +220,11 @@ jobs:
             --json \
             | python -m json.tool
 
-          # Validate output: at least one index.html and at least one audio file
+          # Validate output exists and includes audio
           test "$(find "${OUT_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
-          # Debug context (helps if this ever flakes)
+          # Debug context
           ls -la "${OUT_DIR}" || true
           find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
           find "${OUT_DIR}" -maxdepth 6 -type d -name 'tracks' -print || true
