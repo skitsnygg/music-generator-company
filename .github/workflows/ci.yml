@@ -123,11 +123,10 @@ jobs:
           TRACKS_DIR="${SRC_DIR}/tracks"
           mkdir -p "${OUT_DIR}" "${SRC_DIR}" "${TRACKS_DIR}"
 
-          # Make these available to python subprocesses
           export SRC_DIR
           export TRACKS_DIR
 
-          # Create a deterministic 1.5s sine wave WAV
+          # Deterministic 1.5s sine wave WAV
           ffmpeg -hide_banner -loglevel error -y \
             -f lavfi -i "sine=frequency=440:duration=1.5" \
             -c:a pcm_s16le \
@@ -136,8 +135,7 @@ jobs:
           test -s "${TRACKS_DIR}/track_001.wav"
           ls -la "${TRACKS_DIR}"
 
-          # Synthesize the playlist JSON that mgc web build can consume.
-          # Use relative paths from SRC_DIR.
+          # Build playlist JSON using ABSOLUTE paths (since CI mgc doesn't support --strip-paths)
           PLAYLIST_JSON="${SRC_DIR}/ci_playlist.json"
           python - <<'PY'
           import json, os, pathlib
@@ -153,14 +151,14 @@ jobs:
 
           tracks = []
           for i, p in enumerate(audio, start=1):
-              rel = str(p.relative_to(src_dir))
+              ap = str(p.resolve())
               tracks.append({
                   "id": f"ci-track-{i}",
                   "title": p.stem,
-                  # Provide several common path keys so web build can pick what it expects.
-                  "path": rel,
-                  "file": rel,
-                  "src": rel,
+                  # give multiple common keys, all absolute
+                  "path": ap,
+                  "file": ap,
+                  "src": ap,
               })
 
           playlist = {
@@ -180,22 +178,20 @@ jobs:
           test -s "${PLAYLIST_JSON}"
           python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
-          # Build web player
+          # Web build (NO --strip-paths)
           python -m mgc.main web build \
             --playlist "${PLAYLIST_JSON}" \
             --out-dir "${OUT_DIR}" \
             --prefer-mp3 \
-            --strip-paths \
             --clean \
             --fail-if-empty \
             --json \
             | python -m json.tool
 
-          # Validate build output (at least one index.html + at least one audio file)
+          # Validate build output
           test "$(find "${OUT_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
-          # Helpful debug listing
           find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
           find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 50 || true
 
