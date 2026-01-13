@@ -1185,7 +1185,130 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
 # CLI wiring
 # ----------------------------
 
-def build_parser() -> argparse.ArgumentParser:
+def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)",
+    )
+    run_p.set_defaults(_mgc_group="run")
+    run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
+
+    open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
+    open_p.add_argument("--out-dir", default=None,
+                        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
+    open_p.set_defaults(func=cmd_run_open)
+
+    tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
+    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
+    tail.set_defaults(func=cmd_run_tail)
+
+    diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
+    diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
+    diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
+    diff.add_argument("--since-ok", action="store_true",
+                      help="Auto-pick an older manifest from the most recent run with no stage errors")
+    diff.add_argument("--summary-only", action="store_true",
+                      help="Only output counts in JSON mode (still one-line summary in human mode)")
+    diff.add_argument("--fail-on-changes", action="store_true",
+                      help="Exit 2 if any non-allowed changes are detected (CI)")
+    diff.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.",
+    )
+    diff.set_defaults(func=cmd_run_diff)
+
+    status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
+    status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
+    status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
+    status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
+    status.set_defaults(func=cmd_run_status)
+
+    daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
+    daily.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood (focus/workout/sleep)")
+    daily.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed for deterministic behavior")
+    daily.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    daily.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
+    daily.set_defaults(func=cmd_run_daily)
+
+    pub = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
+    pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
+    pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
+    pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
+    pub.set_defaults(func=cmd_publish_marketing)
+
+    drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
+    drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
+    drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
+    drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
+    drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
+    drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
+    drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
+    drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    drop.set_defaults(func=cmd_run_drop)
+
+    weekly = run_sub.add_parser("weekly", help="Run 7 dailies + one publish-marketing + one manifest; emit weekly evidence")
+    weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
+    weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
+    weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
+    weekly.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    weekly.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
+    weekly.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
+    weekly.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
+    weekly.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
+    weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    weekly.set_defaults(func=cmd_run_weekly)
+
+    man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
+    man.add_argument("--repo-root", default=".", help="Repository root to hash")
+    man.add_argument("--include", action="append", default=None, help="Optional glob(s) to include (can repeat)")
+    man.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude (repeatable)")
+    man.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude (repeatable)")
+    man.add_argument("--out", default=None, help="Write manifest JSON to this path (else stdout)")
+    man.add_argument("--print-hash", action="store_true", help="Print root_tree_sha256 to stderr")
+    man.set_defaults(func=cmd_run_manifest)
+
+    stage = run_sub.add_parser("stage", help="Inspect or set run stage state (resume/observability)")
+    stage_sub = stage.add_subparsers(dest="stage_cmd", required=True)
+
+    st_set = stage_sub.add_parser("set", help="Upsert a stage row")
+    st_set.add_argument("run_id", help="Canonical run_id")
+    st_set.add_argument("stage", help="Stage name (e.g. daily, publish_marketing, manifest, evidence)")
+    st_set.add_argument("status", help="pending|running|ok|error|skipped")
+    st_set.add_argument("--started-at", default=None, help="ISO8601 timestamp")
+    st_set.add_argument("--ended-at", default=None, help="ISO8601 timestamp")
+    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds (normalized to 0 in deterministic mode)")
+    st_set.add_argument("--error-json", default=None, help="JSON string for error details")
+    st_set.add_argument("--meta-json", default=None, help="JSON string to merge into meta_json")
+    st_set.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    st_set.set_defaults(func=cmd_run_stage_set)
+
+    st_get = stage_sub.add_parser("get", help="Get a stage row")
+    st_get.add_argument("run_id", help="Canonical run_id")
+    st_get.add_argument("stage", help="Stage name")
+    st_get.set_defaults(func=cmd_run_stage_get)
+
+    st_ls = stage_sub.add_parser("list", help="List all stages for a run_id")
+    st_ls.add_argument("run_id", help="Canonical run_id")
+    st_ls.set_defaults(func=cmd_run_stage_list)
+
+# ---------------------------------------------------------------------------
+# Parser wiring
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
 
     # GLOBALS ONLY: do NOT repeat these on subparsers (argparse can overwrite globals with subparser defaults)
@@ -1325,29 +1448,58 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_parser() -> argparse.ArgumentParser:
+    # Wrapper expected by the rest of main.py / error messages.
+    return _build_parser()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    CLI entrypoint.
+
+    Guarantees:
+      - supports global flag hoisting (e.g. `mgc rebuild ls --json`)
+      - configures logging before dispatch
+      - returns an int exit code
+    """
     parser = build_parser()
 
     raw = list(argv) if argv is not None else sys.argv[1:]
     cooked = _hoist_global_flags(raw)
-    args = parser.parse_args(cooked)
 
+    try:
+        args = parser.parse_args(cooked)
+    except SystemExit as e:
+        # argparse uses SystemExit for -h / parse errors
+        code = int(getattr(e, "code", 2) or 0)
+        return code
+
+    # Logging should be configured after parsing so we can respect flags/env.
     _configure_logging(
-        level=args.log_level,
-        log_file=args.log_file,
-        log_console=bool(args.log_console),
+        level=getattr(args, "log_level", os.environ.get("MGC_LOG_LEVEL", "INFO")),
+        log_file=getattr(args, "log_file", os.environ.get("MGC_LOG_FILE")),
+        log_console=bool(getattr(args, "log_console", False)),
         json_mode=bool(getattr(args, "json", False)),
     )
+
     log = logging.getLogger("mgc")
-    log.debug("argv=%s", sys.argv if argv is None else ["mgc", *argv])
-    log.debug("db=%s", args.db)
+    log.debug("argv=%s", (sys.argv if argv is None else ["mgc", *list(argv)]))
+    log.debug("db=%s", getattr(args, "db", None))
 
     func = getattr(args, "func", None)
-    if not func:
+    if not callable(func):
         parser.print_help()
         return 2
-    return int(func(args))
 
+    try:
+        return int(func(args))
+    except BrokenPipeError:
+        # Allow piping to `head`, `jq`, etc. without stack traces.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

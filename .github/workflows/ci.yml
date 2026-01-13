@@ -139,6 +139,37 @@ jobs:
             > "${MGC_ARTIFACTS_DIR}/drop2.json"
           diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
 
+      - name: Install ffmpeg (ffmpeg + ffprobe)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Web player build (mp3 + validate; must produce playable tracks)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+        run: |
+          set -euxo pipefail
+
+          OUT_DIR="${RUNNER_TEMP}/mgc_web"
+          mkdir -p "${OUT_DIR}"
+
+          python -m mgc.main web build \
+            --playlist data/playlists/tmp_wav_test.json \
+            --out-dir "${OUT_DIR}" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json | python -m json.tool
+
+          test -f "${OUT_DIR}/tmp_wav_test/index.html"
+          ls -la "${OUT_DIR}/tmp_wav_test"
+          ls -la "${OUT_DIR}/tmp_wav_test/tracks" | head
+
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
         run: |
@@ -157,4 +188,12 @@ jobs:
             /tmp/mgc_drop.json
             /tmp/mgc_drops_list.json
             /tmp/mgc_drops_show.json
+          if-no-files-found: ignore
+
+      - name: Upload web build artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-tmp_wav_test
+          path: ${{ runner.temp }}/mgc_web/tmp_wav_test
           if-no-files-found: ignore

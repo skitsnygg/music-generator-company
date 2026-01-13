@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
+
 from mgc.context import build_prompt, get_context_spec
 from mgc.providers import GenerateRequest, get_provider
 
@@ -56,6 +57,71 @@ def _temp_env(patch: Dict[str, Optional[str]]):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Global argv helpers (fix: honor --db even when passed before "run")
+# ---------------------------------------------------------------------------
+
+def _argv_value(flag: str, argv: Optional[Sequence[str]] = None) -> Optional[str]:
+    """
+    Return the value after `flag` from argv if present (handles --flag=value too).
+    Example:
+      --db foo.sqlite
+      --db=foo.sqlite
+    """
+    av = list(argv) if argv is not None else list(sys.argv)
+    for i, tok in enumerate(av):
+        if tok == flag and i + 1 < len(av):
+            nxt = av[i + 1]
+            if not nxt.startswith("-"):
+                return nxt
+            return nxt  # allow paths starting with '-' (rare, but)
+        if tok.startswith(flag + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _argv_has_flag(flag: str, argv: Optional[Sequence[str]] = None) -> bool:
+    av = list(argv) if argv is not None else list(sys.argv)
+    return any(tok == flag or tok.startswith(flag + "=") for tok in av)
+
+
+def resolve_want_json(args: argparse.Namespace) -> bool:
+    """
+    Global JSON flag resolver.
+
+    We support:
+      - mgc.main --json <cmd> ...
+      - mgc.main <cmd> ... --json        (if subparser defines it)
+      - env: MGC_JSON=1 (optional)
+    """
+    v = getattr(args, "json", None)
+    if isinstance(v, bool):
+        return v
+    env = (os.environ.get("MGC_JSON") or "").strip().lower()
+    return env in ("1", "true", "yes", "on")
+
+
+def resolve_db_path(args: argparse.Namespace) -> str:
+    """
+    Global DB flag resolver.
+
+    We support:
+      - mgc.main --db PATH <cmd> ...
+      - mgc.main <cmd> ... --db PATH     (if subparser defines it)
+      - env: MGC_DB=... (preferred) then default data/db.sqlite
+    """
+    db = getattr(args, "db", None)
+    if isinstance(db, str) and db.strip():
+        return db.strip()
+
+    env = (os.environ.get("MGC_DB") or "").strip()
+    if env:
+        return env
+
+    return "data/db.sqlite"
+
 
 
 # ---------------------------------------------------------------------------
@@ -845,16 +911,16 @@ def _sha256_file(path: Path) -> str:
 
 
 def db_insert_track(
-        con: sqlite3.Connection,
-        *,
-        track_id: str,
-        ts: str,
-        title: str,
-        provider: str,
-        mood: Optional[str],
-        genre: Optional[str],
-        artifact_path: Optional[str],
-        meta: Dict[str, Any],
+    con: sqlite3.Connection,
+    *,
+    track_id: str,
+    ts: str,
+    title: str,
+    provider: str,
+    mood: Optional[str],
+    genre: Optional[str],
+    artifact_path: Optional[str],
+    meta: Dict[str, Any],
 ) -> None:
     cols = db_table_columns(con, "tracks")
     if not cols:
@@ -1197,7 +1263,6 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
         die(f"repo_root does not exist: {repo_root}")
 
     include = args.include or None
-
     exclude_dirs = args.exclude_dir or None
     exclude_globs = args.exclude_glob or None
 
@@ -1269,10 +1334,6 @@ def _stub_daily_run(
       - riffusion (local server)
       - staged providers (suno, diffsinger)
     """
-
-    from mgc.context import build_prompt
-    from mgc.providers import GenerateRequest, get_provider
-
     out_dir.mkdir(parents=True, exist_ok=True)
 
     drop_id = stable_uuid5("drop", run_id)
@@ -1384,7 +1445,7 @@ def _stub_daily_run(
         },
     )
 
-    # Marketing drafts (unchanged behavior)
+    # Marketing drafts
     platforms = ["x", "youtube_shorts", "instagram_reels", "tiktok"]
     post_ids: List[str] = []
 
@@ -1447,9 +1508,7 @@ def _stub_daily_run(
             "size": len(result.artifact_bytes),
             "mime": result.mime,
         },
-        "marketing_drafts": [
-            {"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)
-        ],
+        "marketing_drafts": [{"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)],
     }
 
     evidence_path = out_dir / ("daily_evidence.json" if deterministic else f"daily_evidence_{run_id}.json")
@@ -1457,18 +1516,19 @@ def _stub_daily_run(
 
     return evidence
 
+
 def cmd_run_daily(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
 
-    db_path = args.db or os.environ.get("MGC_DB") or "data/db.sqlite"
-    context = args.context or os.environ.get("MGC_CONTEXT") or "focus"
-    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    db_path = resolve_db_path(args)
+    context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
+    seed = str(getattr(args, "seed", None) if getattr(args, "seed", None) is not None else (os.environ.get("MGC_SEED") or "1"))
     provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
 
     ts = deterministic_now_iso(deterministic)
     run_date = ts.split("T", 1)[0]
 
-    out_dir = Path(args.out_dir or "data/evidence").resolve()
+    out_dir = Path(getattr(args, "out_dir", None) or "data/evidence").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     con = db_connect(db_path)
@@ -1553,7 +1613,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
 
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    db_path = resolve_db_path(args)
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
@@ -1681,20 +1741,11 @@ def _drop_latest_for_run(con: sqlite3.Connection, run_id: str) -> Optional[sqlit
 
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
-    """
-    Product-level command: daily + publish-marketing + manifest + consolidated evidence.
-
-    Guarantees:
-      - stdout emits exactly ONE JSON object (so `json.tool` works)
-      - deterministic under --deterministic / MGC_DETERMINISTIC=1 (and MGC_FIXED_TIME)
-      - stages recorded into run_stages (daily, publish_marketing, manifest, evidence)
-      - resume: skips stages already ok/skipped, unless --no-resume
-    """
     deterministic = is_deterministic(args)
 
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
-    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    db_path = resolve_db_path(args)
+    context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
+    seed = str(getattr(args, "seed", None) if getattr(args, "seed", None) is not None else (os.environ.get("MGC_SEED") or "1"))
     provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
 
     limit = int(getattr(args, "limit", None) or 50)
@@ -1819,9 +1870,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                     "manifest_path": str(manifest_path),
                     "manifest_sha256": manifest_sha256,
                 },
-                "stages": {
-                    "allow_resume": allow_resume,
-                },
+                "stages": {"allow_resume": allow_resume},
             }
 
             out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
@@ -1851,7 +1900,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                     )
                     con.commit()
 
-    # Emit exactly one JSON object (re-read evidence file if it exists)
+    # Emit exactly one JSON object
     try:
         sys.stdout.write(out_path.read_text(encoding="utf-8"))
     except Exception:
@@ -1873,25 +1922,30 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         )
     return 0
 
+
 def cmd_run_tail(args: argparse.Namespace) -> int:
     evidence_dir = Path(
-        args.out_dir
+        getattr(args, "out_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR")
         or "data/evidence"
     ).resolve()
 
-    kind = args.type  # drop | weekly | any
-    n = int(args.n or 1)
+    kind = str(getattr(args, "type", "any") or "any")  # drop | weekly | any
+    n = int(getattr(args, "n", 1) or 1)
 
-    if not evidence_dir.exists():
-        sys.stdout.write(stable_json_dumps({
-            "found": False,
-            "reason": "evidence_dir_missing",
-            "path": str(evidence_dir),
-        }) + "\n")
+    if not evidence_dir.exists() or not evidence_dir.is_dir():
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "found": False,
+                    "reason": "evidence_dir_missing",
+                    "path": str(evidence_dir),
+                }
+            )
+            + "\n"
+        )
         return 0
 
-    patterns = []
     if kind == "drop":
         patterns = ["drop_evidence*.json"]
     elif kind == "weekly":
@@ -1906,11 +1960,16 @@ def cmd_run_tail(args: argparse.Namespace) -> int:
     files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
     if not files:
-        sys.stdout.write(stable_json_dumps({
-            "found": False,
-            "reason": "no_evidence_files",
-            "path": str(evidence_dir),
-        }) + "\n")
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "found": False,
+                    "reason": "no_evidence_files",
+                    "path": str(evidence_dir),
+                }
+            )
+            + "\n"
+        )
         return 0
 
     selected = files[:n]
@@ -1922,42 +1981,36 @@ def cmd_run_tail(args: argparse.Namespace) -> int:
         except Exception as e:
             payload = {"error": str(e)}
 
-        items.append({
-            "file": str(p),
-            "mtime": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
-            "payload": payload,
-        })
+        items.append(
+            {
+                "file": str(p),
+                "mtime": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+                "payload": payload,
+            }
+        )
 
-    out = {
-        "found": True,
-        "count": len(items),
-        "items": items,
-    }
-
-    sys.stdout.write(stable_json_dumps(out) + "\n")
+    sys.stdout.write(
+        stable_json_dumps(
+            {
+                "found": True,
+                "count": len(items),
+                "items": items,
+            }
+        )
+        + "\n"
+    )
     return 0
-
 
 # ---------------------------------------------------------------------------
 # Weekly run (7 dailies + publish + manifest + consolidated evidence)
 # ---------------------------------------------------------------------------
 
 def cmd_run_weekly(args: argparse.Namespace) -> int:
-    """
-    Weekly umbrella command:
-      - Runs 7 daily runs (each has its own canonical daily run_id)
-      - Publishes marketing once (covers all pending drafts)
-      - Writes manifest once
-      - Writes weekly evidence JSON
-      - Records stages under the weekly umbrella run_id:
-          daily_0..daily_6, publish_marketing, manifest, evidence
-      - Resume semantics per-stage unless --no-resume
-    """
     deterministic = is_deterministic(args)
 
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
-    context = str(args.context or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(args.seed if args.seed is not None else (os.environ.get("MGC_SEED") or "1"))
+    db_path = resolve_db_path(args)
+    context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
+    seed = str(getattr(args, "seed", None) if getattr(args, "seed", None) is not None else (os.environ.get("MGC_SEED") or "1"))
     provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
 
     limit = int(getattr(args, "limit", None) or 50)
@@ -1984,8 +2037,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     daily_results: List[Dict[str, Any]] = []
 
-    # Run 7 dailies as distinct calendar days, starting from week_start.
-    # In deterministic mode, we force MGC_FIXED_TIME per day so cmd_run_daily produces distinct run_date/run_id.
     for i in range(7):
         stage_name = f"daily_{i}"
         day_dt = datetime.strptime(week_start, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=i)
@@ -2001,7 +2052,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         ) as should_run:
             if should_run:
                 with _silence_stdout(True):
-                    # Ensure deterministic daily uses a distinct day.
                     patch = {"MGC_FIXED_TIME": day_ts} if deterministic else {}
                     with _temp_env(patch):
                         daily_ns = argparse.Namespace(
@@ -2013,11 +2063,14 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
                         )
                         cmd_run_daily(daily_ns)
 
-        # Best-effort: resolve that day's canonical daily run_id and attach pointers.
-        # This is deterministic because run_id is canonical for (run_date, context, seed, provider_set_version).
         day_run_id = db_get_or_create_run_id(
             con,
-            run_key=RunKey(run_date=day_dt.date().isoformat(), context=context, seed=seed, provider_set_version=provider_set_version),
+            run_key=RunKey(
+                run_date=day_dt.date().isoformat(),
+                context=context,
+                seed=seed,
+                provider_set_version=provider_set_version,
+            ),
             ts=(day_ts if deterministic else ts0),
             argv=None,
         )
@@ -2038,7 +2091,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
             }
         )
 
-    # Publish once
     with run_stage(
         con,
         run_id=weekly_run_id,
@@ -2057,7 +2109,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
                 )
                 cmd_publish_marketing(pub_ns)
 
-    # Manifest once
     weekly_evidence_path = out_dir / ("weekly_evidence.json" if deterministic else f"weekly_evidence_{weekly_run_id}.json")
     weekly_manifest_path = out_dir / ("weekly_manifest.json" if deterministic else f"weekly_manifest_{weekly_run_id}.json")
 
@@ -2083,7 +2134,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     manifest_sha256 = _sha256_file(weekly_manifest_path)
 
-    # Evidence once
     with run_stage(
         con,
         run_id=weekly_run_id,
@@ -2113,7 +2163,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
             }
             weekly_evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
 
-    # Emit exactly one JSON object
     try:
         sys.stdout.write(weekly_evidence_path.read_text(encoding="utf-8"))
     except Exception:
@@ -2142,7 +2191,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
 def cmd_run_stage_set(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+
+    db_path = args.db
     run_id = str(args.run_id).strip()
     stage = str(args.stage).strip()
     status = str(args.status).strip().lower()
@@ -2157,30 +2207,38 @@ def cmd_run_stage_set(args: argparse.Namespace) -> int:
     con = db_connect(db_path)
     ensure_tables_minimal(con)
 
-    started_at = args.started_at
-    ended_at = args.ended_at
-    duration_ms = args.duration_ms
+    started_at = getattr(args, "started_at", None)
+    ended_at = getattr(args, "ended_at", None)
+    duration_ms = getattr(args, "duration_ms", None)
+
+    # Normalize duration in deterministic mode
     if duration_ms is not None:
-        duration_ms = int(duration_ms)
+        try:
+            duration_ms = int(duration_ms)
+        except Exception:
+            die("duration_ms must be an integer")
         if deterministic:
             duration_ms = 0
 
     error_obj: Optional[Dict[str, Any]] = None
-    if args.error_json:
+    raw_error = getattr(args, "error_json", None)
+    if raw_error:
         try:
-            parsed = json.loads(args.error_json)
+            parsed = json.loads(raw_error)
             error_obj = parsed if isinstance(parsed, dict) else {"value": parsed}
         except Exception:
-            error_obj = {"raw": args.error_json}
+            error_obj = {"raw": str(raw_error)}
 
     meta_patch: Optional[Dict[str, Any]] = None
-    if args.meta_json:
+    raw_meta = getattr(args, "meta_json", None)
+    if raw_meta:
         try:
-            parsed = json.loads(args.meta_json)
+            parsed = json.loads(raw_meta)
             meta_patch = parsed if isinstance(parsed, dict) else {"value": parsed}
         except Exception:
-            meta_patch = {"raw": args.meta_json}
+            meta_patch = {"raw": str(raw_meta)}
 
+    # Auto-fill timestamps if omitted (keeps UX sane + DB consistent)
     if started_at is None and status in ("running", "ok", "error", "skipped"):
         started_at = deterministic_now_iso(deterministic)
     if ended_at is None and status in ("ok", "error", "skipped"):
@@ -2202,6 +2260,7 @@ def cmd_run_stage_set(args: argparse.Namespace) -> int:
         stable_json_dumps(
             {
                 "ok": True,
+                "db": db_path,
                 "run_id": run_id,
                 "stage": stage,
                 "status": status,
@@ -2213,31 +2272,120 @@ def cmd_run_stage_set(args: argparse.Namespace) -> int:
 
 
 def cmd_run_stage_get(args: argparse.Namespace) -> int:
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    db_path = args.db
     run_id = str(args.run_id).strip()
     stage = str(args.stage).strip()
+
+    if not run_id:
+        die("run_id required")
+    if not stage:
+        die("stage required")
+
     con = db_connect(db_path)
-    ensure_tables_minimal(con)
+
+    # Be tolerant: do not create tables on read-only get; just report not found.
+    if not db_table_exists(con, "run_stages"):
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "found": False,
+                    "db": db_path,
+                    "run_id": run_id,
+                    "stage": stage,
+                    "reason": "run_stages_table_missing",
+                }
+            )
+            + "\n"
+        )
+        return 1
+
     row = db_stage_get(con, run_id=run_id, stage=stage)
     if row is None:
-        sys.stdout.write(stable_json_dumps({"found": False, "run_id": run_id, "stage": stage}) + "\n")
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "found": False,
+                    "db": db_path,
+                    "run_id": run_id,
+                    "stage": stage,
+                }
+            )
+            + "\n"
+        )
         return 1
-    sys.stdout.write(stable_json_dumps({"found": True, "item": dict(row)}) + "\n")
+
+    sys.stdout.write(
+        stable_json_dumps(
+            {
+                "found": True,
+                "db": db_path,
+                "run_id": run_id,
+                "stage": stage,
+                "item": dict(row),
+            }
+        )
+        + "\n"
+    )
     return 0
 
 
 def cmd_run_stage_list(args: argparse.Namespace) -> int:
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    db_path = args.db
     run_id = str(args.run_id).strip()
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-    rows = con.execute(
-        "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
-        (run_id,),
-    ).fetchall()
-    sys.stdout.write(stable_json_dumps({"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}) + "\n")
-    return 0
 
+    if not run_id:
+        die("run_id required")
+
+    con = db_connect(db_path)
+
+    # Be tolerant: do not create tables on list; just return empty.
+    if not db_table_exists(con, "run_stages"):
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "db": db_path,
+                    "run_id": run_id,
+                    "count": 0,
+                    "items": [],
+                    "reason": "run_stages_table_missing",
+                }
+            )
+            + "\n"
+        )
+        return 0
+
+    try:
+        rows = con.execute(
+            "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+    except sqlite3.Error as e:
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "db": db_path,
+                    "run_id": run_id,
+                    "count": 0,
+                    "items": [],
+                    "error": {"type": "sqlite3.Error", "message": str(e)},
+                }
+            )
+            + "\n"
+        )
+        return 1
+
+    sys.stdout.write(
+        stable_json_dumps(
+            {
+                "db": db_path,
+                "run_id": run_id,
+                "count": len(rows),
+                "items": [dict(r) for r in rows],
+            }
+        )
+        + "\n"
+    )
+    return 0
 
 # ---------------------------------------------------------------------------
 # run status
@@ -2272,22 +2420,6 @@ def _run_id_latest(con: sqlite3.Connection) -> Optional[str]:
         return None
 
 
-def _drop_latest_for_run(con: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
-    # You already have this function earlier in the file; keep it.
-    # This stub is here ONLY if someone deletes it by accident.
-    cols = db_table_columns(con, "drops")
-    if not cols:
-        return None
-
-    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on", "occurred_at"])
-    id_col = _pick_first_existing(cols, ["id", "drop_id"]) or "id"
-    if ts_col:
-        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {ts_col} DESC, {id_col} DESC LIMIT 1"
-    else:
-        sql = f"SELECT * FROM drops WHERE run_id = ? ORDER BY {id_col} DESC LIMIT 1"
-    return con.execute(sql, (run_id,)).fetchone()
-
-
 def cmd_run_status(args: argparse.Namespace) -> int:
     """
     Output rules:
@@ -2296,11 +2428,10 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     """
     want_json = bool(getattr(args, "json", False))
 
-    db_path = str(args.db or os.environ.get("MGC_DB") or "data/db.sqlite")
+    db_path = str(getattr(args, "db", None) or os.environ.get("MGC_DB") or "data/db.sqlite")
     con = db_connect(db_path)
 
-    # Do not force-create tables in status; be tolerant.
-    run_id = (getattr(args, "run_id", None) or "").strip()
+    run_id = str(getattr(args, "run_id", None) or "").strip()
     latest = bool(getattr(args, "latest", False))
     fail_on_error = bool(getattr(args, "fail_on_error", False))
 
@@ -2319,7 +2450,8 @@ def cmd_run_status(args: argparse.Namespace) -> int:
         "summary": {"counts": {}, "healthy": None},
     }
 
-    if run_id and _table_exists(con, "runs"):
+    # run row
+    if run_id and db_table_exists(con, "runs"):
         try:
             row = con.execute("SELECT * FROM runs WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
             if row is not None:
@@ -2330,7 +2462,7 @@ def cmd_run_status(args: argparse.Namespace) -> int:
 
     # stages
     stage_items: List[Dict[str, Any]] = []
-    if run_id and _table_exists(con, "run_stages"):
+    if run_id and db_table_exists(con, "run_stages"):
         try:
             rows = con.execute(
                 "SELECT * FROM run_stages WHERE run_id = ? ORDER BY id ASC",
@@ -2351,7 +2483,7 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     out["summary"] = {"counts": dict(sorted(counts.items())), "healthy": healthy}
 
     # drop pointer
-    if run_id and _table_exists(con, "drops"):
+    if run_id and db_table_exists(con, "drops"):
         try:
             drow = _drop_latest_for_run(con, run_id)
             if drow is not None:
@@ -2364,32 +2496,37 @@ def cmd_run_status(args: argparse.Namespace) -> int:
         if want_json:
             sys.stdout.write(stable_json_dumps(out) + "\n")
         else:
-            print(f"run_id={run_id} status=ERROR stages_error={counts.get('error', 0)}")
+            print(f"run_id={run_id or '(none)'} status=ERROR stages_error={counts.get('error', 0)} db={db_path}")
         return 2
 
     if want_json:
         sys.stdout.write(stable_json_dumps(out) + "\n")
         return 0 if out["found"] else 1
 
-    # human single line
+    # Human single line
     rid = run_id or "(none)"
     err = counts.get("error", 0)
     ok = counts.get("ok", 0)
+    running = counts.get("running", 0)
+    skipped = counts.get("skipped", 0)
+
+    status = "OK" if err == 0 else "ERROR"
+    print(f"run_id={rid} status={status} ok={ok} running={running} skipped={skipped} error={err} db={db_path}")
+    return 0 if err == 0 else 2
 
 def cmd_run_open(args: argparse.Namespace) -> int:
     evidence_dir = Path(
-        args.out_dir
+        getattr(args, "out_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR")
         or "data/evidence"
     ).resolve()
 
-    kind = args.type  # drop | weekly | any
-    n = int(args.n or 1)
+    kind = str(getattr(args, "type", "any") or "any")  # drop | weekly | any
+    n = int(getattr(args, "n", 1) or 1)
 
-    if not evidence_dir.exists():
+    if not evidence_dir.exists() or not evidence_dir.is_dir():
         return 1
 
-    patterns = []
     if kind == "drop":
         patterns = ["drop_evidence*.json"]
     elif kind == "weekly":
@@ -2406,9 +2543,9 @@ def cmd_run_open(args: argparse.Namespace) -> int:
         return 1
 
     selected = files[:n]
-
     for p in selected:
         print(str(p))
+        # Also print referenced manifest if present & exists
         try:
             payload = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
@@ -2417,6 +2554,8 @@ def cmd_run_open(args: argparse.Namespace) -> int:
                     manifest_path = paths.get("manifest_path")
                     if isinstance(manifest_path, str) and manifest_path.strip():
                         mp = Path(manifest_path)
+                        if not mp.is_absolute():
+                            mp = (evidence_dir / mp).resolve()
                         if mp.exists():
                             print(str(mp))
         except Exception:
@@ -2431,21 +2570,15 @@ def _load_manifest(path: Path) -> Dict[str, Any]:
     for e in entries:
         p = e.get("path")
         if p:
-            by_path[p] = {
-                "sha256": e.get("sha256"),
-                "size": e.get("size"),
-            }
+            by_path[p] = {"sha256": e.get("sha256"), "size": e.get("size")}
     return {
         "path": str(path),
         "root_tree_sha256": obj.get("root_tree_sha256"),
         "entries": by_path,
     }
 
+
 def _manifest_entries_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    Return {path -> entry_dict} for manifest["entries"].
-    Each entry is expected to have: path, sha256, size (size optional).
-    """
     entries = manifest.get("entries", [])
     out: Dict[str, Dict[str, Any]] = {}
     if isinstance(entries, list):
@@ -2459,15 +2592,6 @@ def _manifest_entries_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
 
 
 def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Diff two manifest objects.
-    Returns:
-      {
-        "added":    [{"path":..., "sha256":..., "size":...}, ...],
-        "removed":  [{"path":..., "sha256":..., "size":...}, ...],
-        "modified": [{"path":..., "a": {...}, "b": {...}}, ...],
-      }
-    """
     am = _manifest_entries_map(a)
     bm = _manifest_entries_map(b)
 
@@ -2484,23 +2608,11 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
     for p in added_paths:
         e = bm[p]
-        added.append(
-            {
-                "path": p,
-                "sha256": e.get("sha256"),
-                "size": e.get("size"),
-            }
-        )
+        added.append({"path": p, "sha256": e.get("sha256"), "size": e.get("size")})
 
     for p in removed_paths:
         e = am[p]
-        removed.append(
-            {
-                "path": p,
-                "sha256": e.get("sha256"),
-                "size": e.get("size"),
-            }
-        )
+        removed.append({"path": p, "sha256": e.get("sha256"), "size": e.get("size")})
 
     for p in common_paths:
         ea = am[p]
@@ -2516,27 +2628,14 @@ def _diff_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"added": added, "removed": removed, "modified": modified}
 
-def _find_manifest_files(evidence_dir: Path, *, type_filter: str = "any") -> List[Path]:
-    """
-    Return manifest files newest-first from evidence_dir.
 
-    type_filter:
-      - "drop":   only manifest*.json (excludes weekly_manifest*.json)
-      - "weekly": only weekly_manifest*.json
-      - "any":    both
-    """
+def _find_manifest_files(evidence_dir: Path, *, type_filter: str = "any") -> List[Path]:
     if not isinstance(evidence_dir, Path):
         evidence_dir = Path(str(evidence_dir))
 
     if not evidence_dir.exists() or not evidence_dir.is_dir():
         return []
 
-    # We only care about manifest JSON files written by run drop/weekly.
-    # Names we expect:
-    #   manifest.json
-    #   manifest_<drop_id>.json
-    #   weekly_manifest.json
-    #   weekly_manifest_<weekly_run_id>.json
     paths: List[Path] = []
     for p in evidence_dir.glob("*manifest*.json"):
         if not p.is_file():
@@ -2558,9 +2657,9 @@ def _find_manifest_files(evidence_dir: Path, *, type_filter: str = "any") -> Lis
         except Exception:
             return (0.0, p.name)
 
-    # newest-first
     paths.sort(key=_mtime_key, reverse=True)
     return paths
+
 
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     try:
@@ -2569,19 +2668,9 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _resolve_since_ok_manifest_path(evidence_dir: Path) -> Optional[Path]:
-    """
-    Pick an "older" manifest from the most recent run that has NO stage errors in the DB.
+def _resolve_since_ok_manifest_path(evidence_dir: Path, *, args_for_db: argparse.Namespace) -> Optional[Path]:
+    db_path = resolve_db_path(args_for_db)
 
-    Strategy:
-      - Scan evidence JSON files (drop_evidence*.json, weekly_evidence*.json) newest-first
-      - For each, extract run_id / weekly_run_id and manifest_path
-      - Query run_stages for that run_id; if no rows with status='error', accept
-      - Return manifest path as a Path (absolute if evidence wrote absolute; else relative to evidence_dir)
-    """
-    db_path = os.environ.get("MGC_DB") or "data/db.sqlite"
-
-    # Prefer most recent evidence files
     candidates: List[Path] = []
     try:
         candidates.extend(sorted(evidence_dir.glob("drop_evidence*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
@@ -2609,7 +2698,6 @@ def _resolve_since_ok_manifest_path(evidence_dir: Path) -> Optional[Path]:
             if not run_id or not manifest_raw:
                 continue
 
-            # If run_stages table doesn't exist (or other DB issue), we can't prove "ok".
             try:
                 row = con.execute(
                     "SELECT COUNT(1) AS n FROM run_stages WHERE run_id = ? AND LOWER(status) = 'error'",
@@ -2637,6 +2725,7 @@ def _resolve_since_ok_manifest_path(evidence_dir: Path) -> Optional[Path]:
             except Exception:
                 pass
 
+
 def cmd_run_diff(args: argparse.Namespace) -> int:
     """
     Diff manifests in the evidence dir.
@@ -2651,8 +2740,7 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
       - --since PATH: compare newest against PATH (PATH is "older")
       - --since-ok: auto-pick an older manifest from the most recent run with no stage errors
     """
-    # NOTE: --json is a GLOBAL flag on mgc.main. We read args.json here.
-    want_json = bool(getattr(args, "json", False))
+    want_json = resolve_want_json(args)
 
     evidence_dir = Path(
         getattr(args, "out_dir", None)
@@ -2676,34 +2764,63 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
     if since:
         since_path = Path(str(since)).expanduser().resolve()
         if not since_path.exists():
-            out = {"found": False, "reason": "since_not_found", "since": str(since_path)}
-            sys.stdout.write(stable_json_dumps(out) + "\n")
+            sys.stdout.write(
+                stable_json_dumps(
+                    {"found": False, "reason": "since_not_found", "since": str(since_path)}
+                )
+                + "\n"
+            )
             return 0
 
         if not files:
-            out = {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
-            sys.stdout.write(stable_json_dumps(out) + "\n")
+            sys.stdout.write(
+                stable_json_dumps(
+                    {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
+                )
+                + "\n"
+            )
             return 0
 
         a_path, b_path = since_path, files[0]
+
     elif since_ok:
-        since_path = _resolve_since_ok_manifest_path(evidence_dir)
+        # Must use resolver helper (DB path depends on args/global default/env)
+        since_path = _resolve_since_ok_manifest_path(evidence_dir, args_for_db=args)
         if since_path is None:
-            out = {"found": False, "reason": "since_ok_not_found", "path": str(evidence_dir)}
-            sys.stdout.write(stable_json_dumps(out) + "\n")
+            sys.stdout.write(
+                stable_json_dumps(
+                    {"found": False, "reason": "since_ok_not_found", "path": str(evidence_dir)}
+                )
+                + "\n"
+            )
             return 0
 
         if not files:
-            out = {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
-            sys.stdout.write(stable_json_dumps(out) + "\n")
+            sys.stdout.write(
+                stable_json_dumps(
+                    {"found": False, "reason": "no_manifests_found", "path": str(evidence_dir)}
+                )
+                + "\n"
+            )
             return 0
 
         a_path, b_path = since_path, files[0]
+
     else:
         if len(files) < 2:
-            out = {"found": False, "reason": "need_at_least_two_manifests", "count": len(files), "path": str(evidence_dir)}
-            sys.stdout.write(stable_json_dumps(out) + "\n")
+            sys.stdout.write(
+                stable_json_dumps(
+                    {
+                        "found": False,
+                        "reason": "need_at_least_two_manifests",
+                        "count": len(files),
+                        "path": str(evidence_dir),
+                    }
+                )
+                + "\n"
+            )
             return 0
+
         a_path, b_path = files[1], files[0]
 
     a = _load_manifest(a_path)
@@ -2714,8 +2831,7 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
     removed = diff.get("removed", []) or []
     modified = diff.get("modified", []) or []
 
-    # Count non-allowed modified paths (allow only applies to "modified" paths)
-    # If you want allow to cover added/removed too, we can broaden it later.
+    # Allow-list applies to modified paths only (keeps CI strict on add/remove)
     modified_paths = [str(x.get("path") or "") for x in modified if isinstance(x, dict)]
     non_allowed_modified = [p for p in modified_paths if p and p not in allow_set]
 
@@ -2725,7 +2841,6 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
         "modified": len(modified),
     }
 
-    # Decide failure based on "changes", optionally filtered by allow-list
     has_any_changes = (summary["added"] + summary["removed"] + summary["modified"]) > 0
     has_blocking_changes = (summary["added"] + summary["removed"] + len(non_allowed_modified)) > 0
 
@@ -2737,7 +2852,7 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
     newer_name = b_path.name
 
     if want_json:
-        out = {
+        out: Dict[str, Any] = {
             "found": True,
             "older": str(a_path),
             "newer": str(b_path),
@@ -2749,113 +2864,20 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
             "fail_on_changes": fail_on_changes,
             "allow": sorted(allow_set) if allow_set else [],
             "summary": summary,
+            "exit_code": exit_code,
         }
+
         if not summary_only:
             out["diff"] = diff
 
-        # Helpful diagnostics for CI allow-list behavior
         if allow_set:
             out["non_allowed_modified_paths"] = non_allowed_modified
 
-        out["exit_code"] = exit_code
         sys.stdout.write(stable_json_dumps(out) + "\n")
         return exit_code
 
-    # Human output mode
-    line = f"+{summary['added']}  -{summary['removed']}  ~{summary['modified']}  (older={older_name} newer={newer_name})"
-    print(line)
+    print(f"+{summary['added']}  -{summary['removed']}  ~{summary['modified']}  (older={older_name} newer={newer_name})")
     return exit_code
-
-def _stage_status_okish(s: Any) -> bool:
-    v = str(s or "").strip().lower()
-    return v in ("ok", "skipped")
-
-
-def _run_is_okish(con: sqlite3.Connection, run_id: str) -> bool:
-    # If run_stages table missing, we can't verify; treat as not-okish for safety.
-    try:
-        con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_stages' LIMIT 1").fetchone()
-    except Exception:
-        return False
-
-    rows = con.execute(
-        "SELECT stage, status FROM run_stages WHERE run_id = ?",
-        (run_id,),
-    ).fetchall()
-
-    if not rows:
-        return False
-
-    # Hard fail if any error
-    for r in rows:
-        if str(r["status"] or "").strip().lower() == "error":
-            return False
-
-    # Prefer runs that at least have manifest + evidence ok/skipped
-    st = {str(r["stage"]): r["status"] for r in rows}
-    if "manifest" in st and "evidence" in st:
-        return _stage_status_okish(st["manifest"]) and _stage_status_okish(st["evidence"])
-
-    # Otherwise "no errors" is acceptable
-    return True
-
-
-def _evidence_run_id_from_manifest_path(manifest_path: Path) -> Optional[str]:
-    # We infer run_id by looking for a sibling evidence JSON that references this manifest_path.
-    # This avoids needing filename conventions.
-    try:
-        evidence_dir = manifest_path.parent
-        candidates = list(evidence_dir.glob("drop_evidence*.json")) + list(evidence_dir.glob("weekly_evidence*.json"))
-        candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
-        for ev in candidates:
-            try:
-                payload = json.loads(ev.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
-                    continue
-                paths = payload.get("paths", {})
-                if isinstance(paths, dict) and str(paths.get("manifest_path") or "") == str(manifest_path):
-                    # weekly evidence uses weekly_run_id; drop evidence uses run_id
-                    rid = payload.get("run_id") or payload.get("weekly_run_id")
-                    if rid:
-                        return str(rid)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
-
-
-def _pick_since_ok_manifest(
-    *,
-    db_path: str,
-    evidence_dir: Path,
-    manifest_files_newest_first: List[Path],
-) -> Optional[Path]:
-    # Choose the most recent manifest (NOT the newest one) whose run has no stage errors.
-    # We skip index 0 because that's the newest "b" side.
-    if len(manifest_files_newest_first) < 2:
-        return None
-
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        for mp in manifest_files_newest_first[1:]:
-            run_id = _evidence_run_id_from_manifest_path(mp)
-            if not run_id:
-                continue
-            try:
-                if _run_is_okish(con, run_id):
-                    return mp
-            except Exception:
-                continue
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-    return None
-
 
 # ---------------------------------------------------------------------------
 # Argparse wiring
@@ -2867,8 +2889,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
 
     open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
-    open_p.add_argument("--out-dir", default=None,
-                        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    open_p.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
     open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
     open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
     open_p.set_defaults(func=cmd_run_open)
@@ -2883,29 +2904,22 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
     diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
     diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
-    diff.add_argument("--since-ok", action="store_true",
-                      help="Auto-pick an older manifest from the most recent run with no stage errors")
-    diff.add_argument("--summary-only", action="store_true",
-                      help="Only output counts in JSON mode (still one-line summary in human mode)")
-    diff.add_argument("--fail-on-changes", action="store_true",
-                      help="Exit 2 if any non-allowed changes are detected (CI)")
-    diff.add_argument(
-        "--allow",
-        action="append",
-        default=[],
-        help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.",
-    )
+    diff.add_argument("--since-ok", action="store_true", help="Auto-pick an older manifest from the most recent run with no stage errors")
+    diff.add_argument("--summary-only", action="store_true", help="Only output counts in JSON mode (still one-line summary in human mode)")
+    diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any non-allowed changes are detected (CI)")
+    diff.add_argument("--allow", action="append", default=[], help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.")
+    diff.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     diff.set_defaults(func=cmd_run_diff)
 
     status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
     status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
-    status.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    status.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
     status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
     status.set_defaults(func=cmd_run_status)
 
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
-    daily.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    daily.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     daily.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood (focus/workout/sleep)")
     daily.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed for deterministic behavior")
     daily.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
@@ -2913,14 +2927,14 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     daily.set_defaults(func=cmd_run_daily)
 
     pub = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
-    pub.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    pub.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
     pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
     pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
     pub.set_defaults(func=cmd_publish_marketing)
 
     drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
-    drop.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    drop.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
     drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
@@ -2935,7 +2949,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drop.set_defaults(func=cmd_run_drop)
 
     weekly = run_sub.add_parser("weekly", help="Run 7 dailies + one publish-marketing + one manifest; emit weekly evidence")
-    weekly.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    weekly.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
     weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
@@ -2962,7 +2976,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     stage_sub = stage.add_subparsers(dest="stage_cmd", required=True)
 
     st_set = stage_sub.add_parser("set", help="Upsert a stage row")
-    st_set.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_set.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_set.add_argument("run_id", help="Canonical run_id")
     st_set.add_argument("stage", help="Stage name (e.g. daily, publish_marketing, manifest, evidence)")
     st_set.add_argument("status", help="pending|running|ok|error|skipped")
@@ -2975,13 +2989,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     st_set.set_defaults(func=cmd_run_stage_set)
 
     st_get = stage_sub.add_parser("get", help="Get a stage row")
-    st_get.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_get.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_get.add_argument("run_id", help="Canonical run_id")
     st_get.add_argument("stage", help="Stage name")
     st_get.set_defaults(func=cmd_run_stage_get)
 
     st_ls = stage_sub.add_parser("list", help="List all stages for a run_id")
-    st_ls.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
+    st_ls.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_ls.add_argument("run_id", help="Canonical run_id")
     st_ls.set_defaults(func=cmd_run_stage_list)
 
