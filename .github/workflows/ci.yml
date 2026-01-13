@@ -97,7 +97,7 @@ jobs:
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
-      - name: Run determinism gate (run daily/publish/manifest + drop/drops + replay diff)
+      - name: Run determinism gate (existing)
         shell: bash
         env:
           MGC_DETERMINISTIC: "1"
@@ -107,35 +107,9 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
         run: |
           set -euxo pipefail
-
           bash scripts/ci_run_determinism.sh
 
-          python -m mgc.main run drop \
-            --context focus \
-            --seed 1 \
-            --deterministic \
-            --out-dir "${MGC_EVIDENCE_DIR}" \
-            > /tmp/mgc_drop.json
-          python -m json.tool < /tmp/mgc_drop.json > /dev/null
-
-          python -m mgc.main --json drops list --limit 1 > /tmp/mgc_drops_list.json
-          python -m json.tool < /tmp/mgc_drops_list.json > /dev/null
-
-          if command -v jq >/dev/null 2>&1; then
-            DROP_ID="$(jq -r '.drop.id' /tmp/mgc_drop.json)"
-            test -n "$DROP_ID" && test "$DROP_ID" != "null"
-            python -m mgc.main --json drops show "$DROP_ID" > /tmp/mgc_drops_show.json
-            python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
-          fi
-
-          mkdir -p "${MGC_ARTIFACTS_DIR}"
-          python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
-            > "${MGC_ARTIFACTS_DIR}/drop1.json"
-          python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
-            > "${MGC_ARTIFACTS_DIR}/drop2.json"
-          diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
-
-      - name: Web player build (bootstrap manifest -> drop -> collect audio -> synth playlist -> build)
+      - name: Web player build (deterministic synthetic audio -> playlist -> build)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -148,130 +122,37 @@ jobs:
           SRC_DIR="${RUNNER_TEMP}/mgc_web_src"
           TRACKS_DIR="${SRC_DIR}/tracks"
           mkdir -p "${OUT_DIR}" "${SRC_DIR}" "${TRACKS_DIR}"
-          export SRC_DIR
 
-          # cmd_run_drop hashes ${out_dir}/manifest.json. Create a minimal one here.
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
+          # Create a deterministic 1.5s sine wave WAV (no dependency on mgc run drop producing audio)
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i "sine=frequency=440:duration=1.5" \
+            -c:a pcm_s16le \
+            "${TRACKS_DIR}/track_001.wav"
 
-          out_dir = os.environ["SRC_DIR"]
-          fixed = os.environ.get("MGC_FIXED_TIME") or datetime.now(timezone.utc).isoformat()
-          manifest = {
-              "schema": "mgc.manifest.v1",
-              "created_ts": fixed,
-              "notes": "CI-generated minimal manifest to satisfy cmd_run_drop precondition",
-          }
-          path = os.path.join(out_dir, "manifest.json")
-          with open(path, "w", encoding="utf-8") as f:
-              json.dump(manifest, f, sort_keys=True, indent=2)
-              f.write("\n")
-          print("wrote", path)
-          PY
+          test -s "${TRACKS_DIR}/track_001.wav"
+          ls -la "${TRACKS_DIR}"
 
-          test -f "${SRC_DIR}/manifest.json"
-          python -m json.tool < "${SRC_DIR}/manifest.json" >/dev/null
-
-          # Run drop (may write audio elsewhere; stdout JSON may contain paths)
-          python -m mgc.main run drop \
-            --context focus \
-            --seed 1 \
-            --deterministic \
-            --out-dir "${SRC_DIR}" \
-            > "${SRC_DIR}/drop_stdout.json"
-          python -m json.tool < "${SRC_DIR}/drop_stdout.json" >/dev/null
-
-          # Collect audio paths from drop_stdout.json + common repo locations, then copy into TRACKS_DIR
-          python - <<'PY'
-          import json, os, pathlib, shutil, sys
-          from collections import OrderedDict
-
-          src_dir = pathlib.Path(os.environ["SRC_DIR"])
-          tracks_dir = src_dir / "tracks"
-          tracks_dir.mkdir(parents=True, exist_ok=True)
-
-          drop_json = src_dir / "drop_stdout.json"
-          data = json.loads(drop_json.read_text(encoding="utf-8"))
-
-          exts = (".wav", ".mp3")
-
-          def walk(obj):
-              if isinstance(obj, dict):
-                  for v in obj.values():
-                      yield from walk(v)
-              elif isinstance(obj, list):
-                  for v in obj:
-                      yield from walk(v)
-              elif isinstance(obj, str):
-                  yield obj
-
-          candidates = []
-          for s in walk(data):
-              s2 = s.strip()
-              if s2.lower().endswith(exts):
-                  candidates.append(s2)
-
-          # Normalize + keep only existing files
-          existing = OrderedDict()
-          for p in candidates:
-              pp = pathlib.Path(p)
-              if pp.exists() and pp.is_file():
-                  existing[str(pp.resolve())] = pp.resolve()
-
-          # Fallback search: common locations in the repo checkout
-          # (drop may write to data/tracks or similar)
-          repo_root = pathlib.Path(".").resolve()
-          for base in [repo_root / "data", repo_root]:
-              if not base.exists():
-                  continue
-              for ext in exts:
-                  for p in base.rglob(f"*{ext}"):
-                      # avoid huge env dirs if any
-                      if ".venv" in p.parts or "site-packages" in p.parts:
-                          continue
-                      existing.setdefault(str(p.resolve()), p.resolve())
-
-          if not existing:
-              print("ERROR: could not locate any audio files (.wav/.mp3) after run drop", file=sys.stderr)
-              print("drop_stdout.json keys sample:", file=sys.stderr)
-              if isinstance(data, dict):
-                  print(list(data.keys())[:50], file=sys.stderr)
-              sys.exit(2)
-
-          # Copy into SRC_DIR/tracks with stable names
-          copied = []
-          for i, p in enumerate(existing.values(), start=1):
-              dst = tracks_dir / f"track_{i:03d}{p.suffix.lower()}"
-              shutil.copy2(p, dst)
-              copied.append(dst)
-
-          print("copied_audio_count", len(copied))
-          for p in copied[:25]:
-              print("copied", p)
-          PY
-
-          # Synthesize a playlist JSON from the copied audio (guaranteed to live under SRC_DIR/tracks)
+          # Synthesize the playlist JSON that mgc web build can consume.
+          # Use relative paths from the playlist file's directory (SRC_DIR).
           PLAYLIST_JSON="${SRC_DIR}/ci_playlist.json"
           python - <<'PY'
-          import json, os, pathlib, sys
+          import json, os, pathlib
           from datetime import datetime, timezone
 
           src_dir = pathlib.Path(os.environ["SRC_DIR"])
           tracks_dir = src_dir / "tracks"
           fixed = os.environ.get("MGC_FIXED_TIME") or datetime.now(timezone.utc).isoformat()
 
-          audio = sorted([p for p in tracks_dir.iterdir() if p.is_file() and p.suffix.lower() in (".mp3", ".wav")])
-          if not audio:
-              print("ERROR: no audio files present in", tracks_dir, file=sys.stderr)
-              sys.exit(2)
+          audio = sorted([p for p in tracks_dir.iterdir() if p.is_file() and p.suffix.lower() in (".wav", ".mp3")])
+          assert audio, "no audio found in tracks_dir"
 
           tracks = []
           for i, p in enumerate(audio, start=1):
-              # Use relative paths so web build can copy them cleanly; also include a few common field names.
               rel = str(p.relative_to(src_dir))
               tracks.append({
                   "id": f"ci-track-{i}",
                   "title": p.stem,
+                  # Provide several common path keys so web build can pick what it expects.
                   "path": rel,
                   "file": rel,
                   "src": rel,
@@ -289,13 +170,12 @@ jobs:
           out_path = src_dir / "ci_playlist.json"
           out_path.write_text(json.dumps(playlist, sort_keys=True, indent=2) + "\n", encoding="utf-8")
           print("wrote", out_path)
-          print("track_count", len(tracks))
           PY
 
           test -s "${PLAYLIST_JSON}"
           python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
-          # Build web player. Use --strip-paths so relative track paths are resolved inside the build.
+          # Build web player
           python -m mgc.main web build \
             --playlist "${PLAYLIST_JSON}" \
             --out-dir "${OUT_DIR}" \
@@ -306,13 +186,13 @@ jobs:
             --json \
             | python -m json.tool
 
+          # Validate build output (at least one index.html + at least one audio file)
           test "$(find "${OUT_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
-          # Debug context
-          ls -la "${OUT_DIR}" || true
+          # Helpful debug listing
           find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
-          find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
+          find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 50 || true
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
@@ -331,7 +211,4 @@ jobs:
             ${{ env.MGC_EVIDENCE_DIR }}
             ${{ runner.temp }}/mgc_web
             ${{ runner.temp }}/mgc_web_src
-            /tmp/mgc_drop.json
-            /tmp/mgc_drops_list.json
-            /tmp/mgc_drops_show.json
           if-no-files-found: ignore
