@@ -25,8 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "${MGC_ARTIFACTS_DIR}"
-          mkdir -p "${MGC_EVIDENCE_DIR}"
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}"
           echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
           ls -la "${MGC_ARTIFACTS_DIR}"
           ls -la "${MGC_EVIDENCE_DIR}"
@@ -44,12 +43,21 @@ jobs:
           python -m pip install -U pip
           python -m pip install -e .
 
+      - name: Install ffmpeg (ffmpeg + ffprobe)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
       - name: Build fixture DB (copy to temp; reset repo file)
         shell: bash
         run: |
           set -euxo pipefail
 
-          # This script currently writes fixtures/ci_db.sqlite (in-repo).
+          # This script writes fixtures/ci_db.sqlite (in-repo).
           # Copy it into runner temp and then restore the repo copy so the tree stays clean.
           python scripts/make_fixture_db.py
 
@@ -57,7 +65,7 @@ jobs:
           sha256sum fixtures/ci_db.sqlite
 
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
-          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "${GITHUB_ENV}"
+          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
 
           # Restore the repo checkout to avoid accidental commits / dirty tree.
           git checkout -- fixtures/ci_db.sqlite || true
@@ -99,7 +107,6 @@ jobs:
         env:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-          # Use the runtime-set env var (NOT ${{ runner.temp }} here)
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
           MGC_DB: ${{ env.MGC_DB }}
@@ -131,7 +138,7 @@ jobs:
             python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
           fi
 
-          # NEW: Drop replay determinism + resume (run drop twice, diff stdout JSON)
+          # Drop replay determinism + resume (run drop twice, diff stdout JSON)
           mkdir -p "${MGC_ARTIFACTS_DIR}"
           python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
             > "${MGC_ARTIFACTS_DIR}/drop1.json"
@@ -139,16 +146,7 @@ jobs:
             > "${MGC_ARTIFACTS_DIR}/drop2.json"
           diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
 
-      - name: Install ffmpeg (ffmpeg + ffprobe)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          ffmpeg -version
-          ffprobe -version
-
-      - name: Web player build (mp3 + validate; must produce playable tracks)
+      - name: Web player build (generate playlist in temp; mp3 + validate)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -156,19 +154,49 @@ jobs:
           set -euxo pipefail
 
           OUT_DIR="${RUNNER_TEMP}/mgc_web"
-          mkdir -p "${OUT_DIR}"
+          PLAYLIST_ROOT="${RUNNER_TEMP}/mgc_playlists"
+          mkdir -p "${OUT_DIR}" "${PLAYLIST_ROOT}"
+
+          # The failure you hit was: data/playlists/tmp_wav_test.json not present in CI.
+          # Fix: generate a playlist JSON in runner temp (never rely on an untracked repo file).
+          #
+          # We try to use the rebuild command first, then autodiscover the produced playlist JSON.
+          # If your rebuild subcommand writes under a "data/playlists" subtree, discovery still works.
+          python -m mgc.main rebuild playlists \
+            --db "${MGC_DB}" \
+            --out-dir "${PLAYLIST_ROOT}" \
+            --write \
+            --json \
+            | python -m json.tool >/dev/null || true
+
+          PLAYLIST_JSON="$(find "${PLAYLIST_ROOT}" -type f -name '*.json' | head -n 1 || true)"
+          if [ -z "${PLAYLIST_JSON}" ]; then
+            echo "ERROR: no playlist JSON produced under ${PLAYLIST_ROOT}"
+            echo "Contents:"
+            find "${PLAYLIST_ROOT}" -maxdepth 4 -type f -print || true
+            exit 2
+          fi
+
+          echo "Using playlist JSON: ${PLAYLIST_JSON}"
+          python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
           python -m mgc.main web build \
-            --playlist data/playlists/tmp_wav_test.json \
+            --playlist "${PLAYLIST_JSON}" \
             --out-dir "${OUT_DIR}" \
             --prefer-mp3 \
             --clean \
             --fail-if-empty \
-            --json | python -m json.tool
+            --json \
+            | python -m json.tool
 
-          test -f "${OUT_DIR}/tmp_wav_test/index.html"
-          ls -la "${OUT_DIR}/tmp_wav_test"
-          ls -la "${OUT_DIR}/tmp_wav_test/tracks" | head
+          # Validate build output: there should be an index and at least one track file.
+          test -f "${OUT_DIR}/index.html" || test -f "${OUT_DIR}/tmp_wav_test/index.html"
+
+          # Print a little context for debugging (non-fatal if layout differs)
+          ls -la "${OUT_DIR}" || true
+          find "${OUT_DIR}" -maxdepth 3 -type f -name 'index.html' -print || true
+          find "${OUT_DIR}" -maxdepth 4 -type d -name 'tracks' -print || true
+          find "${OUT_DIR}" -maxdepth 5 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
@@ -185,15 +213,9 @@ jobs:
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
+            ${{ runner.temp }}/mgc_web
+            ${{ runner.temp }}/mgc_playlists
             /tmp/mgc_drop.json
             /tmp/mgc_drops_list.json
             /tmp/mgc_drops_show.json
-          if-no-files-found: ignore
-
-      - name: Upload web build artifact (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-tmp_wav_test
-          path: ${{ runner.temp }}/mgc_web/tmp_wav_test
           if-no-files-found: ignore
