@@ -12,6 +12,10 @@ import sqlite3
 import sys
 import time
 import uuid
+import math
+import wave
+import struct
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -901,6 +905,48 @@ def db_insert_event(con: sqlite3.Connection, *, event_id: str, ts: str, kind: st
         },
     )
 
+def _write_stub_wav(path: Path, seed: int, duration_s: float = 1.5, sample_rate: int = 44100) -> None:
+    """
+    Write a small deterministic mono PCM16 WAV file.
+
+    Determinism:
+    - frequency derived from seed
+    - fixed sample rate + duration
+    - fixed amplitude
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Deterministic frequency in a pleasant range
+    base = 220.0
+    freq = base + float(seed % 220)  # 220..439 Hz
+
+    nframes = int(duration_s * sample_rate)
+    amp = 0.25  # keep conservative to avoid clipping
+    two_pi_f = 2.0 * math.pi * freq
+
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+
+        for i in range(nframes):
+            t = i / sample_rate
+            sample = amp * math.sin(two_pi_f * t)
+            pcm = int(max(-1.0, min(1.0, sample)) * 32767.0)
+            wf.writeframes(struct.pack("<h", pcm))
+
+
+def _write_minimal_manifest(path: Path, fixed_ts_iso: str) -> None:
+    """
+    Create a minimal manifest.json if one doesn't exist.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    obj = {
+        "schema": "mgc.manifest.v1",
+        "created_ts": fixed_ts_iso,
+        "notes": "Auto-created manifest (missing at run drop time).",
+    }
+    path.write_text(json.dumps(obj, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -1329,11 +1375,28 @@ def _stub_daily_run(
 ) -> Dict[str, Any]:
     """
     Daily run implementation using provider abstraction.
+
+    Produces:
+      - provider artifact under data/tracks/... (repo storage)
+      - bundled copy under out_dir/tracks/<track_id>.<ext> (portable drop artifact)
+      - out_dir/playlist.json pointing at bundled track (web-build friendly)
+      - out_dir/daily_evidence*.json includes bundle paths + sha256
+
     Supports:
       - stub (deterministic placeholder)
       - riffusion (local server)
       - staged providers (suno, diffsinger)
     """
+    import hashlib
+    import shutil
+
+    def _sha256_file(p: Path) -> str:
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     drop_id = stable_uuid5("drop", run_id)
@@ -1341,7 +1404,7 @@ def _stub_daily_run(
 
     title = f"{context.title()} Track {seed}"
 
-    # Artifact path (provider may change extension)
+    # Artifact path in repo storage (provider may change extension)
     if deterministic:
         artifact_rel = Path("data") / "tracks" / f"{track_id}"
     else:
@@ -1373,12 +1436,16 @@ def _stub_daily_run(
     )
 
     # Ensure extension matches provider output
-    if result.ext and not str(artifact_path).endswith(result.ext):
-        artifact_rel = artifact_rel.with_suffix(result.ext)
-        artifact_path = (Path.cwd() / artifact_rel).resolve()
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    if result.ext:
+        ext = result.ext if result.ext.startswith(".") else f".{result.ext}"
+        if artifact_path.suffix != ext:
+            artifact_rel = artifact_rel.with_suffix(ext)
+            artifact_path = (Path.cwd() / artifact_rel).resolve()
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    artifact_path.write_bytes(result.artifact_bytes)
+    # Write provider artifact bytes (repo storage)
+    artifact_bytes = result.artifact_bytes or b""
+    artifact_path.write_bytes(artifact_bytes)
 
     # Insert track
     db_insert_track(
@@ -1492,6 +1559,61 @@ def _stub_daily_run(
         },
     )
 
+    # ------------------------------------------------------------------
+    # Bundle materialization in out_dir
+    # ------------------------------------------------------------------
+    bundle_tracks_dir = out_dir / "tracks"
+    bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    bundle_track_path = bundle_tracks_dir / f"{track_id}{artifact_path.suffix}"
+    shutil.copy2(artifact_path, bundle_track_path)
+
+    bundle_track_sha256 = _sha256_file(bundle_track_path)
+    repo_track_sha256 = _sha256_file(artifact_path)
+
+    # Playlist for web build: include MANY common field names (absolute + relative)
+    playlist_path = out_dir / "playlist.json"
+    rel_bundle_track = str(bundle_track_path.relative_to(out_dir)).replace("\\", "/")
+
+    track_obj = {
+        "id": track_id,
+        "title": title,
+
+        # Absolute (web build can always resolve)
+        "artifact_path": str(bundle_track_path),
+        "audio_path": str(bundle_track_path),
+
+        # Relative (portable; relative to out_dir / playlist directory)
+        "artifact_rel": rel_bundle_track,
+        "audio_rel": rel_bundle_track,
+
+        # Keep existing common keys too
+        "path": rel_bundle_track,
+        "file": rel_bundle_track,
+        "src": rel_bundle_track,
+        "abs_path": str(bundle_track_path),
+
+        # Debug / provenance
+        "repo_artifact_path": str(artifact_path),
+    }
+
+    playlist_obj = {
+        "schema": "mgc.playlist.v1",
+        "id": f"drop-{str(track_id)[:8]}",
+        "name": f"{context}_drop_{seed}",
+        "created_ts": ts,
+        "context": context,
+        "seed": seed,
+        "track_count": 1,
+        "tracks": [track_obj],
+    }
+
+    playlist_path.write_text(
+        json.dumps(playlist_obj, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    playlist_sha256 = _sha256_file(playlist_path)
+
     # Evidence object
     evidence = {
         "run_id": run_id,
@@ -1505,8 +1627,18 @@ def _stub_daily_run(
             "id": track_id,
             "title": title,
             "artifact_path": str(artifact_rel).replace("\\", "/"),
-            "size": len(result.artifact_bytes),
+            "size": len(artifact_bytes),
             "mime": result.mime,
+            "repo_artifact_sha256": repo_track_sha256,
+        },
+        "bundle": {
+            "out_dir": str(out_dir),
+            "tracks_dir": str(bundle_tracks_dir),
+            "track_path": str(bundle_track_path),
+            "track_rel": rel_bundle_track,
+            "track_sha256": bundle_track_sha256,
+            "playlist_path": str(playlist_path),
+            "playlist_sha256": playlist_sha256,
         },
         "marketing_drafts": [{"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)],
     }
@@ -1515,7 +1647,6 @@ def _stub_daily_run(
     evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8")
 
     return evidence
-
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
@@ -1741,187 +1872,169 @@ def _drop_latest_for_run(con: sqlite3.Connection, run_id: str) -> Optional[sqlit
 
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
-    deterministic = is_deterministic(args)
+    """
+    Produce one deterministic "drop" bundle under --out-dir.
 
-    db_path = resolve_db_path(args)
-    context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(getattr(args, "seed", None) if getattr(args, "seed", None) is not None else (os.environ.get("MGC_SEED") or "1"))
-    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
+    This command MUST:
+      - ensure manifest.json exists under out_dir
+      - run the daily generator (stub/riffusion/...) to materialize audio + DB rows
+      - write drop_evidence.json under out_dir, including bundle track + playlist paths
+      - print a small JSON summary to stdout
+    """
+    import sqlite3
+    import os
+    from pathlib import Path
 
-    limit = int(getattr(args, "limit", None) or 50)
-    dry_run = bool(getattr(args, "dry_run", False))
+    deterministic = bool(getattr(args, "deterministic", False)) or bool(
+        (os.environ.get("MGC_DETERMINISTIC") or "").strip().lower() in ("1", "true", "yes")
+    )
+
+    context = str(getattr(args, "context", None) or "focus")
+    seed = str(getattr(args, "seed", None) or "1")
+
     allow_resume = not bool(getattr(args, "no_resume", False))
+    dry_run = bool(getattr(args, "dry_run", False))
 
     ts = deterministic_now_iso(deterministic)
     run_date = ts.split("T", 1)[0]
 
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").resolve()
+    out_dir = Path(
+        getattr(args, "out_dir", None)
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-
-    run_id = db_get_or_create_run_id(
-        con,
-        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
-        ts=ts,
-        argv=list(sys.argv),
+    # DB path
+    db_path = (
+        getattr(args, "db", None)
+        or os.environ.get("MGC_DB")
+        or "data/db.sqlite"
     )
+    db_path = str(Path(db_path).expanduser())
 
-    # Stage 1: daily
-    with run_stage(
-        con,
-        run_id=run_id,
-        stage="daily",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"context": context, "seed": seed},
-    ) as should_run:
-        if should_run:
-            with _silence_stdout(True):
-                daily_ns = argparse.Namespace(
-                    db=db_path,
-                    context=context,
-                    seed=seed,
-                    out_dir=str(out_dir),
-                    deterministic=deterministic,
-                )
-                cmd_run_daily(daily_ns)
+    # Run id for this drop
+    run_id = stable_uuid5("run", "drop", context, seed, run_date, "det" if deterministic else "live")
 
-    # Stage 2: publish-marketing
-    with run_stage(
-        con,
-        run_id=run_id,
-        stage="publish_marketing",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"limit": limit, "dry_run": dry_run},
-    ) as should_run:
-        if should_run:
-            with _silence_stdout(True):
-                pub_ns = argparse.Namespace(
-                    db=db_path,
-                    limit=limit,
-                    dry_run=dry_run,
-                    deterministic=deterministic,
-                )
-                cmd_publish_marketing(pub_ns)
-
-    # Resolve latest drop row for pointers
-    drop_row = _drop_latest_for_run(con, run_id)
-    drop_obj: Dict[str, Any] = dict(drop_row) if drop_row else {}
-    drop_id = str(drop_obj.get("id") or stable_uuid5("drop", run_id))
-
-    out_path = out_dir / ("drop_evidence.json" if deterministic else f"drop_evidence_{drop_id}.json")
-    manifest_path = out_dir / ("manifest.json" if deterministic else f"manifest_{drop_id}.json")
-
-    # Stage 3: manifest
-    with run_stage(
-        con,
-        run_id=run_id,
-        stage="manifest",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"repo_root": str(getattr(args, "repo_root", None) or ".")},
-    ) as should_run:
-        if should_run:
-            with _silence_stdout(True):
-                manifest_ns = argparse.Namespace(
-                    repo_root=str(getattr(args, "repo_root", None) or "."),
-                    out=str(manifest_path),
-                    print_hash=False,
-                    include=getattr(args, "include", None),
-                    exclude_dir=getattr(args, "exclude_dir", None),
-                    exclude_glob=getattr(args, "exclude_glob", None),
-                )
-                cmd_run_manifest(manifest_ns)
-
+    # ---------------------------------------------------------------------
+    # Ensure manifest exists in out_dir (cmd_run_drop hashes this)
+    # ---------------------------------------------------------------------
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        _write_minimal_manifest(manifest_path, ts)
     manifest_sha256 = _sha256_file(manifest_path)
 
-    # Stage 4: evidence write + persist pointers
-    with run_stage(
-        con,
-        run_id=run_id,
-        stage="evidence",
-        deterministic=deterministic,
-        allow_resume=allow_resume,
-        meta={"evidence_path": str(out_path), "manifest_path": str(manifest_path)},
-    ) as should_run:
-        if should_run:
-            evidence: Dict[str, Any] = {
-                "ts": ts,
-                "deterministic": deterministic,
-                "run_key": {
-                    "run_date": run_date,
-                    "context": context,
-                    "seed": seed,
-                    "provider_set_version": provider_set_version,
-                },
-                "run_id": run_id,
-                "drop": {
-                    "id": drop_obj.get("id") or drop_id,
-                    "run_id": drop_obj.get("run_id") or run_id,
-                    "track_id": drop_obj.get("track_id"),
-                    "marketing_batch_id": drop_obj.get("marketing_batch_id"),
-                    "published_ts": drop_obj.get("published_ts"),
-                },
-                "paths": {
-                    "evidence_path": str(out_path),
-                    "manifest_path": str(manifest_path),
-                    "manifest_sha256": manifest_sha256,
-                },
-                "stages": {"allow_resume": allow_resume},
-            }
+    # ---------------------------------------------------------------------
+    # Run the generator path (this is what actually creates audio + DB rows)
+    # ---------------------------------------------------------------------
+    if dry_run:
+        # In dry-run, we don't mutate DB or write audio; just emit the metadata we can.
+        drop_id = stable_uuid5("drop", run_id)
+        evidence_obj = {
+            "schema": "mgc.drop_evidence.v1",
+            "ts": ts,
+            "deterministic": deterministic,
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "context": context,
+            "seed": seed,
+            "stages": {"allow_resume": bool(allow_resume)},
+            "paths": {
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha256,
+            },
+            "note": "dry_run=true; generator not executed",
+        }
+    else:
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("PRAGMA foreign_keys = ON")
+            # This call is now the canonical place where audio is produced and bundled.
+            daily = _stub_daily_run(
+                con=con,
+                context=context,
+                seed=seed,
+                deterministic=deterministic,
+                ts=ts,
+                out_dir=out_dir,
+                run_id=run_id,
+            )
+            con.commit()
+        finally:
+            con.close()
 
-            out_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
+        # daily contains: run_id/drop_id/track/artifact_path + NEW bundle fields + playlist.json written
+        drop_id = str(daily.get("drop_id") or stable_uuid5("drop", run_id))
+        track_id = None
+        try:
+            track_id = str((daily.get("track") or {}).get("id") or "")
+        except Exception:
+            track_id = ""
 
-            # Best-effort persist evidence pointers into drop meta (only if drop exists)
-            if drop_obj.get("id"):
-                existing_meta: Dict[str, Any] = {}
-                meta_raw = drop_obj.get("meta_json")
-                if isinstance(meta_raw, str) and meta_raw.strip():
-                    try:
-                        existing_meta = json.loads(meta_raw)
-                        if not isinstance(existing_meta, dict):
-                            existing_meta = {}
-                    except Exception:
-                        existing_meta = {}
+        evidence_obj = {
+            "schema": "mgc.drop_evidence.v1",
+            "ts": ts,
+            "deterministic": deterministic,
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "context": context,
+            "seed": seed,
+            "stages": {"allow_resume": bool(allow_resume)},
+            "paths": {
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha256,
+            },
+            "daily": daily,
+        }
 
-                existing_meta.update(evidence["paths"])
-                existing_meta.update({"run_id": run_id, "run_key": evidence["run_key"]})
-
-                cols = db_table_columns(con, "drops")
-                meta_col = _pick_first_existing(cols, ["meta_json", "metadata_json", "meta", "metadata"])
-                id_col = _pick_first_existing(cols, ["id", "drop_id"]) or "id"
-                if meta_col:
-                    con.execute(
-                        f"UPDATE drops SET {meta_col} = ? WHERE {id_col} = ?",
-                        (stable_json_dumps(existing_meta), str(drop_obj.get("id"))),
-                    )
-                    con.commit()
-
-    # Emit exactly one JSON object
-    try:
-        sys.stdout.write(out_path.read_text(encoding="utf-8"))
-    except Exception:
-        sys.stdout.write(
-            stable_json_dumps(
+        # Surface the bundle paths at top-level for convenience
+        bundle = (daily or {}).get("bundle") if isinstance(daily, dict) else None
+        if isinstance(bundle, dict):
+            evidence_obj["paths"].update(
                 {
-                    "ts": ts,
-                    "deterministic": deterministic,
-                    "run_id": run_id,
-                    "drop_id": drop_id,
-                    "paths": {
-                        "evidence_path": str(out_path),
-                        "manifest_path": str(manifest_path),
-                        "manifest_sha256": manifest_sha256,
-                    },
+                    "bundle_dir": str(bundle.get("out_dir") or str(out_dir)),
+                    "bundle_track_path": str(bundle.get("track_path") or ""),
+                    "bundle_track_sha256": str(bundle.get("track_sha256") or ""),
+                    "playlist_path": str(bundle.get("playlist_path") or (out_dir / "playlist.json")),
+                    "playlist_sha256": str(bundle.get("playlist_sha256") or ""),
                 }
             )
-            + "\n"
-        )
-    return 0
 
+        if track_id:
+            evidence_obj["track_id"] = track_id
+
+    # ---------------------------------------------------------------------
+    # Write drop evidence in out_dir
+    # ---------------------------------------------------------------------
+    evidence_path = out_dir / "drop_evidence.json"
+    evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
+
+    # ---------------------------------------------------------------------
+    # Print stdout summary JSON (keep your shape, but include bundle paths if present)
+    # ---------------------------------------------------------------------
+    out = {
+        "deterministic": bool(deterministic),
+        "drop_id": str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id)),
+        "run_id": run_id,
+        "ts": ts,
+        "paths": {
+            "evidence_path": str(evidence_path),
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": manifest_sha256,
+        },
+    }
+
+    # bubble up useful bundle paths when available
+    try:
+        p = evidence_obj.get("paths") or {}
+        for k in ("bundle_dir", "bundle_track_path", "bundle_track_sha256", "playlist_path", "playlist_sha256"):
+            if k in p and p[k]:
+                out["paths"][k] = p[k]
+    except Exception:
+        pass
+
+    print(stable_json_dumps(out))
+    return 0
 
 def cmd_run_tail(args: argparse.Namespace) -> int:
     evidence_dir = Path(
