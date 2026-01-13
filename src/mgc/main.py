@@ -279,7 +279,12 @@ def _maybe_int(v: Any) -> Optional[int]:
         return None
 
 
-def _safe_select_playlist_rows(conn: sqlite3.Connection, *, limit: int, slug: Optional[str] = None) -> List[sqlite3.Row]:
+def _safe_select_playlist_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    slug: Optional[str] = None,
+) -> List[sqlite3.Row]:
     if not _table_exists(conn, "playlists"):
         return []
 
@@ -444,7 +449,12 @@ def _extract_playlist_json_from_row(d: Dict[str, Any]) -> Optional[Any]:
     return None
 
 
-def _reconstruct_playlist_json(conn: sqlite3.Connection, playlist_row: Dict[str, Any], *, item_limit: int = 500) -> Dict[str, Any]:
+def _reconstruct_playlist_json(
+    conn: sqlite3.Connection,
+    playlist_row: Dict[str, Any],
+    *,
+    item_limit: int = 500,
+) -> Dict[str, Any]:
     pid = str(playlist_row.get("id", ""))
     slug = str(playlist_row.get("slug", playlist_row.get("name", "")) or "")
     created_at = playlist_row.get("created_at", playlist_row.get("created_ts", playlist_row.get("created", "")))
@@ -782,8 +792,19 @@ def _path_info(path: Path) -> Dict[str, Any]:
         is_dir = path.is_dir() if exists else False
         is_file = path.is_file() if exists else False
         size = path.stat().st_size if (exists and is_file) else None
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds") if exists else None
-        return {"path": str(path), "exists": exists, "is_dir": is_dir, "is_file": is_file, "size": size, "mtime_utc": mtime}
+        mtime = (
+            datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+            if exists
+            else None
+        )
+        return {
+            "path": str(path),
+            "exists": exists,
+            "is_dir": is_dir,
+            "is_file": is_file,
+            "size": size,
+            "mtime_utc": mtime,
+        }
     except Exception as e:
         return {"path": str(path), "exists": False, "error": str(e)}
 
@@ -827,10 +848,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     db = DBConn(db_path)
     with db.connect() as conn:
         for t in ("events", "playlist_runs", "playlists", "playlist_items", "tracks", "marketing_posts"):
-            out["tables"][t] = {
-                "exists": _table_exists(conn, t),
-                "count": _db_count(conn, t),
-            }
+            out["tables"][t] = {"exists": _table_exists(conn, t), "count": _db_count(conn, t)}
 
         latest_playlist = _safe_latest_row(conn, "playlists")
         if latest_playlist is not None:
@@ -856,11 +874,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             rows = _safe_select_latest_playlists_by_slug(conn)
             out["latest"]["playlists_by_slug"] = [
                 {
-                    "id": r.get("id"),
-                    "slug": r.get("slug", r.get("name")),
-                    "created_at": r.get("created_at", r.get("created_ts")),
+                    "id": item.get("id"),
+                    "slug": item.get("slug", item.get("name")),
+                    "created_at": item.get("created_at", item.get("created_ts")),
                 }
-                for r in (_row_to_dict(x) for x in rows)
+                for item in (_row_to_dict(x) for x in rows)
             ]
         except Exception:
             pass
@@ -908,7 +926,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("  latest:")
         if "playlist" in latest:
             d = latest["playlist"]
-            print(f"    playlist: id={d.get('id')} slug={d.get('slug', d.get('name'))} created={d.get('created_at', d.get('created_ts'))}")
+            print(
+                f"    playlist: id={d.get('id')} slug={d.get('slug', d.get('name'))} created={d.get('created_at', d.get('created_ts'))}"
+            )
         if "track" in latest:
             d = latest["track"]
             title = d.get("title") or d.get("name") or d.get("slug") or ""
@@ -943,12 +963,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ----------------------------
 
 def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
-    return (
-        arg_db
-        or global_db
-        or os.environ.get("MGC_DB")
-        or DEFAULT_DB
-    )
+    return arg_db or global_db or os.environ.get("MGC_DB") or DEFAULT_DB
 
 
 def _resolve_artifacts_dir(default_out_dir: str) -> Path:
@@ -973,9 +988,10 @@ def cmd_rebuild_ls(args: argparse.Namespace) -> int:
 
     out: Dict[str, Any] = {"db": str(db.path), "tables": [], "counts": {}}
     with db.connect() as conn:
-        out["tables"] = [r["name"] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name ASC"
-        ).fetchall()]
+        out["tables"] = [
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name ASC").fetchall()
+        ]
         for t in ("events", "marketing_posts", "playlist_items", "playlist_runs", "playlists", "tracks"):
             if _table_exists(conn, t):
                 out["counts"][t] = int(conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"])
@@ -1274,7 +1290,6 @@ def build_parser() -> argparse.ArgumentParser:
         from mgc.drops_cli import register_drops_subcommand  # type: ignore
     except Exception:
         register_drops_subcommand = None  # type: ignore
-
     if register_drops_subcommand:
         register_drops_subcommand(sub)
 
@@ -1283,7 +1298,6 @@ def build_parser() -> argparse.ArgumentParser:
         from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
     except Exception:
         register_analytics_subcommand = None  # type: ignore
-
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
 
@@ -1300,7 +1314,6 @@ def build_parser() -> argparse.ArgumentParser:
         from mgc.run_cli import register_run_subcommand  # type: ignore
     except Exception as e:
         raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
-
     register_run_subcommand(sub)
 
     return p
@@ -1319,6 +1332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.debug("argv=%s", sys.argv if argv is None else ["mgc", *argv])
     log.debug("db=%s", args.db)
 
+    # handy for subcommands that accept --db and also want to fall back to the global
     setattr(args, "global_db", getattr(args, "db", None))
     if not hasattr(args, "sub_json"):
         setattr(args, "sub_json", False)
