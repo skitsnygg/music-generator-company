@@ -56,7 +56,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           python scripts/make_fixture_db.py
 
           ls -la fixtures
@@ -149,19 +148,50 @@ jobs:
           SRC_DIR="${RUNNER_TEMP}/mgc_web_src"
           mkdir -p "${OUT_DIR}" "${SRC_DIR}"
 
-          # Ensure manifest.json exists where cmd_run_drop expects it
-          python -m mgc.main run manifest \
-            --context focus \
-            --seed 1 \
-            --deterministic \
-            --out-dir "${SRC_DIR}" \
-            > "${SRC_DIR}/manifest_stdout.json" || true
+          # 1) Produce manifest using whatever args `run manifest` supports (apparently none).
+          python -m mgc.main run manifest
 
-          # Sanity: must exist (this is what was missing)
+          # 2) Locate the manifest file it produced and copy into SRC_DIR/manifest.json
+          MANIFEST_SRC="$(
+            python - <<'PY'
+          import pathlib, sys
+
+          # Common locations (keep this simple and explicit)
+          candidates = [
+              pathlib.Path("data/evidence/manifest.json"),
+              pathlib.Path("data/manifest.json"),
+              pathlib.Path("manifest.json"),
+          ]
+          for p in candidates:
+              if p.exists():
+                  print(str(p))
+                  sys.exit(0)
+
+          # Fallback: search repo for a manifest.json (limit depth to keep it cheap)
+          for p in pathlib.Path(".").rglob("manifest.json"):
+              if "site-packages" in str(p):
+                  continue
+              # prefer data/evidence style if it exists
+              print(str(p))
+              sys.exit(0)
+
+          print("", end="")
+          sys.exit(1)
+          PY
+          )"
+
+          if [ -z "${MANIFEST_SRC}" ]; then
+            echo "ERROR: run manifest produced no manifest.json in expected locations"
+            echo "Repo search (first 50):"
+            find . -name manifest.json | head -n 50 || true
+            exit 2
+          fi
+
+          echo "Found manifest at: ${MANIFEST_SRC}"
+          cp -f "${MANIFEST_SRC}" "${SRC_DIR}/manifest.json"
           test -f "${SRC_DIR}/manifest.json"
-          python -m json.tool < "${SRC_DIR}/manifest.json" >/dev/null || true
 
-          # Now drop can hash manifest.json safely
+          # 3) Now run drop into SRC_DIR (cmd_run_drop expects manifest.json in --out-dir)
           python -m mgc.main run drop \
             --context focus \
             --seed 1 \
@@ -170,7 +200,7 @@ jobs:
             > "${SRC_DIR}/drop_stdout.json"
           python -m json.tool < "${SRC_DIR}/drop_stdout.json" >/dev/null
 
-          # Find a JSON file with a non-empty tracks list
+          # 4) Find a JSON file with non-empty tracks list
           PLAYLIST_JSON="$(
             SRC_DIR="${SRC_DIR}" python - <<'PY'
           import json, os, pathlib, sys
@@ -219,6 +249,7 @@ jobs:
           test -s "${PLAYLIST_JSON}"
           python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
+          # 5) Build web player
           python -m mgc.main web build \
             --playlist "${PLAYLIST_JSON}" \
             --out-dir "${OUT_DIR}" \
