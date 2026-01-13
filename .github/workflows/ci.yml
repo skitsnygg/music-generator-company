@@ -57,8 +57,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # This script writes fixtures/ci_db.sqlite (in-repo).
-          # Copy it into runner temp and then restore the repo copy so the tree stays clean.
           python scripts/make_fixture_db.py
 
           ls -la fixtures
@@ -67,10 +65,9 @@ jobs:
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
           echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
 
-          # Restore the repo checkout to avoid accidental commits / dirty tree.
+          # Keep the checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
-          # Sanity: show which DB CI will use going forward
           ls -la "${RUNNER_TEMP}/ci_db.sqlite"
           sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
 
@@ -113,10 +110,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Existing determinism checks (rebuild determinism, manifest hashing, etc.)
           bash scripts/ci_run_determinism.sh
 
-          # Drop smoke: run a deterministic drop, writing outputs to runner temp
           python -m mgc.main run drop \
             --context focus \
             --seed 1 \
@@ -125,11 +120,9 @@ jobs:
             > /tmp/mgc_drop.json
           python -m json.tool < /tmp/mgc_drop.json > /dev/null
 
-          # IMPORTANT: --json is a GLOBAL flag, so it must come before the subcommand.
           python -m mgc.main --json drops list --limit 1 > /tmp/mgc_drops_list.json
           python -m json.tool < /tmp/mgc_drops_list.json > /dev/null
 
-          # Optional stronger check with jq
           if command -v jq >/dev/null 2>&1; then
             DROP_ID="$(jq -r '.drop.id' /tmp/mgc_drop.json)"
             test -n "$DROP_ID" && test "$DROP_ID" != "null"
@@ -138,7 +131,6 @@ jobs:
             python -m json.tool < /tmp/mgc_drops_show.json > /dev/null
           fi
 
-          # Drop replay determinism + resume (run drop twice, diff stdout JSON)
           mkdir -p "${MGC_ARTIFACTS_DIR}"
           python -m mgc.main --log-level INFO run drop --context focus --seed 1 --deterministic --out-dir "${MGC_EVIDENCE_DIR}" \
             > "${MGC_ARTIFACTS_DIR}/drop1.json"
@@ -146,7 +138,7 @@ jobs:
             > "${MGC_ARTIFACTS_DIR}/drop2.json"
           diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
 
-      - name: Web player build (generate playlist in temp; mp3 + validate)
+      - name: Web player build (generate playlist JSON from stdout; mp3 + validate)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -157,27 +149,21 @@ jobs:
           PLAYLIST_ROOT="${RUNNER_TEMP}/mgc_playlists"
           mkdir -p "${OUT_DIR}" "${PLAYLIST_ROOT}"
 
-          # The failure you hit was: data/playlists/tmp_wav_test.json not present in CI.
-          # Fix: generate a playlist JSON in runner temp (never rely on an untracked repo file).
-          #
-          # We try to use the rebuild command first, then autodiscover the produced playlist JSON.
-          # If your rebuild subcommand writes under a "data/playlists" subtree, discovery still works.
+          # Key fix:
+          # `mgc rebuild playlists` did NOT write any JSON files under --out-dir in CI,
+          # but it *does* emit JSON on stdout when --json is used.
+          # So: capture stdout as the playlist JSON file and use that for web build.
+          PLAYLIST_JSON="${PLAYLIST_ROOT}/playlist.json"
+
           python -m mgc.main rebuild playlists \
             --db "${MGC_DB}" \
             --out-dir "${PLAYLIST_ROOT}" \
             --write \
             --json \
-            | python -m json.tool >/dev/null || true
+            | tee "${PLAYLIST_JSON}" \
+            | python -m json.tool >/dev/null
 
-          PLAYLIST_JSON="$(find "${PLAYLIST_ROOT}" -type f -name '*.json' | head -n 1 || true)"
-          if [ -z "${PLAYLIST_JSON}" ]; then
-            echo "ERROR: no playlist JSON produced under ${PLAYLIST_ROOT}"
-            echo "Contents:"
-            find "${PLAYLIST_ROOT}" -maxdepth 4 -type f -print || true
-            exit 2
-          fi
-
-          echo "Using playlist JSON: ${PLAYLIST_JSON}"
+          test -s "${PLAYLIST_JSON}"
           python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
           python -m mgc.main web build \
@@ -189,14 +175,17 @@ jobs:
             --json \
             | python -m json.tool
 
-          # Validate build output: there should be an index and at least one track file.
-          test -f "${OUT_DIR}/index.html" || test -f "${OUT_DIR}/tmp_wav_test/index.html"
+          # Validate build output (layout can vary; be tolerant but assert we got something real)
+          find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print
+          test "$(find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' | wc -l)" -ge 1
 
-          # Print a little context for debugging (non-fatal if layout differs)
+          # Must contain at least one audio file
+          test "$(find "${OUT_DIR}" -maxdepth 6 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
+
+          # Debug context (helpful if it fails later)
           ls -la "${OUT_DIR}" || true
-          find "${OUT_DIR}" -maxdepth 3 -type f -name 'index.html' -print || true
-          find "${OUT_DIR}" -maxdepth 4 -type d -name 'tracks' -print || true
-          find "${OUT_DIR}" -maxdepth 5 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
+          find "${OUT_DIR}" -maxdepth 3 -type d -name 'tracks' -print || true
+          find "${OUT_DIR}" -maxdepth 6 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
