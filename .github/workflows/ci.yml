@@ -57,6 +57,7 @@ jobs:
         run: |
           set -euxo pipefail
 
+          # Generates fixtures/ci_db.sqlite (in-repo)
           python scripts/make_fixture_db.py
 
           ls -la fixtures
@@ -65,7 +66,7 @@ jobs:
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
           echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
 
-          # Keep the checkout clean
+          # Keep checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
           ls -la "${RUNNER_TEMP}/ci_db.sqlite"
@@ -138,31 +139,79 @@ jobs:
             > "${MGC_ARTIFACTS_DIR}/drop2.json"
           diff -u "${MGC_ARTIFACTS_DIR}/drop1.json" "${MGC_ARTIFACTS_DIR}/drop2.json"
 
-      - name: Web player build (generate playlist JSON from stdout; mp3 + validate)
+      - name: Web player build (generate real playlist-with-tracks; mp3 + validate)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
         run: |
           set -euxo pipefail
 
           OUT_DIR="${RUNNER_TEMP}/mgc_web"
-          PLAYLIST_ROOT="${RUNNER_TEMP}/mgc_playlists"
-          mkdir -p "${OUT_DIR}" "${PLAYLIST_ROOT}"
+          SRC_DIR="${RUNNER_TEMP}/mgc_web_src"
+          mkdir -p "${OUT_DIR}" "${SRC_DIR}"
 
-          # Key fix:
-          # `mgc rebuild playlists` did NOT write any JSON files under --out-dir in CI,
-          # but it *does* emit JSON on stdout when --json is used.
-          # So: capture stdout as the playlist JSON file and use that for web build.
-          PLAYLIST_JSON="${PLAYLIST_ROOT}/playlist.json"
+          # IMPORTANT:
+          # `mgc rebuild playlists --json` can emit a summary JSON with track_count=0.
+          # For the web build we need an actual playlist JSON that includes a non-empty `tracks` list.
+          #
+          # So we run a deterministic drop into SRC_DIR, then scan for a JSON file that contains tracks.
+          python -m mgc.main run drop \
+            --context focus \
+            --seed 1 \
+            --deterministic \
+            --out-dir "${SRC_DIR}" \
+            > "${SRC_DIR}/drop_stdout.json"
+          python -m json.tool < "${SRC_DIR}/drop_stdout.json" >/dev/null
 
-          python -m mgc.main rebuild playlists \
-            --db "${MGC_DB}" \
-            --out-dir "${PLAYLIST_ROOT}" \
-            --write \
-            --json \
-            | tee "${PLAYLIST_JSON}" \
-            | python -m json.tool >/dev/null
+          PLAYLIST_JSON="$(
+            SRC_DIR="${SRC_DIR}" python - <<'PY'
+          import json, os, pathlib, sys
 
+          root = pathlib.Path(os.environ["SRC_DIR"])
+          candidates = []
+
+          def tracks_in(obj):
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("tracks"), list):
+                      return obj["tracks"]
+                  pl = obj.get("playlist")
+                  if isinstance(pl, dict) and isinstance(pl.get("tracks"), list):
+                      return pl["tracks"]
+              return None
+
+          for p in root.rglob("*.json"):
+              try:
+                  data = json.loads(p.read_text(encoding="utf-8"))
+              except Exception:
+                  continue
+              tr = tracks_in(data)
+              if tr and len(tr) > 0:
+                  candidates.append(p)
+
+          if not candidates:
+              print("ERROR: no playlist JSON with non-empty tracks found under", root, file=sys.stderr)
+              # Helpful diagnostics
+              all_json = sorted(root.rglob("*.json"))
+              print("JSON files present:", file=sys.stderr)
+              for p in all_json[:200]:
+                  try:
+                      data = json.loads(p.read_text(encoding="utf-8"))
+                      tr = tracks_in(data)
+                      n = len(tr) if isinstance(tr, list) else 0
+                  except Exception:
+                      n = -1
+                  print(f"  - {p} (tracks={n})", file=sys.stderr)
+              sys.exit(2)
+
+          # Pick the largest (usually the “full” playlist export, not a tiny status blob)
+          best = sorted(candidates, key=lambda x: x.stat().st_size, reverse=True)[0]
+          print(str(best))
+          PY
+          )"
+
+          echo "Using playlist JSON: ${PLAYLIST_JSON}"
           test -s "${PLAYLIST_JSON}"
           python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
 
@@ -170,22 +219,21 @@ jobs:
             --playlist "${PLAYLIST_JSON}" \
             --out-dir "${OUT_DIR}" \
             --prefer-mp3 \
+            --strip-paths \
             --clean \
             --fail-if-empty \
             --json \
             | python -m json.tool
 
-          # Validate build output (layout can vary; be tolerant but assert we got something real)
-          find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print
-          test "$(find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' | wc -l)" -ge 1
+          # Validate output: at least one index.html and at least one audio file
+          test "$(find "${OUT_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
+          test "$(find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
-          # Must contain at least one audio file
-          test "$(find "${OUT_DIR}" -maxdepth 6 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
-
-          # Debug context (helpful if it fails later)
+          # Debug context (helps if this ever flakes)
           ls -la "${OUT_DIR}" || true
-          find "${OUT_DIR}" -maxdepth 3 -type d -name 'tracks' -print || true
-          find "${OUT_DIR}" -maxdepth 6 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
+          find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
+          find "${OUT_DIR}" -maxdepth 6 -type d -name 'tracks' -print || true
+          find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 25
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
@@ -203,7 +251,7 @@ jobs:
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
             ${{ runner.temp }}/mgc_web
-            ${{ runner.temp }}/mgc_playlists
+            ${{ runner.temp }}/mgc_web_src
             /tmp/mgc_drop.json
             /tmp/mgc_drops_list.json
             /tmp/mgc_drops_show.json
