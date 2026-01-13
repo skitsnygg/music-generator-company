@@ -16,6 +16,7 @@ Other commands:
 - marketing: posts list
 - analytics: delegated to mgc.analytics_cli if available
 - run: autonomous pipeline entrypoint (daily/weekly)
+- web: static web player build/serve
 
 Logging:
 - deterministic UTC timestamps
@@ -473,14 +474,6 @@ def _safe_slug(s: str) -> str:
     return s2 if s2 else "playlist"
 
 
-def _playlist_output_path(d: Dict[str, Any], *, out_dir: Path) -> Path:
-    p = d.get("json_path") or d.get("path")
-    if p:
-        return Path(str(p))
-    slug = str(d.get("slug", "")) if d.get("slug") else "playlist"
-    return out_dir / f"{_safe_slug(slug)}.json"
-
-
 def _build_playlist_json_for_row(conn: sqlite3.Connection, d: Dict[str, Any]) -> Any:
     src = d.get("json_path") or d.get("path")
     if src:
@@ -796,11 +789,6 @@ def _path_info(path: Path) -> Dict[str, Any]:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """
-    Human-friendly health + activity snapshot.
-
-    Also supports JSON output via global --json.
-    """
     db_path = Path(args.db)
     out: Dict[str, Any] = {
         "ts_utc": _utc_now_iso(),
@@ -819,7 +807,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         "notes": [],
     }
 
-    # Filesystem quick checks
     out["paths"]["playlists_dir"] = _path_info(DEFAULT_PLAYLIST_DIR)
     out["paths"]["tracks_dir"] = _path_info(DEFAULT_TRACKS_DIR)
     out["paths"]["tracks_export"] = _path_info(DEFAULT_TRACKS_EXPORT)
@@ -839,31 +826,32 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     db = DBConn(db_path)
     with db.connect() as conn:
-        # Table presence + counts
         for t in ("events", "playlist_runs", "playlists", "playlist_items", "tracks", "marketing_posts"):
             out["tables"][t] = {
                 "exists": _table_exists(conn, t),
                 "count": _db_count(conn, t),
             }
 
-        # Latest rows (best-effort)
         latest_playlist = _safe_latest_row(conn, "playlists")
         if latest_playlist is not None:
             out["latest"]["playlist"] = _row_to_dict(latest_playlist)
+
         latest_track = _safe_latest_row(conn, "tracks")
         if latest_track is not None:
             out["latest"]["track"] = _row_to_dict(latest_track)
+
         latest_post = _safe_latest_row(conn, "marketing_posts")
         if latest_post is not None:
             out["latest"]["marketing_post"] = _row_to_dict(latest_post)
+
         latest_event = _safe_latest_row(conn, "events")
         if latest_event is not None:
             out["latest"]["event"] = _row_to_dict(latest_event)
+
         latest_run = _safe_latest_row(conn, "playlist_runs")
         if latest_run is not None:
             out["latest"]["playlist_run"] = _row_to_dict(latest_run)
 
-        # “Latest playlist per slug” summary (handy for contexts)
         try:
             rows = _safe_select_latest_playlists_by_slug(conn)
             out["latest"]["playlists_by_slug"] = [
@@ -881,12 +869,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
-    # Human output
     print("MGC Status")
     print(f"  time_utc: {out['ts_utc']}")
     print(f"  db: {out['db']['path']} ({'OK' if out['db']['exists'] else 'MISSING'})")
 
-    # Env (only print the helpful ones if set)
     env_items = out["env"]
     env_show = []
     for k in ("MGC_CONTEXT", "MGC_SEED", "MGC_PROVIDER", "MGC_DETERMINISTIC", "MGC_ARTIFACTS_DIR"):
@@ -917,7 +903,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             extra += f" mtime_utc={p['mtime_utc']}"
         print(f"    {key}: {p.get('path')} ({status}){extra}")
 
-    # Latest summary (small + readable)
     latest = out.get("latest", {})
     if latest:
         print("  latest:")
@@ -942,10 +927,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             created = d.get("created_at", d.get("created_ts"))
             print(f"    event: id={d.get('id')} {kind} created={created}".rstrip())
 
-        # Optional: show per-slug list if not enormous
         pbs = latest.get("playlists_by_slug")
         if isinstance(pbs, list) and pbs:
-            # keep it short-ish
             print("    playlists_by_slug:")
             for item in pbs[:25]:
                 print(f"      {item.get('slug')}  id={item.get('id')}  created={item.get('created_at')}")
@@ -969,22 +952,10 @@ def _resolve_db_path(arg_db: Optional[str], global_db: Optional[str]) -> str:
 
 
 def _resolve_artifacts_dir(default_out_dir: str) -> Path:
-    """
-    If MGC_ARTIFACTS_DIR is set, route writes/verifies to that tree so CI
-    doesn't dirty the repo working tree.
-
-    Example:
-      MGC_ARTIFACTS_DIR=artifacts/ci
-      playlists -> artifacts/ci/rebuild/playlists
-      tracks    -> artifacts/ci/rebuild/tracks
-    """
     root = (os.environ.get("MGC_ARTIFACTS_DIR") or "").strip()
     if not root:
         return Path(default_out_dir)
-
-    # Keep it stable + predictable
     base = Path(root) / "rebuild"
-    # Caller passes default_out_dir like "data/playlists" / "data/tracks"
     leaf = Path(default_out_dir).name
     return base / leaf
 
@@ -1028,8 +999,6 @@ def cmd_rebuild_playlists(args: argparse.Namespace) -> int:
         rows = _safe_select_latest_playlists_by_slug(conn)
         for r in rows:
             d = _row_to_dict(r)
-            # IMPORTANT: during rebuild, always write into out_dir (CI artifacts),
-            # do NOT honor json_path/path from the DB row.
             slug = str(d.get("slug") or d.get("name") or "playlist")
             out_path = Path(out_dir) / f"{_safe_slug(slug)}.json"
 
@@ -1095,106 +1064,88 @@ def cmd_rebuild_tracks(args: argparse.Namespace) -> int:
     return 0
 
 
-def _verify_playlists(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, List[Dict[str, Any]]]:
-    diffs: List[Dict[str, Any]] = []
-    rows = _safe_select_latest_playlists_by_slug(conn)
-    for r in rows:
-        d = _row_to_dict(r)
-        # IMPORTANT: verify must check the same canonical rebuild path in out_dir
-        slug = str(d.get("slug") or d.get("name") or "playlist")
-        path = Path(out_dir) / f"{_safe_slug(slug)}.json"
-        expected = _build_playlist_json_for_row(conn, d)
-
-        if not path.exists():
-            diffs.append({"path": str(path), "reason": "missing"})
-            continue
-
-        try:
-            actual = read_json_file(path)
-        except Exception:
-            diffs.append({"path": str(path), "reason": "unreadable"})
-            continue
-
-        if stable_dumps(actual) != stable_dumps(expected):
-            diffs.append({"path": str(path), "reason": "content_diff"})
-    return (len(diffs), diffs)
-
-
-def _verify_tracks(conn: sqlite3.Connection, out_dir: Path) -> Tuple[int, List[Dict[str, Any]]]:
-    diffs: List[Dict[str, Any]] = []
-    out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
-
-    if not _table_exists(conn, "tracks"):
-        return (0, diffs)
-
-    if not out_path.exists():
-        diffs.append({"path": str(out_path), "reason": "missing"})
-        return (1, diffs)
-
-    try:
-        actual = read_json_file(out_path)
-    except Exception:
-        diffs.append({"path": str(out_path), "reason": "unreadable"})
-        return (1, diffs)
-
-    cols = set(_columns(conn, "tracks"))
-    q = "SELECT * FROM tracks "
-    if "created_at" in cols and "id" in cols:
-        q += "ORDER BY created_at ASC, id ASC"
-    elif "id" in cols:
-        q += "ORDER BY id ASC"
-    rows = conn.execute(q).fetchall()
-    expected = [_row_to_dict(r) for r in rows]
-
-    if stable_dumps(actual) != stable_dumps(expected):
-        diffs.append({"path": str(out_path), "reason": "content_diff"})
-    return (len(diffs), diffs)
-
-
 def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
-    log = logging.getLogger("mgc.rebuild.verify.playlists")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
 
-    if args.stamp:
-        log.debug("stamp=%s", args.stamp)
-
     db = DBConn(Path(db_path))
     with db.connect() as conn:
-        n, diffs = _verify_playlists(conn, out_dir)
+        diffs: List[Dict[str, Any]] = []
+        rows = _safe_select_latest_playlists_by_slug(conn)
+        for r in rows:
+            d = _row_to_dict(r)
+            slug = str(d.get("slug") or d.get("name") or "playlist")
+            path = Path(out_dir) / f"{_safe_slug(slug)}.json"
+            expected = _build_playlist_json_for_row(conn, d)
 
-    payload = {"diffs": diffs, "diff_count": n}
+            if not path.exists():
+                diffs.append({"path": str(path), "reason": "missing"})
+                continue
+
+            try:
+                actual = read_json_file(path)
+            except Exception:
+                diffs.append({"path": str(path), "reason": "unreadable"})
+                continue
+
+            if stable_dumps(actual) != stable_dumps(expected):
+                diffs.append({"path": str(path), "reason": "content_diff"})
+
+    payload = {"diffs": diffs, "diff_count": len(diffs)}
     if _truthy(args.json, args.sub_json):
         print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         for d in diffs:
             print(f"{d['path']} {d['reason']}")
 
-    if n and args.strict:
+    if diffs and args.strict:
         return 2
     return 0
 
 
 def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
-    log = logging.getLogger("mgc.rebuild.verify.tracks")
     db_path = _resolve_db_path(args.db, getattr(args, "global_db", None))
     out_dir = _resolve_artifacts_dir(str(args.out_dir))
+    out_path = out_dir / DEFAULT_TRACKS_EXPORT.name
 
-    if args.stamp:
-        log.debug("stamp=%s", args.stamp)
-
+    diffs: List[Dict[str, Any]] = []
     db = DBConn(Path(db_path))
-    with db.connect() as conn:
-        n, diffs = _verify_tracks(conn, out_dir)
 
-    payload = {"diffs": diffs, "diff_count": n}
+    with db.connect() as conn:
+        if not _table_exists(conn, "tracks"):
+            payload = {"diffs": [], "diff_count": 0}
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        if not out_path.exists():
+            diffs.append({"path": str(out_path), "reason": "missing"})
+        else:
+            try:
+                actual = read_json_file(out_path)
+            except Exception:
+                diffs.append({"path": str(out_path), "reason": "unreadable"})
+                actual = None
+
+            if actual is not None:
+                cols = set(_columns(conn, "tracks"))
+                q = "SELECT * FROM tracks "
+                if "created_at" in cols and "id" in cols:
+                    q += "ORDER BY created_at ASC, id ASC"
+                elif "id" in cols:
+                    q += "ORDER BY id ASC"
+                rows = conn.execute(q).fetchall()
+                expected = [_row_to_dict(r) for r in rows]
+                if stable_dumps(actual) != stable_dumps(expected):
+                    diffs.append({"path": str(out_path), "reason": "content_diff"})
+
+    payload = {"diffs": diffs, "diff_count": len(diffs)}
     if _truthy(args.json, args.sub_json):
         print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
     else:
         for d in diffs:
             print(f"{d['path']} {d['reason']}")
 
-    if n and args.strict:
+    if diffs and args.strict:
         return 2
     return 0
 
@@ -1336,11 +1287,20 @@ def build_parser() -> argparse.ArgumentParser:
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
 
-    # -------- run / web / publish --------
+    # -------- web --------
+    try:
+        from mgc.web_cli import register_web_subcommand  # type: ignore
+    except Exception:
+        register_web_subcommand = None  # type: ignore
+    if register_web_subcommand:
+        register_web_subcommand(sub)
+
+    # -------- run --------
     try:
         from mgc.run_cli import register_run_subcommand  # type: ignore
     except Exception as e:
         raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
+
     register_run_subcommand(sub)
 
     return p
@@ -1359,10 +1319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.debug("argv=%s", sys.argv if argv is None else ["mgc", *argv])
     log.debug("db=%s", args.db)
 
-    # Make global db accessible to rebuild subcommands
     setattr(args, "global_db", getattr(args, "db", None))
-
-    # Ensure sub_json exists on non-rebuild commands
     if not hasattr(args, "sub_json"):
         setattr(args, "sub_json", False)
 

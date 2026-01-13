@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
+from mgc.context import build_prompt, get_context_spec
+from mgc.providers import GenerateRequest, get_provider
 
 
 @contextlib.contextmanager
@@ -843,16 +845,16 @@ def _sha256_file(path: Path) -> str:
 
 
 def db_insert_track(
-    con: sqlite3.Connection,
-    *,
-    track_id: str,
-    ts: str,
-    title: str,
-    provider: str,
-    mood: Optional[str],
-    genre: Optional[str],
-    artifact_path: Optional[str],
-    meta: Dict[str, Any],
+        con: sqlite3.Connection,
+        *,
+        track_id: str,
+        ts: str,
+        title: str,
+        provider: str,
+        mood: Optional[str],
+        genre: Optional[str],
+        artifact_path: Optional[str],
+        meta: Dict[str, Any],
 ) -> None:
     cols = db_table_columns(con, "tracks")
     if not cols:
@@ -1260,49 +1262,84 @@ def _stub_daily_run(
     out_dir: Path,
     run_id: str,
 ) -> Dict[str, Any]:
+    """
+    Daily run implementation using provider abstraction.
+    Supports:
+      - stub (deterministic placeholder)
+      - riffusion (local server)
+      - staged providers (suno, diffsinger)
+    """
+
+    from mgc.context import build_prompt
+    from mgc.providers import GenerateRequest, get_provider
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     drop_id = stable_uuid5("drop", run_id)
     track_id = stable_uuid5("track", context, seed, run_id)
 
     title = f"{context.title()} Track {seed}"
-    provider = "stub"
-    mood = context
-    genre = "ambient" if context == "focus" else "mixed"
 
+    # Artifact path (provider may change extension)
     if deterministic:
-        artifact_rel = Path("data") / "tracks" / f"{track_id}.wav"
+        artifact_rel = Path("data") / "tracks" / f"{track_id}"
     else:
         day = ts.split("T", 1)[0]
-        artifact_rel = Path("data") / "tracks" / day / f"{track_id}.wav"
+        artifact_rel = Path("data") / "tracks" / day / f"{track_id}"
 
     artifact_path = (Path.cwd() / artifact_rel).resolve()
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = {
-        "track_id": track_id,
-        "run_id": run_id,
-        "drop_id": drop_id,
-        "context": context,
-        "seed": seed,
-        "ts": ts,
-        "provider": provider,
-    }
-    artifact_bytes = stable_json_dumps(payload).encode("utf-8")
-    artifact_path.write_bytes(artifact_bytes)
+    # Build prompt from context
+    prompt = build_prompt(context)
 
+    # Pick provider
+    provider_name = str(os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    provider = get_provider(provider_name)
+
+    # Generate
+    result = provider.generate(
+        GenerateRequest(
+            track_id=track_id,
+            run_id=run_id,
+            context=context,
+            seed=seed,
+            prompt=prompt,
+            deterministic=deterministic,
+            ts=ts,
+            out_rel=str(artifact_path),
+        )
+    )
+
+    # Ensure extension matches provider output
+    if result.ext and not str(artifact_path).endswith(result.ext):
+        artifact_rel = artifact_rel.with_suffix(result.ext)
+        artifact_path = (Path.cwd() / artifact_rel).resolve()
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+
+    artifact_path.write_bytes(result.artifact_bytes)
+
+    # Insert track
     db_insert_track(
         con,
         track_id=track_id,
         ts=ts,
         title=title,
-        provider=provider,
-        mood=mood,
-        genre=genre,
+        provider=result.provider,
+        mood=context,
+        genre=result.meta.get("genre") if isinstance(result.meta, dict) else None,
         artifact_path=str(artifact_rel).replace("\\", "/"),
-        meta={"run_id": run_id, "drop_id": drop_id, "deterministic": deterministic, "seed": seed, "context": context},
+        meta={
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "context": context,
+            "seed": seed,
+            "deterministic": deterministic,
+            **(result.meta or {}),
+        },
     )
 
+    # Insert drop
     db_insert_drop(
         con,
         drop_id=drop_id,
@@ -1315,19 +1352,21 @@ def _stub_daily_run(
             "run_id": run_id,
             "drop_id": drop_id,
             "track_id": track_id,
+            "provider": result.provider,
             "deterministic": deterministic,
             "seed": seed,
             "context": context,
         },
     )
 
+    # Events
     db_insert_event(
         con,
         event_id=stable_uuid5("event", "drop.created", drop_id),
         ts=ts,
         kind="drop.created",
         actor="system",
-        meta={"drop_id": drop_id, "run_id": run_id, "track_id": track_id, "context": context, "seed": seed},
+        meta={"drop_id": drop_id, "run_id": run_id, "track_id": track_id},
     )
 
     db_insert_event(
@@ -1336,11 +1375,19 @@ def _stub_daily_run(
         ts=ts,
         kind="track.generated",
         actor="system",
-        meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "artifact_path": str(artifact_rel).replace("\\", "/")},
+        meta={
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "track_id": track_id,
+            "artifact_path": str(artifact_rel).replace("\\", "/"),
+            "provider": result.provider,
+        },
     )
 
+    # Marketing drafts (unchanged behavior)
     platforms = ["x", "youtube_shorts", "instagram_reels", "tiktok"]
     post_ids: List[str] = []
+
     for platform in platforms:
         post_id = stable_uuid5("marketing_post", platform, run_id)
         post_ids.append(post_id)
@@ -1353,7 +1400,6 @@ def _stub_daily_run(
             "run_id": run_id,
             "drop_id": drop_id,
         }
-        content = stable_json_dumps(content_obj)
 
         db_insert_marketing_post(
             con,
@@ -1361,8 +1407,14 @@ def _stub_daily_run(
             ts=ts,
             platform=platform,
             status="draft",
-            content=content,
-            meta={"run_id": run_id, "drop_id": drop_id, "track_id": track_id, "deterministic": deterministic},
+            content=stable_json_dumps(content_obj),
+            meta={
+                "run_id": run_id,
+                "drop_id": drop_id,
+                "track_id": track_id,
+                "provider": result.provider,
+                "context": context,
+            },
         )
 
     db_insert_event(
@@ -1371,9 +1423,15 @@ def _stub_daily_run(
         ts=ts,
         kind="marketing.drafts.created",
         actor="system",
-        meta={"run_id": run_id, "drop_id": drop_id, "count": len(post_ids), "post_ids": post_ids},
+        meta={
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "count": len(post_ids),
+            "post_ids": post_ids,
+        },
     )
 
+    # Evidence object
     evidence = {
         "run_id": run_id,
         "drop_id": drop_id,
@@ -1381,21 +1439,23 @@ def _stub_daily_run(
         "deterministic": deterministic,
         "context": context,
         "seed": seed,
+        "provider": result.provider,
         "track": {
             "id": track_id,
             "title": title,
-            "provider": provider,
             "artifact_path": str(artifact_rel).replace("\\", "/"),
-            "sha256": sha256_hex(artifact_bytes),
-            "size": len(artifact_bytes),
+            "size": len(result.artifact_bytes),
+            "mime": result.mime,
         },
-        "marketing_drafts": [{"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)],
+        "marketing_drafts": [
+            {"id": pid, "platform": p} for pid, p in zip(post_ids, platforms)
+        ],
     }
 
     evidence_path = out_dir / ("daily_evidence.json" if deterministic else f"daily_evidence_{run_id}.json")
-    evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8", newline="\n")
-    return evidence
+    evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8")
 
+    return evidence
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
