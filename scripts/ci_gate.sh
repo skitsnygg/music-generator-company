@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # CI gate with modes:
-#   - fast (default): compile + rebuild/verify + golden tree hashes
+#   - fast (default): compile + rebuild/verify + (optional) golden tree hashes (WARN-only by default)
 #   - full: everything (autonomous smoke + submission/web determinism + publish determinism + manifest diff + golden checks)
 #
 # Env:
@@ -14,7 +14,9 @@ set -euo pipefail
 #                      - if set to "data", writes to data/playlists + data/tracks
 #                      - otherwise writes under $MGC_ARTIFACTS_DIR/rebuild/...
 #   MGC_CI_MODE        fast|full (default: fast)
-#   MGC_GOLDEN_STRICT  if "1"/"true"/"yes", fail CI if submission.zip sha not in ci/known_good_submission_sha256.txt
+#   MGC_GOLDEN_STRICT  if "1"/"true"/"yes":
+#                      - full: enforce golden tree hashes + known-good submission hash
+#                      - fast: enforce golden tree hashes (otherwise warn-only)
 #
 # Optional golden-tree hashes (recommended):
 #   fixtures/golden_hashes.json
@@ -142,21 +144,48 @@ echo "  tracks:    $OUT_TRACKS"
 
 # -----------------------------
 # golden TREE hash gate (fast + full, optional)
+# - In fast mode: WARN-ONLY by default (local dev may differ from CI python/version)
+# - In full mode: STRICT by default
+# - MGC_GOLDEN_STRICT forces STRICT in either mode
 # -----------------------------
 GOLDEN_JSON="fixtures/golden_hashes.json"
 if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
   echo "[ci_gate] golden tree hash gate (golden_hashes.json)"
-  $PYTHON scripts/ci_golden_check.py \
+
+  GOLDEN_STRICT=0
+  if [ "$CI_MODE" = "full" ]; then
+    GOLDEN_STRICT=1
+  fi
+
+  v="${MGC_GOLDEN_STRICT:-0}"
+  vv="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+  if [ "$vv" = "1" ] || [ "$vv" = "true" ] || [ "$vv" = "yes" ]; then
+    GOLDEN_STRICT=1
+  fi
+
+  set +e
+  "$PYTHON" scripts/ci_golden_check.py \
     --golden "$GOLDEN_JSON" \
-    --key "ci.rebuild.playlists" \
+    --key ci.rebuild.playlists \
     --root "$OUT_PLAYLISTS"
+  rc_playlists=$?
 
-  $PYTHON scripts/ci_golden_check.py \
+  "$PYTHON" scripts/ci_golden_check.py \
     --golden "$GOLDEN_JSON" \
-    --key "ci.rebuild.tracks" \
+    --key ci.rebuild.tracks \
     --root "$OUT_TRACKS"
+  rc_tracks=$?
+  set -e
 
-  echo "[ci_gate] golden tree hash OK"
+  if [ $rc_playlists -ne 0 ] || [ $rc_tracks -ne 0 ]; then
+    if [ $GOLDEN_STRICT -eq 1 ]; then
+      echo "[ci_gate] FAIL: golden tree hash mismatch (strict mode)"
+      exit 3
+    fi
+    echo "[ci_gate] WARN: golden tree hash mismatch (warn-only mode; continuing)"
+  else
+    echo "[ci_gate] golden tree hash OK"
+  fi
 else
   echo "[ci_gate] golden tree hash SKIP (missing $GOLDEN_JSON or scripts/ci_golden_check.py)"
 fi
@@ -207,11 +236,12 @@ if [ "$CI_MODE" = "full" ]; then
   echo "[ci_gate] manifest diff gate (since-ok, strict JSON)"
   $PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json | $PYTHON -m json.tool
 
-  # golden SUBMISSION hash gate (known-good list) - warn by default
+  # golden SUBMISSION hash gate (known-good list) - warn by default, strict if MGC_GOLDEN_STRICT truthy
   echo "[ci_gate] golden submission hash gate (warn by default)"
   MODE="warn"
   v="${MGC_GOLDEN_STRICT:-0}"
-  if [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ]; then
+  vv="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+  if [ "$vv" = "1" ] || [ "$vv" = "true" ] || [ "$vv" = "yes" ]; then
     MODE="strict"
   fi
 
