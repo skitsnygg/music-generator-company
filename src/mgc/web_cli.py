@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
@@ -53,6 +53,7 @@ def _looks_like_audio_path(s: str) -> bool:
 
 
 def _prefer_mp3_path(p: Path) -> Path:
+    # If a WAV is referenced but an MP3 sibling exists, prefer it.
     if p.suffix.lower() == ".wav":
         mp3 = p.with_suffix(".mp3")
         if mp3.exists():
@@ -114,7 +115,7 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
             if isinstance(it, str):
                 add_path(it)
             elif isinstance(it, dict):
-                for k in ("bundle_track_path", "artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
+                for k in ("artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
                     if k in it:
                         add_path(it.get(k))
                         break
@@ -166,7 +167,6 @@ def _extract_track_ids(playlist_obj: Any) -> List[str]:
                     elif "id" in it:
                         add_id(it.get("id"))
                 elif isinstance(it, str) and not _looks_like_audio_path(it):
-                    # sometimes "tracks" is a list of IDs
                     add_id(it)
         if isinstance(playlist_obj.get("items"), list):
             for it in playlist_obj["items"]:
@@ -213,10 +213,6 @@ def _table_exists(con: sqlite3.Connection, name: str) -> bool:
 
 
 def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Resolve track_ids -> file paths by querying the tracks table.
-    We pick the first usable path-like column present in the schema/rows.
-    """
     meta: Dict[str, Any] = {
         "used_db": str(db_path),
         "tracks_table": False,
@@ -235,9 +231,7 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
             return [], meta
         meta["tracks_table"] = True
 
-        # Determine columns present
         cols = [r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()]
-        # Candidate columns in preference order
         candidates = [
             "artifact_path",
             "audio_path",
@@ -254,13 +248,11 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
             meta["reason"] = "no_path_column_found"
             return [], meta
 
-        # track id column might be track_id or id
         id_col = "track_id" if "track_id" in cols else ("id" if "id" in cols else None)
         if not id_col:
             meta["reason"] = "no_id_column_found"
             return [], meta
 
-        # Query in chunks (sqlite parameter limits)
         resolved_paths: List[str] = []
         missing = 0
         CHUNK = 800
@@ -283,7 +275,6 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
                 if not s:
                     missing += 1
                     continue
-                # accept even if not audio-ext; downstream checks existence and suffix
                 resolved_paths.append(s)
 
         meta["resolved"] = len(resolved_paths)
@@ -296,44 +287,28 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
             pass
 
 
-def _resolve_media_path(playlist_path: Path, media_path: str) -> Path:
+def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
     """
-    Resolve a media path from playlist content into a filesystem path.
+    Resolve a raw track reference into a filesystem Path.
 
-    Rule:
-      - absolute paths stay absolute
-      - relative paths resolve relative to the playlist file's directory
-
-    This is what makes portable drop bundles work in CI:
-      <DROP_DIR>/playlist.json references "tracks/<id>.wav"
-      and the track exists at <DROP_DIR>/tracks/<id>.wav
+    Key behavior:
+    - Relative paths are resolved relative to the playlist file directory (NOT cwd).
+    - Absolute paths are used as-is.
     """
-    p = Path(str(media_path)).expanduser()
-    if p.is_absolute():
-        return p.resolve()
-    return (playlist_path.parent / p).resolve()
-
-
-@dataclass(frozen=True)
-class BuildResult:
-    ok: bool
-    out_dir: str
-    playlist: str
-    track_count: int
-    copied_count: int
-    missing_count: int
-    tracks_dir: str
-    manifest_path: str
+    rp = Path(str(raw).strip())
+    if rp.is_absolute():
+        return rp.resolve()
+    return (playlist_dir / rp).resolve()
 
 
 def cmd_web_build(args: argparse.Namespace) -> int:
-    want_json = bool(getattr(args, "json", False))
-
     playlist_path = Path(str(args.playlist)).expanduser().resolve()
     if not playlist_path.exists():
         out = {"ok": False, "reason": "playlist_not_found", "playlist": str(playlist_path)}
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
+
+    playlist_dir = playlist_path.parent
 
     out_dir = Path(str(args.out_dir)).expanduser().resolve()
     tracks_dir = out_dir / "tracks"
@@ -351,17 +326,19 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_obj = _read_json(playlist_path)
 
     raw_paths = _extract_track_paths(playlist_obj)
+    resolved_from = "playlist_path"
     db_resolution: Optional[Dict[str, Any]] = None
 
-    # If no paths in playlist, try resolving via DB using track IDs
     if not raw_paths:
         track_ids = _extract_track_ids(playlist_obj)
         if track_ids:
             db_path = Path(str(getattr(args, "db", ""))).expanduser().resolve()
             raw_paths, db_resolution = _resolve_track_paths_from_db(db_path, track_ids)
+            if raw_paths:
+                resolved_from = "db"
 
     if bool(getattr(args, "fail_if_empty", False)) and not raw_paths:
-        out = {
+        out: Dict[str, Any] = {
             "ok": False,
             "playlist": str(playlist_path),
             "reason": "playlist_empty",
@@ -372,22 +349,42 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
 
+    if bool(getattr(args, "require_bundled_tracks", False)) and (resolved_from == "db"):
+        out = {
+            "ok": False,
+            "playlist": str(playlist_path),
+            "out_dir": str(out_dir),
+            "reason": "db_resolution_disallowed",
+            "track_count": len(raw_paths),
+            "db_resolution": db_resolution,
+        }
+        sys.stdout.write(_stable_json_dumps(out) + "\n")
+        return 2
+
     copied = 0
     missing = 0
     bundled: List[Dict[str, Any]] = []
 
-    for i, raw in enumerate(raw_paths):
-        # IMPORTANT FIX:
-        # resolve relative media paths relative to the playlist's directory,
-        # not CWD. This is required for portable drop bundles.
-        rp = _resolve_media_path(playlist_path, raw)
+    prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
 
-        if bool(getattr(args, "prefer_mp3", False)):
+    for i, raw in enumerate(raw_paths):
+        rp = _resolve_input_path(raw, playlist_dir=playlist_dir)
+
+        if prefer_mp3:
             rp = _prefer_mp3_path(rp)
 
         if not rp.exists() or not rp.is_file():
             missing += 1
-            bundled.append({"index": i, "source": raw, "resolved": str(rp), "ok": False, "reason": "missing"})
+            bundled.append(
+                {
+                    "index": i,
+                    "source": raw,
+                    "resolved": str(rp),
+                    "ok": False,
+                    "reason": "missing",
+                    "resolved_from": resolved_from,
+                }
+            )
             continue
 
         dest = tracks_dir / rp.name
@@ -411,12 +408,44 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                 "resolved": str(rp),
                 "ok": True,
                 "bundle_path": _as_posix(dest.relative_to(out_dir)),
+                "resolved_from": resolved_from,
             }
         )
+
+    if bool(getattr(args, "fail_on_missing", False)) and missing > 0:
+        out = {
+            "ok": False,
+            "playlist": str(playlist_path),
+            "out_dir": str(out_dir),
+            "reason": "missing_tracks",
+            "track_count": len(raw_paths),
+            "copied_count": copied,
+            "missing_count": missing,
+        }
+        if db_resolution is not None:
+            out["db_resolution"] = db_resolution
+        sys.stdout.write(_stable_json_dumps(out) + "\n")
+        return 2
+
+    if bool(getattr(args, "fail_if_none_copied", False)) and copied == 0:
+        out = {
+            "ok": False,
+            "playlist": str(playlist_path),
+            "out_dir": str(out_dir),
+            "reason": "no_tracks_copied",
+            "track_count": len(raw_paths),
+            "copied_count": copied,
+            "missing_count": missing,
+        }
+        if db_resolution is not None:
+            out["db_resolution"] = db_resolution
+        sys.stdout.write(_stable_json_dumps(out) + "\n")
+        return 2
 
     web_playlist = {
         "version": 1,
         "source_playlist": str(playlist_path),
+        "resolved_from": resolved_from,
         "tracks": [t for t in bundled if t.get("ok")],
     }
     _write_json(out_playlist_path, web_playlist)
@@ -490,6 +519,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
             "tracks_dir": _as_posix(tracks_dir.relative_to(out_dir)),
             "playlist_json": _as_posix(out_playlist_path.relative_to(out_dir)),
             "index_html": _as_posix(index_path.relative_to(out_dir)),
+            "resolved_from": resolved_from,
             "items": bundled,
             "db_resolution": db_resolution,
         },
@@ -503,6 +533,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "copied_count": copied,
         "missing_count": missing,
         "manifest_path": str(manifest_path),
+        "resolved_from": resolved_from,
     }
     if db_resolution is not None:
         out_obj["db_resolution"] = db_resolution
@@ -545,9 +576,26 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     build = ws.add_parser("build", help="Build a static web bundle")
     build.add_argument("--playlist", required=True, help="Playlist JSON path")
     build.add_argument("--out-dir", required=True, help="Output directory for the web bundle")
+    build.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (used only if playlist contains IDs)")
     build.add_argument("--prefer-mp3", action="store_true", help="Prefer .mp3 when a .wav sibling exists")
     build.add_argument("--clean", action="store_true", help="Delete out-dir contents before writing")
     build.add_argument("--fail-if-empty", action="store_true", help="Exit nonzero if playlist has zero tracks")
+    build.add_argument(
+        "--fail-on-missing",
+        action="store_true",
+        help="Exit nonzero if any referenced track path cannot be found",
+    )
+    build.add_argument(
+        "--fail-if-none-copied",
+        action="store_true",
+        help="Exit nonzero if zero audio files were copied into the bundle",
+    )
+    build.add_argument(
+        "--require-bundled-tracks",
+        dest="require_bundled_tracks",
+        action="store_true",
+        help="Exit nonzero if DB resolution was used (forces portable bundle playlists with file paths)",
+    )
     build.set_defaults(func=cmd_web_build)
 
     serve = ws.add_parser("serve", help="Serve a built web bundle")
