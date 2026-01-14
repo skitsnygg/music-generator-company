@@ -20,10 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
-
 from mgc.context import build_prompt, get_context_spec
 from mgc.providers import GenerateRequest, get_provider
-
+from mgc.hash_utils import sha256_file, sha256_tree
 
 @contextlib.contextmanager
 def _silence_stdout(enabled: bool = True):
@@ -2063,18 +2062,58 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
       - build a submission zip at data/submissions/<drop_id>/submission.zip (non-dry-run)
       - write data/submissions/<drop_id>/submission.json (self-describing pointer)
       - print a small JSON summary to stdout
+
+    Optional:
+      - if --with-web is set, build a static web bundle and include it in the zip under submission/web,
+        and record paths.web_bundle_dir + artifacts.web_bundle_tree_sha256.
+        Use --web-out-dir to override where the on-disk web bundle is written.
     """
+    import hashlib
+    import json
     import os
+    import shutil
     import sqlite3
+    import subprocess
     import tempfile
     import zipfile
-    import shutil
-    import json
-    from pathlib import Path
     from datetime import datetime, timezone
-    from typing import Optional
+    from pathlib import Path
+    from typing import Any, Dict, Optional
 
     from mgc.bundle_validate import validate_bundle
+
+    # -------------------------
+    # tiny deterministic helpers
+    # -------------------------
+
+    def stable_json(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+    def sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def sha256_tree(root: Path) -> str:
+        """
+        Deterministic tree hash:
+          - per file: sha256(file bytes)
+          - lines: "<sha>  <relpath>"
+          - sha256 of concatenated lines
+        """
+        root = root.resolve()
+        files = sorted(
+            (p for p in root.rglob("*") if p.is_file()),
+            key=lambda p: p.relative_to(root).as_posix(),
+        )
+        lines: list[str] = []
+        for p in files:
+            rel = p.relative_to(root).as_posix()
+            lines.append(f"{sha256_file(p)}  {rel}")
+        joined = ("\n".join(lines) + "\n").encode("utf-8")
+        return hashlib.sha256(joined).hexdigest()
 
     def _utc_now_iso() -> str:
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -2093,7 +2132,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
           - fixed timestamps in ZipInfo for deterministic builds
         """
         root = root.resolve()
-        entries = []
+        entries: list[tuple[str, Path]] = []
         for dp, dn, fn in os.walk(root):
             dn.sort()
             fn.sort()
@@ -2113,7 +2152,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             zi.external_attr = 0o644 << 16
             zf.writestr(zi, data)
 
-    def _build_readme(evidence_obj: dict) -> str:
+    def _build_readme(evidence_obj: dict, *, included_web: bool) -> str:
         # Use run ts (not current time) so deterministic runs stay deterministic.
         ids = evidence_obj.get("ids") if isinstance(evidence_obj.get("ids"), dict) else {}
         paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
@@ -2147,17 +2186,95 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             f"- {playlist}: playlist pointing at bundled audio",
             f"- {bundle_track}: bundled audio asset",
             "- daily_evidence.json (or drop bundle evidence): provenance + sha256 hashes",
+        ]
+        if included_web:
+            lines += ["- web/: static web player bundle (index.html + tracks/)"]
+
+        lines += [
             "",
             "## How to review",
             "1) Inspect playlist.json (it references the bundled track under tracks/).",
             "2) Confirm hashes match the files in the bundle.",
+        ]
+        if included_web:
+            lines += ["3) Open web/index.html (or serve web/) to listen."]
+
+        lines += [
             "",
             "## Notes",
             f"- Packaged at: {ts_local or _utc_now_iso()}",
         ]
         return "\n".join(lines) + "\n"
 
-    deterministic = bool(getattr(args, "deterministic", False)) or bool(
+    def _build_web_bundle_from_portable_bundle(*, bundle_dir: Path, web_out_dir: Path) -> Dict[str, Any]:
+        """
+        Build a web bundle using `mgc.main web build` with cwd=bundle_dir so relative paths resolve.
+        Also passes --strip-paths so the generated playlist.json doesn't bake absolute paths.
+        """
+        playlist_path = bundle_dir / "playlist.json"
+        if not playlist_path.exists():
+            raise FileNotFoundError(f"bundle missing playlist.json: {playlist_path}")
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "mgc.main",
+            "web",
+            "build",
+            "--playlist",
+            str(playlist_path),
+            "--out-dir",
+            str(web_out_dir),
+            "--clean",
+            "--fail-if-empty",
+            "--fail-if-none-copied",
+            "--strip-paths",
+            "--json",
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            cwd=str(bundle_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+
+        stdout = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            msg = (proc.stderr or "").strip() or stdout or "web build failed"
+            raise RuntimeError(f"web build failed (rc={proc.returncode}): {msg}")
+
+        try:
+            payload = json.loads(stdout) if stdout else {}
+        except Exception:
+            raise RuntimeError(
+                "web build did not emit valid JSON. "
+                f"stdout={stdout[:200]!r} stderr={(proc.stderr or '')[:200]!r}"
+            )
+
+        if not isinstance(payload, dict) or not payload.get("ok", False):
+            raise RuntimeError(f"web build returned ok=false: {payload}")
+
+        # sanity
+        idx = web_out_dir / "index.html"
+        pl = web_out_dir / "playlist.json"
+        tr = web_out_dir / "tracks"
+        if not idx.exists():
+            raise FileNotFoundError(f"web bundle missing index.html: {idx}")
+        if not pl.exists():
+            raise FileNotFoundError(f"web bundle missing playlist.json: {pl}")
+        if not tr.exists() or not tr.is_dir():
+            raise FileNotFoundError(f"web bundle missing tracks/: {tr}")
+
+        return payload
+
+    # -------------------------
+    # args / env
+    # -------------------------
+
+    deterministic = bool(getattr(args, "deterministic", False)) or (
         (os.environ.get("MGC_DETERMINISTIC") or "").strip().lower() in ("1", "true", "yes")
     )
 
@@ -2166,6 +2283,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
     allow_resume = not bool(getattr(args, "no_resume", False))
     dry_run = bool(getattr(args, "dry_run", False))
+    with_web = bool(getattr(args, "with_web", False))
 
     ts = deterministic_now_iso(deterministic)
     run_date = ts.split("T", 1)[0]
@@ -2174,10 +2292,9 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         getattr(args, "out_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR")
         or "data/evidence"
-    ).resolve()
+    ).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # DB path
     db_path = (
         getattr(args, "db", None)
         or os.environ.get("MGC_DB")
@@ -2185,80 +2302,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     )
     db_path = str(Path(db_path).expanduser())
 
-    # Run id for this drop
     run_id = stable_uuid5("run", "drop", context, seed, run_date, "det" if deterministic else "live")
-
-    def cmd_run_autonomous(args: argparse.Namespace) -> int:
-        """
-        Cron-safe wrapper: run a full drop end-to-end, then optionally verify the produced submission.zip.
-
-        Why this exists:
-          - one command to run unattended (cron/GitHub Actions/runner)
-          - keeps existing run drop behavior as the canonical pipeline
-          - adds a final "submission artifact sanity check" so failures surface immediately
-        """
-        import json
-        import tempfile
-        import zipfile
-        from pathlib import Path
-
-        # 1) Run the canonical drop pipeline (daily + publish-marketing + manifest + evidence + submission zip)
-        rc = int(cmd_run_drop(args))
-        if rc != 0:
-            return rc
-
-        # 2) Optional submission verification (default: on)
-        verify = not bool(getattr(args, "no_verify_submission", False))
-        if not verify:
-            return 0
-
-        # In your cmd_run_drop, the evidence file is always written to out_dir/drop_evidence.json
-        out_dir = Path(
-            getattr(args, "out_dir", None)
-            or os.environ.get("MGC_EVIDENCE_DIR")
-            or "data/evidence"
-        ).expanduser().resolve()
-        evidence_path = out_dir / "drop_evidence.json"
-        if not evidence_path.exists():
-            # If drop succeeded but evidence missing, that's a contract violation
-            raise SystemExit(f"[run autonomous] missing evidence: {evidence_path}")
-
-        try:
-            evidence_obj = json.loads(evidence_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            raise SystemExit(f"[run autonomous] failed to read evidence JSON: {evidence_path}: {e}") from e
-
-        paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
-        submission_zip = paths.get("submission_zip") if isinstance(paths, dict) else None
-        if not submission_zip:
-            raise SystemExit("[run autonomous] drop completed but evidence has no paths.submission_zip")
-
-        zip_path = Path(str(submission_zip)).expanduser().resolve()
-        if not zip_path.exists():
-            raise SystemExit(f"[run autonomous] submission_zip missing on disk: {zip_path}")
-
-        # Verify zip layout + validate extracted drop bundle
-        # (Does not depend on submission_cli wiring; safe + local.)
-        from mgc.bundle_validate import validate_bundle  # type: ignore
-
-        with zipfile.ZipFile(str(zip_path), "r") as zf:
-            names = zf.namelist()
-            expected_prefix = "submission/drop_bundle/"
-            if not any(n.startswith(expected_prefix) for n in names):
-                raise SystemExit("[run autonomous] invalid submission.zip layout: expected submission/drop_bundle/")
-
-            with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
-                td_path = Path(td).resolve()
-                zf.extractall(td_path)
-                bundle_dir = td_path / "submission" / "drop_bundle"
-                if not bundle_dir.exists() or not bundle_dir.is_dir():
-                    raise SystemExit(f"[run autonomous] extracted bundle missing: {bundle_dir}")
-
-                # Raises on invalid (hash mismatch/missing files/etc.)
-                validate_bundle(bundle_dir)
-
-        # If we got here, everything is good.
-        return 0
 
     # ---------------------------------------------------------------------
     # Ensure manifest exists in out_dir (cmd_run_drop hashes this)
@@ -2269,14 +2313,14 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     manifest_sha256 = _sha256_file(manifest_path)
 
     # ---------------------------------------------------------------------
-    # Run the generator path (this is what actually creates audio + DB rows)
+    # Run generator (or dry_run)
     # ---------------------------------------------------------------------
     if dry_run:
         drop_id = stable_uuid5("drop", run_id)
-        evidence_obj = {
+        evidence_obj: Dict[str, Any] = {
             "schema": "mgc.drop_evidence.v1",
             "ts": ts,
-            "deterministic": deterministic,
+            "deterministic": bool(deterministic),
             "run_id": run_id,
             "drop_id": drop_id,
             "context": context,
@@ -2296,7 +2340,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 con=con,
                 context=context,
                 seed=seed,
-                deterministic=deterministic,
+                deterministic=bool(deterministic),
                 ts=ts,
                 out_dir=out_dir,
                 run_id=run_id,
@@ -2305,18 +2349,18 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         finally:
             con.close()
 
-        drop_id = str(daily.get("drop_id") or stable_uuid5("drop", run_id))
+        drop_id = str((daily or {}).get("drop_id") or stable_uuid5("drop", run_id))
 
         track_id = ""
         try:
-            track_id = str((daily.get("track") or {}).get("id") or "")
+            track_id = str(((daily or {}).get("track") or {}).get("id") or "")
         except Exception:
             track_id = ""
 
         evidence_obj = {
             "schema": "mgc.drop_evidence.v1",
             "ts": ts,
-            "deterministic": deterministic,
+            "deterministic": bool(deterministic),
             "run_id": run_id,
             "drop_id": drop_id,
             "context": context,
@@ -2345,16 +2389,21 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             evidence_obj["track_id"] = track_id
 
     # ---------------------------------------------------------------------
-    # Write drop evidence in out_dir (v1)
+    # Write drop evidence (initial)
     # ---------------------------------------------------------------------
     evidence_path = out_dir / "drop_evidence.json"
-    evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
+    evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
     # Build submission zip + submission.json (non-dry-run only)
     # ---------------------------------------------------------------------
     submission_zip_path: Optional[Path] = None
     submission_json_path: Optional[Path] = None
+    receipt_path: Optional[Path] = None
+
+    web_out_dir: Optional[Path] = None
+    web_build_meta: Optional[Dict[str, Any]] = None
+    web_tree_sha: Optional[str] = None
 
     if not dry_run:
         pths = evidence_obj.get("paths") or {}
@@ -2363,7 +2412,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         # Validate bundle before packaging
         validate_bundle(bundle_dir)
 
-        # Read daily evidence object if present (for README). Prefer daily_evidence.json if it exists.
+        # Evidence object for README
         daily_ev_path = bundle_dir / "daily_evidence.json"
         if daily_ev_path.exists():
             try:
@@ -2374,7 +2423,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                     "drop_id": evidence_obj.get("drop_id"),
                     "run_id": run_id,
                     "context": context,
-                    "deterministic": deterministic,
+                    "deterministic": bool(deterministic),
                 }
         else:
             daily_ev_obj = {
@@ -2382,7 +2431,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 "drop_id": evidence_obj.get("drop_id"),
                 "run_id": run_id,
                 "context": context,
-                "deterministic": deterministic,
+                "deterministic": bool(deterministic),
             }
 
         drop_id_for_paths = str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id))
@@ -2391,19 +2440,52 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
         submission_zip_path = (submissions_root / "submission.zip").resolve()
         submission_json_path = (submissions_root / "submission.json").resolve()
+        receipt_path = submission_zip_path.with_suffix(".receipt.json")
 
+        # ------------------------------------------------------------
+        # Optional web bundle: build ONCE into a stable on-disk location
+        # ------------------------------------------------------------
+        if with_web:
+            web_out_override = getattr(args, "web_out_dir", None)
+            web_out_dir = (
+                Path(str(web_out_override)).expanduser().resolve()
+                if web_out_override
+                else (submissions_root / "web").resolve()
+            )
+            _safe_mkdir(web_out_dir)
+
+            # Build using web CLI against the portable bundle playlist
+            web_build_meta = _build_web_bundle_from_portable_bundle(bundle_dir=bundle_dir, web_out_dir=web_out_dir)
+
+            # Hash the web bundle tree (deterministic)
+            web_tree_sha = sha256_tree(web_out_dir)
+
+            evidence_obj.setdefault("paths", {})
+            evidence_obj["paths"]["web_bundle_dir"] = str(web_out_dir)
+
+        # ------------------------------------------------------------
         # Stage + zip deterministically
+        # ------------------------------------------------------------
         with tempfile.TemporaryDirectory(prefix="mgc_submission_") as td:
             stage = Path(td).resolve()
             pkg_root = stage / "submission"
             _safe_mkdir(pkg_root)
 
-            # Copy bundle
+            # Copy bundle into stage
             drop_bundle_dst = pkg_root / "drop_bundle"
             shutil.copytree(bundle_dir, drop_bundle_dst)
 
-            # Write README.md (stable-ish)
-            (pkg_root / "README.md").write_text(_build_readme(daily_ev_obj), encoding="utf-8")
+            # Copy web bundle into stage (if built)
+            included_web = False
+            if with_web and web_out_dir and web_out_dir.exists():
+                shutil.copytree(web_out_dir, pkg_root / "web")
+                included_web = True
+
+            # README.md (stable fields)
+            (pkg_root / "README.md").write_text(
+                _build_readme(daily_ev_obj, included_web=included_web),
+                encoding="utf-8",
+            )
 
             # Write zip (deterministic ordering + timestamps)
             if submission_zip_path.exists():
@@ -2411,11 +2493,16 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
             with zipfile.ZipFile(str(submission_zip_path), mode="w") as zf:
                 fixed_dt = (2020, 1, 1, 0, 0, 0)
+
                 zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 zi.external_attr = 0o644 << 16
                 zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
+
                 _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
+
+                if included_web and (pkg_root / "web").exists():
+                    _zip_add_dir(zf, pkg_root / "web", arc_root="submission/web")
 
         # Write submission.json (self-describing pointer file; stable fields)
         submission_obj = {
@@ -2425,20 +2512,51 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "deterministic": bool(deterministic),
             "ts": ts,  # use run ts for determinism
             "submission_zip": "submission.zip",  # relative within submissions_root
+            "included_web": bool(with_web),
         }
-        submission_json_path.write_text(stable_json_dumps(submission_obj) + "\n", encoding="utf-8")
+        submission_json_path.write_text(stable_json(submission_obj), encoding="utf-8")
 
-        # Record in evidence + rewrite drop_evidence.json so pointer is included
+        # Compute artifact hashes + write receipt
+        submission_sha = sha256_file(submission_zip_path)
+        receipt_obj: Dict[str, Any] = {
+            "ok": True,
+            "drop_id": drop_id_for_paths,
+            "run_id": str(run_id),
+            "deterministic": bool(deterministic),
+            "ts": ts,
+            "submission_zip": str(submission_zip_path),
+            "submission_zip_sha256": submission_sha,
+            "included_web": bool(with_web),
+            "web_bundle_dir": str(web_out_dir) if (with_web and web_out_dir) else None,
+            "web_bundle_tree_sha256": web_tree_sha,
+        }
+        if web_build_meta is not None:
+            receipt_obj["web_build"] = web_build_meta
+        receipt_path.write_text(stable_json(receipt_obj), encoding="utf-8")
+
+        # Record in evidence + rewrite drop_evidence.json so pointers + hashes are included
         evidence_obj.setdefault("paths", {})
+        evidence_obj.setdefault("artifacts", {})
+
         evidence_obj["paths"]["submission_dir"] = str(submissions_root)
         evidence_obj["paths"]["submission_zip"] = str(submission_zip_path)
         evidence_obj["paths"]["submission_json"] = str(submission_json_path)
-        evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
+
+        if with_web and web_out_dir:
+            evidence_obj["paths"]["web_bundle_dir"] = str(web_out_dir)
+
+        if isinstance(evidence_obj.get("artifacts"), dict):
+            evidence_obj["artifacts"]["submission_zip_sha256"] = submission_sha
+            if web_tree_sha:
+                evidence_obj["artifacts"]["web_bundle_tree_sha256"] = web_tree_sha
+            evidence_obj["artifacts"]["submission_receipt_json"] = str(receipt_path)
+
+        evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
     # Print stdout summary JSON
     # ---------------------------------------------------------------------
-    out = {
+    out: Dict[str, Any] = {
         "deterministic": bool(deterministic),
         "drop_id": str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id)),
         "run_id": run_id,
@@ -2453,17 +2571,31 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     # bubble up useful bundle paths when available
     try:
         p = evidence_obj.get("paths") or {}
-        for k in ("bundle_dir", "bundle_track_path", "bundle_track_sha256", "playlist_path", "playlist_sha256"):
+        for k in (
+            "bundle_dir",
+            "bundle_track_path",
+            "bundle_track_sha256",
+            "playlist_path",
+            "playlist_sha256",
+            "submission_dir",
+            "submission_zip",
+            "submission_json",
+            "web_bundle_dir",
+        ):
             if k in p and p[k]:
                 out["paths"][k] = p[k]
-        if submission_zip_path is not None:
-            out["paths"]["submission_zip"] = str(submission_zip_path)
-        if submission_json_path is not None:
-            out["paths"]["submission_json"] = str(submission_json_path)
+
+        a = evidence_obj.get("artifacts") or {}
+        if isinstance(a, dict):
+            for k in ("submission_zip_sha256", "web_bundle_tree_sha256", "submission_receipt_json"):
+                if k in a and a[k]:
+                    out.setdefault("artifacts", {})[k] = a[k]
     except Exception:
         pass
 
-    print(stable_json_dumps(out))
+    if not bool(getattr(args, "_suppress_stdout_json", False)):
+        print(stable_json(out))
+
     return 0
 
 def cmd_run_tail(args: argparse.Namespace) -> int:
@@ -3436,7 +3568,6 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
       --no-verify-submission  skip unzip+validate
       --dry-run              will skip zip verification automatically (no zip expected)
     """
-    import io
     import json
     import os
     import tempfile
@@ -3446,125 +3577,127 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
 
     from mgc.bundle_validate import validate_bundle
 
+    def _stable_json(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
     def _read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def _silence_stdout():
-        # minimal local context manager (avoid importing contextlib if you prefer)
-        class _Silencer:
-            def __enter__(self):
-                import sys
-                self._old = sys.stdout
-                sys.stdout = io.StringIO()
-                return sys.stdout
-            def __exit__(self, exc_type, exc, tb):
-                import sys
-                sys.stdout = self._old
-                return False
-        return _Silencer()
-
     dry_run = bool(getattr(args, "dry_run", False))
     no_verify = bool(getattr(args, "no_verify_submission", False))
+    json_mode = bool(getattr(args, "json", False))
 
-    # Run drop, but capture its stdout so autonomous prints exactly one JSON blob
-    with _silence_stdout() as buf:
-        rc = int(cmd_run_drop(args))
-        drop_stdout = buf.getvalue().strip()
+    # IMPORTANT: ensure cmd_run_drop does NOT print its own summary JSON.
+    # We want exactly one JSON object from this command.
+    setattr(args, "_suppress_stdout_json", True)
 
+    # 1) Run drop (canonical pipeline). Any logs should be on stderr via logging config.
+    rc = int(cmd_run_drop(args))
     if rc != 0:
-        # If drop failed, surface whatever it printed (if anything)
-        if drop_stdout:
-            try:
-                sys.stdout.write(drop_stdout + "\n")
-            except Exception:
-                pass
+        # In JSON mode, still emit exactly one JSON object.
+        if json_mode:
+            sys.stdout.write(
+                _stable_json(
+                    {"ok": False, "cmd": "run.autonomous", "stage": "drop", "rc": rc}
+                )
+            )
         return rc
 
-    # Parse drop stdout JSON (best effort)
-    drop_out: Dict[str, Any] = {}
-    if drop_stdout:
-        try:
-            drop_out = json.loads(drop_stdout.splitlines()[-1])
-        except Exception:
-            drop_out = {"raw_stdout": drop_stdout}
-
-    # Determine out_dir
+    # 2) Determine out_dir + evidence path
     out_dir = Path(
         getattr(args, "out_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR")
         or "data/evidence"
     ).expanduser().resolve()
 
-    # Locate evidence + submission zip path
-    evidence_path = Path(str((drop_out.get("paths") or {}).get("evidence_path") or (out_dir / "drop_evidence.json"))).resolve()
+    evidence_path = (out_dir / "drop_evidence.json").resolve()
+    if not evidence_path.exists():
+        msg = f"missing evidence: {evidence_path}"
+        if json_mode:
+            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "evidence", "error": msg}))
+            return 2
+        raise SystemExit(f"[run autonomous] {msg}")
 
-    evidence_obj: Dict[str, Any] = {}
-    if evidence_path.exists():
-        try:
-            evidence_obj = _read_json(evidence_path)
-        except Exception:
-            evidence_obj = {}
+    try:
+        evidence_obj = _read_json(evidence_path)
+    except Exception as e:
+        msg = f"failed to read evidence JSON: {evidence_path}: {e}"
+        if json_mode:
+            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "evidence", "error": msg}))
+            return 2
+        raise SystemExit(f"[run autonomous] {msg}") from e
 
-    drop_id = str(drop_out.get("drop_id") or evidence_obj.get("drop_id") or "")
-    run_id = str(drop_out.get("run_id") or evidence_obj.get("run_id") or "")
+    # 3) Locate submission.zip (by contract: evidence.paths.submission_zip)
+    paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
+    submission_zip = paths.get("submission_zip") if isinstance(paths, dict) else None
+    if not submission_zip:
+        msg = "drop completed but evidence has no paths.submission_zip"
+        if json_mode:
+            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "evidence", "error": msg}))
+            return 2
+        raise SystemExit(f"[run autonomous] {msg}")
 
-    # submission zip path priority:
-    # 1) evidence_obj.paths.submission_zip
-    # 2) drop_out.paths.submission_zip
-    # 3) conventional: data/submissions/<drop_id>/submission.zip
-    submission_zip: Optional[Path] = None
-    p_evi = (evidence_obj.get("paths") or {}) if isinstance(evidence_obj.get("paths"), dict) else {}
-    p_out = (drop_out.get("paths") or {}) if isinstance(drop_out.get("paths"), dict) else {}
+    zip_path = Path(str(submission_zip)).expanduser().resolve()
+    if not zip_path.exists():
+        msg = f"submission_zip missing on disk: {zip_path}"
+        if json_mode:
+            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "submission_zip", "error": msg}))
+            return 2
+        raise SystemExit(f"[run autonomous] {msg}")
 
-    cand = p_evi.get("submission_zip") or p_out.get("submission_zip")
-    if cand:
-        submission_zip = Path(str(cand)).expanduser().resolve()
-    elif drop_id:
-        submission_zip = (Path("data") / "submissions" / drop_id / "submission.zip").resolve()
+    # 4) Verify zip unless skipped / dry-run
+    verify_skipped = bool(dry_run or no_verify)
+    verify_ok: Optional[bool] = None
+    verify_error: Optional[str] = None
 
-    verify_ok = None
-    verify_error = None
-
-    # Verify zip (unless skipped / dry-run)
-    if dry_run or no_verify:
+    if verify_skipped:
         verify_ok = None
     else:
         try:
-            if submission_zip is None or not submission_zip.exists():
-                raise FileNotFoundError(f"submission.zip not found (expected at {submission_zip})")
+            with zipfile.ZipFile(str(zip_path), "r") as zf:
+                names = zf.namelist()
+                expected_prefix = "submission/drop_bundle/"
+                if not any(n.startswith(expected_prefix) for n in names):
+                    raise ValueError("invalid submission.zip layout: expected submission/drop_bundle/")
 
-            with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
-                td_path = Path(td).resolve()
-                with zipfile.ZipFile(str(submission_zip), "r") as zf:
-                    zf.extractall(str(td_path))
+                with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
+                    td_path = Path(td).resolve()
+                    zf.extractall(td_path)
 
-                bundle_dir = td_path / "submission" / "drop_bundle"
-                if not bundle_dir.exists():
-                    raise FileNotFoundError(f"Expected submission/drop_bundle in zip, not found at: {bundle_dir}")
+                    bundle_dir = td_path / "submission" / "drop_bundle"
+                    if not bundle_dir.exists() or not bundle_dir.is_dir():
+                        raise FileNotFoundError(f"extracted bundle missing: {bundle_dir}")
 
-                validate_bundle(bundle_dir)
-                verify_ok = True
+                    validate_bundle(bundle_dir)
+
+            verify_ok = True
         except Exception as e:
             verify_ok = False
             verify_error = str(e)
 
+    # 5) Emit exactly one JSON object
+    drop_id = str(evidence_obj.get("drop_id") or "")
+    run_id = str(evidence_obj.get("run_id") or "")
+
     out: Dict[str, Any] = {
-        "ok": bool(verify_ok) if verify_ok is not None else True,
-        "drop": drop_out,
+        "ok": (verify_ok in (None, True)),
+        "cmd": "run.autonomous",
         "ids": {"drop_id": drop_id, "run_id": run_id},
         "paths": {
             "out_dir": str(out_dir),
             "evidence_path": str(evidence_path),
-            "submission_zip": str(submission_zip) if submission_zip is not None else None,
+            "submission_zip": str(zip_path),
         },
         "verify": {
-            "skipped": bool(dry_run or no_verify),
+            "skipped": verify_skipped,
             "ok": verify_ok,
             "error": verify_error,
         },
+        # Include the full drop evidence so this command is self-contained.
+        "drop": evidence_obj,
     }
 
-    sys.stdout.write(stable_json_dumps(out) + "\n")
+    sys.stdout.write(_stable_json(out))
     return 0 if (verify_ok in (None, True)) else 2
 
 # ---------------------------------------------------------------------------
@@ -3723,15 +3856,31 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         help="Evidence output directory",
     )
     drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
-    drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
-    drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--include", action="append", default=None,
+                      help="Optional glob(s) to include in manifest (repeatable)")
+    drop.add_argument("--exclude-dir", action="append", default=None,
+                      help="Directory name(s) to exclude during manifest (repeatable)")
+    drop.add_argument("--exclude-glob", action="append", default=None,
+                      help="Filename glob(s) to exclude during manifest (repeatable)")
     drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     drop.add_argument(
         "--deterministic",
         action="store_true",
         help="Deterministic mode (also via MGC_DETERMINISTIC=1)",
     )
+
+    # NEW: web bundle inclusion
+    drop.add_argument(
+        "--with-web",
+        action="store_true",
+        help="Build a static web bundle and include it inside submission.zip (also records paths.web_bundle_dir)",
+    )
+    drop.add_argument(
+        "--web-out-dir",
+        default=None,
+        help="Optional override for web bundle output dir (default: data/submissions/<drop_id>/web)",
+    )
+
     drop.set_defaults(func=cmd_run_drop)
 
     # ----------------------------
@@ -3773,12 +3922,28 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         help="Evidence output directory",
     )
     auto.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
-    auto.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
-    auto.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    auto.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    auto.add_argument("--include", action="append", default=None,
+                      help="Optional glob(s) to include in manifest (repeatable)")
+    auto.add_argument("--exclude-dir", action="append", default=None,
+                      help="Directory name(s) to exclude during manifest (repeatable)")
+    auto.add_argument("--exclude-glob", action="append", default=None,
+                      help="Filename glob(s) to exclude during manifest (repeatable)")
     auto.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     auto.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     auto.add_argument("--no-verify-submission", action="store_true", help="Skip verifying submission.zip after drop")
+
+    # NEW: pass-through to drop
+    auto.add_argument(
+        "--with-web",
+        action="store_true",
+        help="Build+include static web bundle (passes through to run drop)",
+    )
+    auto.add_argument(
+        "--web-out-dir",
+        default=None,
+        help="Optional override for web bundle output dir (default: data/submissions/<drop_id>/web)",
+    )
+
     auto.set_defaults(func=cmd_run_autonomous)
 
     # ----------------------------
