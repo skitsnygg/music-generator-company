@@ -2188,6 +2188,78 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     # Run id for this drop
     run_id = stable_uuid5("run", "drop", context, seed, run_date, "det" if deterministic else "live")
 
+    def cmd_run_autonomous(args: argparse.Namespace) -> int:
+        """
+        Cron-safe wrapper: run a full drop end-to-end, then optionally verify the produced submission.zip.
+
+        Why this exists:
+          - one command to run unattended (cron/GitHub Actions/runner)
+          - keeps existing run drop behavior as the canonical pipeline
+          - adds a final "submission artifact sanity check" so failures surface immediately
+        """
+        import json
+        import tempfile
+        import zipfile
+        from pathlib import Path
+
+        # 1) Run the canonical drop pipeline (daily + publish-marketing + manifest + evidence + submission zip)
+        rc = int(cmd_run_drop(args))
+        if rc != 0:
+            return rc
+
+        # 2) Optional submission verification (default: on)
+        verify = not bool(getattr(args, "no_verify_submission", False))
+        if not verify:
+            return 0
+
+        # In your cmd_run_drop, the evidence file is always written to out_dir/drop_evidence.json
+        out_dir = Path(
+            getattr(args, "out_dir", None)
+            or os.environ.get("MGC_EVIDENCE_DIR")
+            or "data/evidence"
+        ).expanduser().resolve()
+        evidence_path = out_dir / "drop_evidence.json"
+        if not evidence_path.exists():
+            # If drop succeeded but evidence missing, that's a contract violation
+            raise SystemExit(f"[run autonomous] missing evidence: {evidence_path}")
+
+        try:
+            evidence_obj = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise SystemExit(f"[run autonomous] failed to read evidence JSON: {evidence_path}: {e}") from e
+
+        paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
+        submission_zip = paths.get("submission_zip") if isinstance(paths, dict) else None
+        if not submission_zip:
+            raise SystemExit("[run autonomous] drop completed but evidence has no paths.submission_zip")
+
+        zip_path = Path(str(submission_zip)).expanduser().resolve()
+        if not zip_path.exists():
+            raise SystemExit(f"[run autonomous] submission_zip missing on disk: {zip_path}")
+
+        # Verify zip layout + validate extracted drop bundle
+        # (Does not depend on submission_cli wiring; safe + local.)
+        from mgc.bundle_validate import validate_bundle  # type: ignore
+
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            names = zf.namelist()
+            expected_prefix = "submission/drop_bundle/"
+            if not any(n.startswith(expected_prefix) for n in names):
+                raise SystemExit("[run autonomous] invalid submission.zip layout: expected submission/drop_bundle/")
+
+            with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
+                td_path = Path(td).resolve()
+                zf.extractall(td_path)
+                bundle_dir = td_path / "submission" / "drop_bundle"
+                if not bundle_dir.exists() or not bundle_dir.is_dir():
+                    raise SystemExit(f"[run autonomous] extracted bundle missing: {bundle_dir}")
+
+                # Raises on invalid (hash mismatch/missing files/etc.)
+                validate_bundle(bundle_dir)
+
+        # If we got here, everything is good.
+        return 0
+
     # ---------------------------------------------------------------------
     # Ensure manifest exists in out_dir (cmd_run_drop hashes this)
     # ---------------------------------------------------------------------
@@ -3350,90 +3422,368 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
     print(f"+{summary['added']}  -{summary['removed']}  ~{summary['modified']}  (older={older_name} newer={newer_name})")
     return exit_code
 
+def cmd_run_autonomous(args: argparse.Namespace) -> int:
+    """
+    End-to-end autonomous run:
+
+    - executes `run drop` (daily + publish-marketing + manifest + evidence + submission zip)
+    - verifies the produced submission.zip by:
+        * unzip to temp dir
+        * validate_bundle(submission/drop_bundle)
+    - prints a single JSON summary to stdout
+
+    Flags:
+      --no-verify-submission  skip unzip+validate
+      --dry-run              will skip zip verification automatically (no zip expected)
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    import zipfile
+    from pathlib import Path
+    from typing import Any, Dict, Optional
+
+    from mgc.bundle_validate import validate_bundle
+
+    def _read_json(path: Path) -> Any:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _silence_stdout():
+        # minimal local context manager (avoid importing contextlib if you prefer)
+        class _Silencer:
+            def __enter__(self):
+                import sys
+                self._old = sys.stdout
+                sys.stdout = io.StringIO()
+                return sys.stdout
+            def __exit__(self, exc_type, exc, tb):
+                import sys
+                sys.stdout = self._old
+                return False
+        return _Silencer()
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    no_verify = bool(getattr(args, "no_verify_submission", False))
+
+    # Run drop, but capture its stdout so autonomous prints exactly one JSON blob
+    with _silence_stdout() as buf:
+        rc = int(cmd_run_drop(args))
+        drop_stdout = buf.getvalue().strip()
+
+    if rc != 0:
+        # If drop failed, surface whatever it printed (if anything)
+        if drop_stdout:
+            try:
+                sys.stdout.write(drop_stdout + "\n")
+            except Exception:
+                pass
+        return rc
+
+    # Parse drop stdout JSON (best effort)
+    drop_out: Dict[str, Any] = {}
+    if drop_stdout:
+        try:
+            drop_out = json.loads(drop_stdout.splitlines()[-1])
+        except Exception:
+            drop_out = {"raw_stdout": drop_stdout}
+
+    # Determine out_dir
+    out_dir = Path(
+        getattr(args, "out_dir", None)
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).expanduser().resolve()
+
+    # Locate evidence + submission zip path
+    evidence_path = Path(str((drop_out.get("paths") or {}).get("evidence_path") or (out_dir / "drop_evidence.json"))).resolve()
+
+    evidence_obj: Dict[str, Any] = {}
+    if evidence_path.exists():
+        try:
+            evidence_obj = _read_json(evidence_path)
+        except Exception:
+            evidence_obj = {}
+
+    drop_id = str(drop_out.get("drop_id") or evidence_obj.get("drop_id") or "")
+    run_id = str(drop_out.get("run_id") or evidence_obj.get("run_id") or "")
+
+    # submission zip path priority:
+    # 1) evidence_obj.paths.submission_zip
+    # 2) drop_out.paths.submission_zip
+    # 3) conventional: data/submissions/<drop_id>/submission.zip
+    submission_zip: Optional[Path] = None
+    p_evi = (evidence_obj.get("paths") or {}) if isinstance(evidence_obj.get("paths"), dict) else {}
+    p_out = (drop_out.get("paths") or {}) if isinstance(drop_out.get("paths"), dict) else {}
+
+    cand = p_evi.get("submission_zip") or p_out.get("submission_zip")
+    if cand:
+        submission_zip = Path(str(cand)).expanduser().resolve()
+    elif drop_id:
+        submission_zip = (Path("data") / "submissions" / drop_id / "submission.zip").resolve()
+
+    verify_ok = None
+    verify_error = None
+
+    # Verify zip (unless skipped / dry-run)
+    if dry_run or no_verify:
+        verify_ok = None
+    else:
+        try:
+            if submission_zip is None or not submission_zip.exists():
+                raise FileNotFoundError(f"submission.zip not found (expected at {submission_zip})")
+
+            with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
+                td_path = Path(td).resolve()
+                with zipfile.ZipFile(str(submission_zip), "r") as zf:
+                    zf.extractall(str(td_path))
+
+                bundle_dir = td_path / "submission" / "drop_bundle"
+                if not bundle_dir.exists():
+                    raise FileNotFoundError(f"Expected submission/drop_bundle in zip, not found at: {bundle_dir}")
+
+                validate_bundle(bundle_dir)
+                verify_ok = True
+        except Exception as e:
+            verify_ok = False
+            verify_error = str(e)
+
+    out: Dict[str, Any] = {
+        "ok": bool(verify_ok) if verify_ok is not None else True,
+        "drop": drop_out,
+        "ids": {"drop_id": drop_id, "run_id": run_id},
+        "paths": {
+            "out_dir": str(out_dir),
+            "evidence_path": str(evidence_path),
+            "submission_zip": str(submission_zip) if submission_zip is not None else None,
+        },
+        "verify": {
+            "skipped": bool(dry_run or no_verify),
+            "ok": verify_ok,
+            "error": verify_error,
+        },
+    }
+
+    sys.stdout.write(stable_json_dumps(out) + "\n")
+    return 0 if (verify_ok in (None, True)) else 2
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    run_p = subparsers.add_parser("run", help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)")
+    """
+    Wire `mgc run ...` subcommands.
+
+    NOTE:
+    - This function in mgc.run_cli.py is the canonical run parser wiring.
+    - Do NOT maintain a second copy in mgc.main.py (it will drift and waste time).
+    """
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)",
+    )
     run_p.set_defaults(_mgc_group="run")
     run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
 
+    # ----------------------------
+    # open
+    # ----------------------------
     open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
-    open_p.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    open_p.add_argument(
+        "--out-dir",
+        default=None,
+        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)",
+    )
+    open_p.add_argument(
+        "--type",
+        choices=["drop", "weekly", "any"],
+        default="any",
+        help="Evidence type filter",
+    )
     open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
     open_p.set_defaults(func=cmd_run_open)
 
+    # ----------------------------
+    # tail
+    # ----------------------------
     tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
-    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
+    tail.add_argument(
+        "--out-dir",
+        default=None,
+        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)",
+    )
+    tail.add_argument(
+        "--type",
+        choices=["drop", "weekly", "any"],
+        default="any",
+        help="Evidence type filter",
+    )
     tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
     tail.set_defaults(func=cmd_run_tail)
 
+    # ----------------------------
+    # diff
+    # ----------------------------
     diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
-    diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
+    diff.add_argument(
+        "--out-dir",
+        default=None,
+        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)",
+    )
+    diff.add_argument(
+        "--type",
+        choices=["drop", "weekly", "any"],
+        default="any",
+        help="Manifest type filter",
+    )
     diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
-    diff.add_argument("--since-ok", action="store_true", help="Auto-pick an older manifest from the most recent run with no stage errors")
-    diff.add_argument("--summary-only", action="store_true", help="Only output counts in JSON mode (still one-line summary in human mode)")
-    diff.add_argument("--fail-on-changes", action="store_true", help="Exit 2 if any non-allowed changes are detected (CI)")
-    diff.add_argument("--allow", action="append", default=[], help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.")
-    diff.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
+    diff.add_argument(
+        "--since-ok",
+        action="store_true",
+        help="Auto-pick an older manifest from the most recent run with no stage errors",
+    )
+    diff.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only output counts in JSON mode (still one-line summary in human mode)",
+    )
+    diff.add_argument(
+        "--fail-on-changes",
+        action="store_true",
+        help="Exit 2 if any non-allowed changes are detected (CI)",
+    )
+    diff.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.",
+    )
     diff.set_defaults(func=cmd_run_diff)
 
+    # ----------------------------
+    # status
+    # ----------------------------
     status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
     status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
-    status.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
     status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
     status.set_defaults(func=cmd_run_status)
 
+    # ----------------------------
+    # daily
+    # ----------------------------
     daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
-    daily.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
-    daily.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood (focus/workout/sleep)")
-    daily.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed for deterministic behavior")
-    daily.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
-    daily.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
+    daily.add_argument(
+        "--context",
+        default=os.environ.get("MGC_CONTEXT", "focus"),
+        help="Context/mood (focus/workout/sleep)",
+    )
+    daily.add_argument(
+        "--seed",
+        default=os.environ.get("MGC_SEED", "1"),
+        help="Seed for deterministic behavior",
+    )
+    daily.add_argument(
+        "--out-dir",
+        default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
+        help="Evidence output directory",
+    )
+    daily.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)",
+    )
     daily.set_defaults(func=cmd_run_daily)
 
+    # ----------------------------
+    # publish-marketing
+    # ----------------------------
     pub = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
-    pub.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
     pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
-    pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
+    pub.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)",
+    )
     pub.set_defaults(func=cmd_publish_marketing)
 
+    # ----------------------------
+    # drop
+    # ----------------------------
     drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
-    drop.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
     drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
-    drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    drop.add_argument(
+        "--out-dir",
+        default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
+        help="Evidence output directory",
+    )
     drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
     drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
     drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
     drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
     drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
-    drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    drop.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Deterministic mode (also via MGC_DETERMINISTIC=1)",
+    )
     drop.set_defaults(func=cmd_run_drop)
 
+    # ----------------------------
+    # weekly
+    # ----------------------------
     weekly = run_sub.add_parser("weekly", help="Run 7 dailies + one publish-marketing + one manifest; emit weekly evidence")
-    weekly.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
     weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
-    weekly.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
+    weekly.add_argument(
+        "--out-dir",
+        default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
+        help="Evidence output directory",
+    )
     weekly.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
     weekly.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
     weekly.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
     weekly.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
     weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
-    weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    weekly.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Deterministic mode (also via MGC_DETERMINISTIC=1)",
+    )
     weekly.set_defaults(func=cmd_run_weekly)
 
+    # ----------------------------
+    # autonomous (NEW)
+    # ----------------------------
+    auto = run_sub.add_parser("autonomous", help="Run end-to-end drop + verify submission (cron-safe)")
+    auto.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
+    auto.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    auto.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
+    auto.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
+    auto.add_argument(
+        "--out-dir",
+        default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
+        help="Evidence output directory",
+    )
+    auto.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
+    auto.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
+    auto.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
+    auto.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
+    auto.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
+    auto.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
+    auto.add_argument("--no-verify-submission", action="store_true", help="Skip verifying submission.zip after drop")
+    auto.set_defaults(func=cmd_run_autonomous)
+
+    # ----------------------------
+    # manifest
+    # ----------------------------
     man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     man.add_argument("--repo-root", default=".", help="Repository root to hash")
     man.add_argument("--include", action="append", default=None, help="Optional glob(s) to include (can repeat)")
@@ -3443,33 +3793,37 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     man.add_argument("--print-hash", action="store_true", help="Print root_tree_sha256 to stderr")
     man.set_defaults(func=cmd_run_manifest)
 
+    # ----------------------------
+    # stage
+    # ----------------------------
     stage = run_sub.add_parser("stage", help="Inspect or set run stage state (resume/observability)")
     stage_sub = stage.add_subparsers(dest="stage_cmd", required=True)
 
     st_set = stage_sub.add_parser("set", help="Upsert a stage row")
-    st_set.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_set.add_argument("run_id", help="Canonical run_id")
     st_set.add_argument("stage", help="Stage name (e.g. daily, publish_marketing, manifest, evidence)")
     st_set.add_argument("status", help="pending|running|ok|error|skipped")
     st_set.add_argument("--started-at", default=None, help="ISO8601 timestamp")
     st_set.add_argument("--ended-at", default=None, help="ISO8601 timestamp")
-    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds (normalized to 0 in deterministic mode)")
+    st_set.add_argument(
+        "--duration-ms",
+        type=int,
+        default=None,
+        help="Duration in milliseconds (normalized to 0 in deterministic mode)",
+    )
     st_set.add_argument("--error-json", default=None, help="JSON string for error details")
     st_set.add_argument("--meta-json", default=None, help="JSON string to merge into meta_json")
     st_set.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     st_set.set_defaults(func=cmd_run_stage_set)
 
     st_get = stage_sub.add_parser("get", help="Get a stage row")
-    st_get.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_get.add_argument("run_id", help="Canonical run_id")
     st_get.add_argument("stage", help="Stage name")
     st_get.set_defaults(func=cmd_run_stage_get)
 
     st_ls = stage_sub.add_parser("list", help="List all stages for a run_id")
-    st_ls.add_argument("--db", default=None, help="SQLite DB path (optional; also honors global --db and MGC_DB)")
     st_ls.add_argument("run_id", help="Canonical run_id")
     st_ls.set_defaults(func=cmd_run_stage_list)
-
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mgc-run-cli", description="MGC run_cli helpers")

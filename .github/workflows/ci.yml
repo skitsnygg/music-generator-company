@@ -64,10 +64,81 @@ jobs:
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
           echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
 
+          # Keep checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
           ls -la "${RUNNER_TEMP}/ci_db.sqlite"
           sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
+
+      - name: Ensure DB schema has required tables (CI bootstrap)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os, sqlite3
+
+          p = os.environ["MGC_DB"]
+          con = sqlite3.connect(p)
+          try:
+              con.execute("PRAGMA foreign_keys = ON")
+              con.executescript("""
+              CREATE TABLE IF NOT EXISTS tracks (
+                track_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                title TEXT,
+                provider TEXT,
+                mood TEXT,
+                genre TEXT,
+                artifact_path TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS drops (
+                drop_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                context TEXT,
+                seed TEXT,
+                run_id TEXT,
+                track_id TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                kind TEXT,
+                actor TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS marketing_posts (
+                post_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                platform TEXT,
+                status TEXT,
+                content TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS playlists (
+                playlist_id TEXT PRIMARY KEY,
+                ts TEXT,
+                context TEXT,
+                payload TEXT,
+                meta TEXT
+              );
+              """)
+              con.commit()
+
+              tables = [r[0] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+              ).fetchall()]
+              print("tables:", tables)
+              assert "drops" in tables, "drops table missing"
+              assert "playlists" in tables, "playlists table missing"
+          finally:
+              con.close()
+          PY
 
       - name: Preflight DB (must pass)
         shell: bash
@@ -81,10 +152,14 @@ jobs:
           p = os.environ["MGC_DB"]
           con = sqlite3.connect(p)
           try:
-              tables = [r[0] for r in con.execute("select name from sqlite_master where type='table' order by name").fetchall()]
+              tables = [r[0] for r in con.execute(
+                  "select name from sqlite_master where type='table' order by name"
+              ).fetchall()]
               print("tables:", tables)
-              if "playlists" not in tables:
-                  print(f"ERROR: {p} missing playlists table", file=sys.stderr)
+              required = {"tracks", "drops", "events", "marketing_posts", "playlists"}
+              missing = sorted(required - set(tables))
+              if missing:
+                  print(f"ERROR: {p} missing tables: {missing}", file=sys.stderr)
                   sys.exit(1)
           finally:
               con.close()
@@ -109,7 +184,7 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
-      - name: Web player build (deterministic synthetic audio -> playlist -> build)
+      - name: Web player build (real drop bundle -> playlist -> build)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -118,70 +193,25 @@ jobs:
         run: |
           set -euxo pipefail
 
-          OUT_DIR="${RUNNER_TEMP}/mgc_web"
-          SRC_DIR="${RUNNER_TEMP}/mgc_web_src"
-          TRACKS_DIR="${SRC_DIR}/tracks"
-          mkdir -p "${OUT_DIR}" "${SRC_DIR}" "${TRACKS_DIR}"
+          DROP_DIR="${RUNNER_TEMP}/mgc_drop_test"
+          WEB_DIR="${RUNNER_TEMP}/mgc_web"
+          mkdir -p "${DROP_DIR}" "${WEB_DIR}"
 
-          export SRC_DIR
-          export TRACKS_DIR
+          # Produce a real deterministic drop bundle (writes tracks/ + playlist.json)
+          python -m mgc.main run drop \
+            --context focus \
+            --seed 1 \
+            --deterministic \
+            --out-dir "${DROP_DIR}" \
+            > "${DROP_DIR}/drop_stdout.json"
 
-          # Deterministic 1.5s sine wave WAV
-          ffmpeg -hide_banner -loglevel error -y \
-            -f lavfi -i "sine=frequency=440:duration=1.5" \
-            -c:a pcm_s16le \
-            "${TRACKS_DIR}/track_001.wav"
+          python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
+          test -s "${DROP_DIR}/playlist.json"
 
-          test -s "${TRACKS_DIR}/track_001.wav"
-          ls -la "${TRACKS_DIR}"
-
-          # Build playlist JSON using ABSOLUTE paths (since CI mgc doesn't support --strip-paths)
-          PLAYLIST_JSON="${SRC_DIR}/ci_playlist.json"
-          python - <<'PY'
-          import json, os, pathlib
-          from datetime import datetime, timezone
-
-          src_dir = pathlib.Path(os.environ["SRC_DIR"])
-          tracks_dir = pathlib.Path(os.environ["TRACKS_DIR"])
-          fixed = os.environ.get("MGC_FIXED_TIME") or datetime.now(timezone.utc).isoformat()
-
-          audio = sorted([p for p in tracks_dir.iterdir() if p.is_file() and p.suffix.lower() in (".wav", ".mp3")])
-          if not audio:
-              raise SystemExit(f"no audio found in {tracks_dir}")
-
-          tracks = []
-          for i, p in enumerate(audio, start=1):
-              ap = str(p.resolve())
-              tracks.append({
-                  "id": f"ci-track-{i}",
-                  "title": p.stem,
-                  # give multiple common keys, all absolute
-                  "path": ap,
-                  "file": ap,
-                  "src": ap,
-              })
-
-          playlist = {
-              "schema": "mgc.playlist.v1",
-              "id": "ci-playlist",
-              "name": "ci_web_smoke",
-              "created_ts": fixed,
-              "track_count": len(tracks),
-              "tracks": tracks,
-          }
-
-          out_path = src_dir / "ci_playlist.json"
-          out_path.write_text(json.dumps(playlist, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-          print("wrote", out_path)
-          PY
-
-          test -s "${PLAYLIST_JSON}"
-          python -m json.tool < "${PLAYLIST_JSON}" >/dev/null
-
-          # Web build (NO --strip-paths)
+          # Build the web player from the drop playlist
           python -m mgc.main web build \
-            --playlist "${PLAYLIST_JSON}" \
-            --out-dir "${OUT_DIR}" \
+            --playlist "${DROP_DIR}/playlist.json" \
+            --out-dir "${WEB_DIR}" \
             --prefer-mp3 \
             --clean \
             --fail-if-empty \
@@ -189,11 +219,11 @@ jobs:
             | python -m json.tool
 
           # Validate build output
-          test "$(find "${OUT_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
-          test "$(find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
+          test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
+          test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
-          find "${OUT_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
-          find "${OUT_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 50 || true
+          find "${WEB_DIR}" -maxdepth 4 -type f -name 'index.html' -print || true
+          find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | head -n 50 || true
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
@@ -210,6 +240,6 @@ jobs:
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
+            ${{ runner.temp }}/mgc_drop_test
             ${{ runner.temp }}/mgc_web
-            ${{ runner.temp }}/mgc_web_src
           if-no-files-found: ignore
