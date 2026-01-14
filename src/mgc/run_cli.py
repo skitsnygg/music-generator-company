@@ -1895,6 +1895,10 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
+    import sys
+    import sqlite3
+    from typing import Any, Dict, List, Tuple
+
     deterministic = is_deterministic(args)
 
     db_path = resolve_db_path(args)
@@ -1908,12 +1912,51 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
     pending = db_marketing_posts_pending(con, limit=limit)
 
+    # Defensive stable ordering (even if helper already orders)
+    def _row_get(r: sqlite3.Row, key: str) -> Any:
+        try:
+            return r[key]
+        except Exception:
+            return None
+
+    def _first_id(r: sqlite3.Row) -> str:
+        v = _row_first(r, ["id", "post_id", "marketing_post_id"], default="")
+        return str(v or "")
+
+    def _first_created(r: sqlite3.Row) -> str:
+        v = _row_first(r, ["created_at", "created_ts", "ts"], default="")
+        return str(v or "")
+
+    pending_sorted = sorted(
+        list(pending),
+        key=lambda r: (_first_created(r), _first_id(r)),
+    )
+
     published: List[Dict[str, Any]] = []
     skipped_ids: List[str] = []
     run_ids_touched: List[str] = []
 
-    for row in pending:
-        post_id = str(_row_first(row, ["id", "post_id"], default=""))
+    # Collect run_ids deterministically (based on the pending set, not publish side effects)
+    for row in pending_sorted:
+        meta = _marketing_row_meta(con, row)
+        rid = str((meta or {}).get("run_id") or "")
+        if rid:
+            run_ids_touched.append(rid)
+    run_ids_touched = sorted(set([r for r in run_ids_touched if r]))
+
+    # Batch id should be deterministic given (ts in live mode) and stable inputs.
+    # In deterministic mode, ts is already fixed (via deterministic_now_iso), but we still treat it as stable.
+    batch_id = stable_uuid5(
+        "marketing_publish_batch",
+        (ts if not deterministic else "fixed"),
+        str(limit),
+        ("dry" if dry_run else "live"),
+        ("|".join(run_ids_touched) if run_ids_touched else "no_runs"),
+    )
+
+    # Now publish items
+    for row in pending_sorted:
+        post_id = _first_id(row)
         platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
         content = _marketing_row_content(con, row)
 
@@ -1922,10 +1965,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             continue
 
         meta = _marketing_row_meta(con, row)
-        run_id = str(meta.get("run_id") or "")
-        drop_id = str(meta.get("drop_id") or "")
+        run_id = str((meta or {}).get("run_id") or "")
+        drop_id = str((meta or {}).get("drop_id") or "")
 
-        publish_id = stable_uuid5("publish", post_id, platform, (ts if not deterministic else "fixed"))
+        # publish_id must be stable; derive from batch_id + post_id + platform
+        publish_id = stable_uuid5("publish", batch_id, post_id, platform)
 
         if not dry_run:
             db_marketing_post_set_status(
@@ -1933,7 +1977,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 post_id=post_id,
                 status="published",
                 ts=ts,
-                meta_patch={"published_id": publish_id, "published_ts": ts},
+                meta_patch={"published_id": publish_id, "published_ts": ts, "batch_id": batch_id},
             )
 
         published.append(
@@ -1948,21 +1992,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "drop_id": drop_id,
             }
         )
-
-        if run_id:
-            run_ids_touched.append(run_id)
-
-    run_ids_touched = sorted(set([r for r in run_ids_touched if r]))
-
-    batch_id = stable_uuid5(
-        "marketing_publish_batch",
-        (ts if not deterministic else "fixed"),
-        str(limit),
-        ("dry" if dry_run else "live"),
-        str(len(skipped_ids)),
-        str(len(published)),
-        ("|".join(run_ids_touched) if deterministic else "nondet"),
-    )
 
     drops_updated: Dict[str, int] = {}
     if run_ids_touched and not dry_run:
@@ -2002,7 +2031,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     }
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
-
 
 # ---------------------------------------------------------------------------
 # Drop (daily + publish + manifest) with stages and resume semantics
