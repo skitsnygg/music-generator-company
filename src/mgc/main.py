@@ -2,6 +2,8 @@
 """
 src/mgc/main.py
 
+Music Generator Company CLI
+
 CI compatibility:
 - `mgc rebuild ls --json ...`  (CI may put --json after subcommand)
 - `mgc rebuild playlists --db ... --out-dir ... --stamp ... --determinism-check --write`
@@ -17,11 +19,13 @@ Other commands:
 - analytics: delegated to mgc.analytics_cli if available
 - run: autonomous pipeline entrypoint (daily/weekly)
 - web: static web player build/serve
+- submission: build + verify deterministic submission ZIPs
 
 Logging:
 - deterministic UTC timestamps
 - no duplicate logging
 - if --log-file is set, default file-only logs (use --log-console to also log to stderr)
+- JSON mode disables console logging to keep stdout clean
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
+
 from mgc.submission_cli import register_submission_subcommand
 
 DEFAULT_DB = "data/db.sqlite"
@@ -46,6 +51,7 @@ DEFAULT_TRACKS_EXPORT = DEFAULT_TRACKS_DIR / "tracks.json"
 LOG_FMT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
 LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
+
 # ----------------------------
 # basic utils
 # ----------------------------
@@ -53,25 +59,32 @@ LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
+
 def die(msg: str, code: int = 2) -> NoReturn:
     eprint(msg)
     raise SystemExit(code)
 
+
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
+
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
 
 def write_text(path: Path, text: str) -> None:
     ensure_parent_dir(path)
     path.write_text(text, encoding="utf-8")
 
+
 def read_json_file(path: Path) -> Any:
     return json.loads(read_text(path))
 
+
 def stable_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
 
 def write_json_file(path: Path, obj: Any) -> None:
     ensure_parent_dir(path)
@@ -80,11 +93,10 @@ def write_json_file(path: Path, obj: Any) -> None:
         encoding="utf-8",
     )
 
-def _truthy(a: bool, b: bool) -> bool:
-    return bool(a) or bool(b)
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 # ----------------------------
 # argv preprocessing (make global flags work anywhere)
@@ -101,6 +113,7 @@ _GLOBAL_FLAG_WITH_VALUE = {
     "--log-file",
 }
 
+
 def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
     # supports --db=path style
     if arg.startswith("--") and "=" in arg:
@@ -108,11 +121,17 @@ def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
         return k, v
     return arg, None
 
+
 def _hoist_global_flags(argv: List[str]) -> List[str]:
     """
     Argparse normally requires global flags to appear before the subcommand.
-    CI (and humans) often do: `mgc drops list --limit 1 --json --db ...`.
+    CI (and humans) often do: `mgc submission verify foo.zip --json --db ...`.
     This function hoists known global flags (and their values) to the front.
+
+    Notes:
+    - Preserves order encountered for global flags.
+    - Respects `--` end-of-options marker.
+    - Supports `--flag=value` for value globals.
     """
     if not argv:
         return argv
@@ -158,8 +177,8 @@ def _hoist_global_flags(argv: List[str]) -> List[str]:
         out.append(a)
         i += 1
 
-    # Keep global flags in the order encountered
     return globals_found + out
+
 
 # ----------------------------
 # logging (deterministic, no duplicates)
@@ -172,6 +191,7 @@ class _UTCFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         return dt.isoformat(timespec="seconds")
 
+
 def _parse_level(level: str) -> int:
     try:
         return int(level)
@@ -179,6 +199,7 @@ def _parse_level(level: str) -> int:
         pass
     lvl = logging.getLevelName(str(level).upper())
     return lvl if isinstance(lvl, int) else logging.INFO
+
 
 def _clear_all_non_root_handlers() -> None:
     root = logging.getLogger()
@@ -194,6 +215,7 @@ def _clear_all_non_root_handlers() -> None:
         for h in list(logger_obj.handlers):
             logger_obj.removeHandler(h)
         logger_obj.propagate = True
+
 
 def _configure_logging(
     *,
@@ -215,20 +237,17 @@ def _configure_logging(
     fmt = _UTCFormatter(LOG_FMT, datefmt=LOG_DATEFMT)
     handlers: List[logging.Handler] = []
 
-    # File handler (optional)
     if log_file:
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
         handlers.append(fh)
 
-    # Console handler (stderr only), disabled in JSON mode
     if not json_mode:
         if (not log_file) or log_console:
             sh = logging.StreamHandler(stream=sys.stderr)
             sh.setFormatter(fmt)
             handlers.append(sh)
 
-    # If somehow no handlers got added, fall back to stderr (still not stdout)
     if not handlers:
         sh = logging.StreamHandler(stream=sys.stderr)
         sh.setFormatter(fmt)
@@ -239,6 +258,7 @@ def _configure_logging(
         handlers=handlers,
         force=True,
     )
+
 
 # ----------------------------
 # DB helpers
@@ -255,6 +275,7 @@ class DBConn:
         conn.row_factory = sqlite3.Row
         return conn
 
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
@@ -262,18 +283,22 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone()
     return row is not None
 
+
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return [r["name"] for r in rows]
 
+
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
+
 
 def _maybe_int(v: Any) -> Optional[int]:
     try:
         return int(v)
     except Exception:
         return None
+
 
 def _safe_select_playlist_rows(
     conn: sqlite3.Connection,
@@ -309,6 +334,7 @@ def _safe_select_playlist_rows(
     params.append(limit)
 
     return conn.execute(q, tuple(params)).fetchall()
+
 
 def _safe_select_latest_playlists_by_slug(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     if not _table_exists(conn, "playlists"):
@@ -1103,9 +1129,12 @@ def cmd_rebuild_verify_playlists(args: argparse.Namespace) -> int:
                 diffs.append({"path": str(path), "reason": "content_diff"})
 
     payload = {"diffs": diffs, "diff_count": len(diffs)}
-    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(
-        f"{d['path']} {d['reason']}" for d in diffs
-    ))
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for d in diffs:
+            print(f"{d['path']} {d['reason']}")
 
     if diffs and args.strict:
         return 2
@@ -1123,7 +1152,12 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
     with db.connect() as conn:
         if not _table_exists(conn, "tracks"):
             payload = {"diffs": [], "diff_count": 0}
-            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                # FIX: do not emit JSON in human mode
+                # (and keep stdout human-friendly)
+                print("tracks table missing")
             return 0
 
         if not out_path.exists():
@@ -1148,287 +1182,29 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
                     diffs.append({"path": str(out_path), "reason": "content_diff"})
 
     payload = {"diffs": diffs, "diff_count": len(diffs)}
-    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(
-        f"{d['path']} {d['reason']}" for d in diffs
-    ))
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for d in diffs:
+            print(f"{d['path']} {d['reason']}")
 
     if diffs and args.strict:
         return 2
     return 0
 
 
-# ----------------------------
-# CLI wiring
-# ----------------------------
-
-def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    run_p = subparsers.add_parser(
-        "run",
-        help="Run pipeline steps (daily, publish, drop, weekly, manifest, stage, status)",
-    )
-    run_p.set_defaults(_mgc_group="run")
-    run_sub = run_p.add_subparsers(dest="run_cmd", required=True)
-
-    open_p = run_sub.add_parser("open", help="Print paths of latest evidence/manifest files (pipe-friendly)")
-    open_p.add_argument("--out-dir", default=None,
-                        help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    open_p.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
-    open_p.add_argument("--n", type=int, default=1, help="Number of recent files")
-    open_p.set_defaults(func=cmd_run_open)
-
-    tail = run_sub.add_parser("tail", help="Show latest evidence file(s)")
-    tail.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    tail.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Evidence type filter")
-    tail.add_argument("--n", type=int, default=1, help="Number of recent files to show")
-    tail.set_defaults(func=cmd_run_tail)
-
-    diff = run_sub.add_parser("diff", help="Diff the two most recent manifests")
-    diff.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
-    diff.add_argument("--type", choices=["drop", "weekly", "any"], default="any", help="Manifest type filter")
-    diff.add_argument("--since", default=None, help="Compare newest manifest against this manifest path (older)")
-    diff.add_argument("--since-ok", action="store_true",
-                      help="Auto-pick an older manifest from the most recent run with no stage errors")
-    diff.add_argument("--summary-only", action="store_true",
-                      help="Only output counts in JSON mode (still one-line summary in human mode)")
-    diff.add_argument("--fail-on-changes", action="store_true",
-                      help="Exit 2 if any non-allowed changes are detected (CI)")
-    diff.add_argument(
-        "--allow",
-        action="append",
-        default=[],
-        help="Allow specific changed manifest paths (repeatable). Works with --fail-on-changes.",
-    )
-    diff.set_defaults(func=cmd_run_diff)
-
-    status = run_sub.add_parser("status", help="Show latest (or specific) run status + stages + drop pointers")
-    status.add_argument("--fail-on-error", action="store_true", help="Exit 2 if any stage is error (for CI)")
-    status.add_argument("--run-id", default=None, help="Specific run_id to inspect")
-    status.add_argument("--latest", action="store_true", help="Force latest run_id (default if --run-id omitted)")
-    status.set_defaults(func=cmd_run_status)
-
-    daily = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
-    daily.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood (focus/workout/sleep)")
-    daily.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed for deterministic behavior")
-    daily.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
-    daily.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
-    daily.set_defaults(func=cmd_run_daily)
-
-    pub = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
-    pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
-    pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
-    pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
-    b.set_defaults(func=cmd_submission_build)
-
-
-    drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
-    drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
-    drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
-    drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
-    drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
-    drop.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
-    drop.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
-    drop.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
-    drop.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    drop.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
-    drop.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
-    drop.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
-    drop.set_defaults(func=cmd_run_drop)
-
-    weekly = run_sub.add_parser("weekly", help="Run 7 dailies + one publish-marketing + one manifest; emit weekly evidence")
-    weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
-    weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
-    weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
-    weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
-    weekly.add_argument("--out-dir", default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"), help="Evidence output directory")
-    weekly.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
-    weekly.add_argument("--include", action="append", default=None, help="Optional glob(s) to include in manifest (repeatable)")
-    weekly.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude during manifest (repeatable)")
-    weekly.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude during manifest (repeatable)")
-    weekly.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
-    weekly.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
-    weekly.set_defaults(func=cmd_run_weekly)
-
-    man = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
-    man.add_argument("--repo-root", default=".", help="Repository root to hash")
-    man.add_argument("--include", action="append", default=None, help="Optional glob(s) to include (can repeat)")
-    man.add_argument("--exclude-dir", action="append", default=None, help="Directory name(s) to exclude (repeatable)")
-    man.add_argument("--exclude-glob", action="append", default=None, help="Filename glob(s) to exclude (repeatable)")
-    man.add_argument("--out", default=None, help="Write manifest JSON to this path (else stdout)")
-    man.add_argument("--print-hash", action="store_true", help="Print root_tree_sha256 to stderr")
-    man.set_defaults(func=cmd_run_manifest)
-
-    stage = run_sub.add_parser("stage", help="Inspect or set run stage state (resume/observability)")
-    stage_sub = stage.add_subparsers(dest="stage_cmd", required=True)
-
-    st_set = stage_sub.add_parser("set", help="Upsert a stage row")
-    st_set.add_argument("run_id", help="Canonical run_id")
-    st_set.add_argument("stage", help="Stage name (e.g. daily, publish_marketing, manifest, evidence)")
-    st_set.add_argument("status", help="pending|running|ok|error|skipped")
-    st_set.add_argument("--started-at", default=None, help="ISO8601 timestamp")
-    st_set.add_argument("--ended-at", default=None, help="ISO8601 timestamp")
-    st_set.add_argument("--duration-ms", type=int, default=None, help="Duration in milliseconds (normalized to 0 in deterministic mode)")
-    st_set.add_argument("--error-json", default=None, help="JSON string for error details")
-    st_set.add_argument("--meta-json", default=None, help="JSON string to merge into meta_json")
-    st_set.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
-    st_set.set_defaults(func=cmd_run_stage_set)
-
-    st_get = stage_sub.add_parser("get", help="Get a stage row")
-    st_get.add_argument("run_id", help="Canonical run_id")
-    st_get.add_argument("stage", help="Stage name")
-    st_get.set_defaults(func=cmd_run_stage_get)
-
-    st_ls = stage_sub.add_parser("list", help="List all stages for a run_id")
-    st_ls.add_argument("run_id", help="Canonical run_id")
-    st_ls.set_defaults(func=cmd_run_stage_list)
-
 # ---------------------------------------------------------------------------
 # Parser wiring
 # ---------------------------------------------------------------------------
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
-
-    # GLOBALS ONLY: do NOT repeat these on subparsers (argparse can overwrite globals with subparser defaults)
-    p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
-    p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
-    p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
-    p.add_argument("--log-console", action="store_true")
-    p.add_argument("--json", action="store_true", help="Output JSON where supported")
-
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    # -------- status --------
-    st = sub.add_parser("status", help="Show health + recent activity snapshot")
-    st.set_defaults(func=cmd_status)
-
-    # -------- rebuild --------
-    rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
-    rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
-
-    rls = rs.add_parser("ls", help="Show rebuild/status info (CI expects this)")
-    rls.set_defaults(func=cmd_rebuild_ls)
-
-    rp = rs.add_parser("playlists", help="Rebuild canonical playlist JSON files (CI)")
-    rp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
-    rp.add_argument("--stamp", default=None)
-    rp.add_argument("--determinism-check", action="store_true")
-    rp.add_argument("--write", action="store_true")
-    rp.set_defaults(func=cmd_rebuild_playlists)
-
-    rt = rs.add_parser("tracks", help="Rebuild canonical tracks export (CI)")
-    rt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
-    rt.add_argument("--stamp", default=None)
-    rt.add_argument("--determinism-check", action="store_true")
-    rt.add_argument("--write", action="store_true")
-    rt.set_defaults(func=cmd_rebuild_tracks)
-
-    rv = rs.add_parser("verify", help="Verify rebuilt outputs match DB + files (CI expects this)")
-    rvs = rv.add_subparsers(dest="verify_cmd", required=True)
-
-    rvp = rvs.add_parser("playlists", help="Verify playlists outputs")
-    rvp.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
-    rvp.add_argument("--stamp", default=None)
-    rvp.add_argument("--strict", action="store_true")
-    rvp.add_argument("rest", nargs=argparse.REMAINDER)
-    rvp.set_defaults(func=cmd_rebuild_verify_playlists)
-
-    rvt = rvs.add_parser("tracks", help="Verify tracks outputs")
-    rvt.add_argument("--out-dir", default=str(DEFAULT_TRACKS_DIR))
-    rvt.add_argument("--stamp", default=None)
-    rvt.add_argument("--strict", action="store_true")
-    rvt.add_argument("rest", nargs=argparse.REMAINDER)
-    rvt.set_defaults(func=cmd_rebuild_verify_tracks)
-
-    # -------- playlists --------
-    playlists = sub.add_parser("playlists", help="Inspect playlists")
-    ps = playlists.add_subparsers(dest="playlists_cmd", required=True)
-
-    pl = ps.add_parser("list", help="List playlists")
-    pl.add_argument("--limit", type=int, default=20)
-    pl.add_argument("--slug", default=None)
-    pl.set_defaults(func=cmd_playlists_list)
-
-    ph = ps.add_parser("history", help="Show playlist history for a slug (or id)")
-    ph.add_argument("target")
-    ph.add_argument("--limit", type=int, default=20)
-    ph.set_defaults(func=cmd_playlists_history)
-
-    pr = ps.add_parser("reveal", help="Print playlist JSON for a playlist id")
-    pr.add_argument("id")
-    pr.set_defaults(func=cmd_playlists_reveal)
-
-    pe = ps.add_parser("export", help="Export recent playlist JSON files")
-    pe.add_argument("--limit", type=int, default=1)
-    pe.add_argument("--slug", default=None)
-    pe.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
-    pe.set_defaults(func=cmd_playlists_export)
-
-    # -------- tracks --------
-    tracks = sub.add_parser("tracks", help="Inspect track library")
-    ts = tracks.add_subparsers(dest="tracks_cmd", required=True)
-
-    tl = ts.add_parser("list", help="List tracks")
-    tl.add_argument("--limit", type=int, default=20)
-    tl.add_argument("--mood", default=None)
-    tl.add_argument("--genre", default=None)
-    tl.set_defaults(func=cmd_tracks_list)
-
-    tshow = ts.add_parser("show", help="Show track details")
-    tshow.add_argument("id")
-    tshow.set_defaults(func=cmd_tracks_show)
-
-    tstats = ts.add_parser("stats", help="Track library stats")
-    tstats.set_defaults(func=cmd_tracks_stats)
-
-    # -------- marketing --------
-    marketing = sub.add_parser("marketing", help="Marketing tools")
-    ms = marketing.add_subparsers(dest="marketing_cmd", required=True)
-
-    mposts = ms.add_parser("posts", help="Marketing posts")
-    mps = mposts.add_subparsers(dest="posts_cmd", required=True)
-
-    mpl = mps.add_parser("list", help="List marketing posts")
-    mpl.add_argument("--limit", type=int, default=20)
-    mpl.set_defaults(func=cmd_marketing_posts_list)
-
-    # -------- drops (optional) --------
-    try:
-        from mgc.drops_cli import register_drops_subcommand  # type: ignore
-    except Exception:
-        register_drops_subcommand = None  # type: ignore
-    if register_drops_subcommand:
-        register_drops_subcommand(sub)
-
-    # -------- analytics (optional) --------
-    try:
-        from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
-    except Exception:
-        register_analytics_subcommand = None  # type: ignore
-    if register_analytics_subcommand:
-        register_analytics_subcommand(sub)
-
-    # -------- web (optional) --------
-    try:
-        from mgc.web_cli import register_web_subcommand  # type: ignore
-    except Exception:
-        register_web_subcommand = None  # type: ignore
-    if register_web_subcommand:
-        register_web_subcommand(sub)
-
-    # -------- run (required) --------
-    try:
-        from mgc.run_cli import register_run_subcommand  # type: ignore
-    except Exception as e:
-        raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
-    register_run_subcommand(sub)
-
-    return p
-
-
 def build_parser() -> argparse.ArgumentParser:
+    """
+    Single source of truth parser builder.
+    """
     p = argparse.ArgumentParser(prog="mgc", description="Music Generator Company CLI")
 
-    # GLOBALS ONLY: do NOT repeat these on subparsers (argparse can overwrite globals with subparser defaults)
+    # GLOBALS ONLY: do NOT repeat these on subparsers
     p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
     p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
     p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
@@ -1437,11 +1213,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # -------- status --------
     st = sub.add_parser("status", help="Show health + recent activity snapshot")
     st.set_defaults(func=cmd_status)
 
-    # -------- rebuild --------
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
 
@@ -1479,7 +1253,6 @@ def build_parser() -> argparse.ArgumentParser:
     rvt.add_argument("rest", nargs=argparse.REMAINDER)
     rvt.set_defaults(func=cmd_rebuild_verify_tracks)
 
-    # -------- playlists --------
     playlists = sub.add_parser("playlists", help="Inspect playlists")
     ps = playlists.add_subparsers(dest="playlists_cmd", required=True)
 
@@ -1503,7 +1276,6 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--out-dir", default=str(DEFAULT_PLAYLIST_DIR))
     pe.set_defaults(func=cmd_playlists_export)
 
-    # -------- tracks --------
     tracks = sub.add_parser("tracks", help="Inspect track library")
     ts = tracks.add_subparsers(dest="tracks_cmd", required=True)
 
@@ -1520,7 +1292,6 @@ def build_parser() -> argparse.ArgumentParser:
     tstats = ts.add_parser("stats", help="Track library stats")
     tstats.set_defaults(func=cmd_tracks_stats)
 
-    # -------- marketing --------
     marketing = sub.add_parser("marketing", help="Marketing tools")
     ms = marketing.add_subparsers(dest="marketing_cmd", required=True)
 
@@ -1531,7 +1302,6 @@ def build_parser() -> argparse.ArgumentParser:
     mpl.add_argument("--limit", type=int, default=20)
     mpl.set_defaults(func=cmd_marketing_posts_list)
 
-    # -------- drops (optional) --------
     try:
         from mgc.drops_cli import register_drops_subcommand  # type: ignore
     except Exception:
@@ -1539,7 +1309,6 @@ def build_parser() -> argparse.ArgumentParser:
     if register_drops_subcommand:
         register_drops_subcommand(sub)
 
-    # -------- analytics (optional) --------
     try:
         from mgc.analytics_cli import register_analytics_subcommand  # type: ignore
     except Exception:
@@ -1547,21 +1316,20 @@ def build_parser() -> argparse.ArgumentParser:
     if register_analytics_subcommand:
         register_analytics_subcommand(sub)
 
-    # -------- web (REQUIRED by workflows) --------
+    # web (required by workflows)
     try:
         import mgc.web_cli as _web_cli  # type: ignore
     except Exception as e:
         raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.web_cli: {e}") from e
 
-    # web_cli registrar name drift tolerance
     _web_registrar = None
     for _name in (
-            "register_web_subcommand",
-            "register_web_subparser",
-            "register_web_cli",
-            "register_web",
-            "register_subcommand",
-            "register",
+        "register_web_subcommand",
+        "register_web_subparser",
+        "register_web_cli",
+        "register_web",
+        "register_subcommand",
+        "register",
     ):
         _maybe = getattr(_web_cli, _name, None)
         if callable(_maybe):
@@ -1569,7 +1337,6 @@ def build_parser() -> argparse.ArgumentParser:
             break
 
     if _web_registrar is None:
-        # show the user what *is* available to reduce guesswork
         _pub = [
             n for n in dir(_web_cli)
             if not n.startswith("_") and callable(getattr(_web_cli, n, None))
@@ -1580,32 +1347,27 @@ def build_parser() -> argparse.ArgumentParser:
             "register_web/register_subcommand/register. "
             f"Callable exports: {_pub}"
         )
-
     _web_registrar(sub)
 
-    # -------- submission --------
     register_submission_subcommand(sub)
 
-    # -------- run (REQUIRED) --------
     try:
-        from mgc.run_cli import register_run_subcommand  # type: ignore
+        from mgc.run_cli import register_run_subcommand as _register_run_subcommand  # type: ignore
     except Exception as e:
         raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
-    register_run_subcommand(sub)
+    _register_run_subcommand(sub)
 
     return p
 
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    # Parser
     parser = build_parser()
 
-    # argv normalization (CI may pass global flags after subcommands)
     raw = list(argv) if argv is not None else sys.argv[1:]
     cooked = _hoist_global_flags(raw)
 
     args = parser.parse_args(cooked)
 
-    # Logging
     _configure_logging(
         level=getattr(args, "log_level", "INFO"),
         log_file=getattr(args, "log_file", None),
@@ -1613,7 +1375,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json_mode=bool(getattr(args, "json", False)),
     )
 
-    # Dispatch
     fn = getattr(args, "func", None)
     if not callable(fn):
         parser.print_help()
