@@ -2,26 +2,36 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-
-permissions:
-  contents: read
 
 jobs:
   ci:
     runs-on: ubuntu-latest
-    env:
-      # Use built-in runner env var (works everywhere) instead of ${{ runner.temp }}
-      MGC_ARTIFACTS_DIR: ${{ env.RUNNER_TEMP }}/artifacts/ci
-      MGC_DB: ${{ env.RUNNER_TEMP }}/ci_db.sqlite
-      # Optional: enforce "golden" submission.zip hashes.
-      # Set to "1" (or "true") to fail if the submission.zip sha isn't in ci/known_good_submission_sha256.txt
-      MGC_GOLDEN_STRICT: "0"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set temp dirs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
+          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
+          echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_test" >> "$GITHUB_ENV"
+          echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
+          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci" "${RUNNER_TEMP}/mgc_drop_test" "${RUNNER_TEMP}/mgc_web"
+
+      - name: Prepare temp dirs (always)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_DROP_DIR}" "${MGC_WEB_DIR}"
+          echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
+          ls -la "${MGC_ARTIFACTS_DIR}"
+          ls -la "${MGC_EVIDENCE_DIR}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,71 +39,92 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      - name: Install dependencies
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          set -euxo pipefail
+          python -m pip install -U pip
+          python -m pip install -e .
 
-      # Cache your deterministic rebuild outputs (big speed win once stable)
-      - name: Cache CI artifacts (rebuild outputs)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.MGC_ARTIFACTS_DIR }}/rebuild
-          key: ${{ runner.os }}-mgc-rebuild-${{ hashFiles('src/**/*.py', 'scripts/**/*.sh', 'fixtures/**/*.sqlite', 'pyproject.toml', 'requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-mgc-rebuild-
-
-      - name: Seed CI DB
+      - name: Install ffmpeg (ffmpeg + ffprobe)
+        shell: bash
         run: |
-          cp fixtures/ci_db.sqlite "${MGC_DB}"
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          ffprobe -version
 
-      - name: Run CI gate
+      - name: Build fixture DB (copy to temp; keep checkout clean)
+        shell: bash
         run: |
+          set -euxo pipefail
+
+          python scripts/make_fixture_db.py
+
+          ls -la fixtures
+          sha256sum fixtures/ci_db.sqlite
+
+          cp -f fixtures/ci_db.sqlite "${MGC_DB}"
+
+          # Keep checkout clean (in case make_fixture_db touched tracked file)
+          git checkout -- fixtures/ci_db.sqlite || true
+
+          ls -la "${MGC_DB}"
+          sha256sum "${MGC_DB}"
+
+      - name: Preflight DB (must pass)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "HEAD=$(git rev-parse HEAD)"
+          echo "MGC_DB=$MGC_DB"
+
+          python - <<'PY'
+          import os, sqlite3, sys
+          p = os.environ["MGC_DB"]
+          con = sqlite3.connect(p)
+          try:
+              tables = [r[0] for r in con.execute(
+                  "select name from sqlite_master where type='table' order by name"
+              ).fetchall()]
+              print("tables:", tables)
+              # keep this flexible—CI gate also validates schema
+              if not tables:
+                  print(f"ERROR: {p} has no tables", file=sys.stderr)
+                  sys.exit(1)
+          finally:
+              con.close()
+          PY
+
+      - name: Run CI gate (twice)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
-      # Optional golden hash enforcement (warn by default; strict if env set)
-      - name: Golden hash gate (submission.zip)
-        if: always()
+      - name: Ensure working tree is clean (no generated artifacts)
+        shell: bash
         run: |
           set -euo pipefail
-          MODE="warn"
-          v="${MGC_GOLDEN_STRICT:-0}"
-          if [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ]; then
-            MODE="strict"
-          fi
-          bash scripts/ci_golden_hash_gate.sh \
-            --evidence-root "${MGC_ARTIFACTS_DIR}/auto" \
-            --known-file "ci/known_good_submission_sha256.txt" \
-            --mode "$MODE"
+          git status --porcelain=v1
+          test -z "$(git status --porcelain=v1)"
 
-      # Upload the exact artifacts CI produced (submission.zip + receipt + web bundle + logs)
-      - name: Upload CI artifacts
-        if: always()
+      - name: Upload artifacts (on failure)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: mgc-ci-artifacts
-          if-no-files-found: warn
-          retention-days: 14
+          name: ci-artifacts
           path: |
-            ${{ env.MGC_ARTIFACTS_DIR }}/**
-            data/submissions/**
-
-      # Also upload a tight “release bundle” (submission.zip + receipt + web) derived from evidence
-      - name: Upload submission bundle (from evidence)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mgc-submission-bundle
-          if-no-files-found: warn
-          retention-days: 14
-          path: |
-            ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
-            ${{ env.MGC_ARTIFACTS_DIR }}/auto/manifest.json
-            ${{ env.MGC_ARTIFACTS_DIR }}/auto/playlist.json
-            ${{ env.MGC_ARTIFACTS_DIR }}/auto/tracks/**
-            ${{ env.MGC_ARTIFACTS_DIR }}/auto/*.log
-            data/submissions/**/submission.zip
-            data/submissions/**/submission.receipt.json
-            data/submissions/**/web/**
+            ${{ env.MGC_ARTIFACTS_DIR }}
+            ${{ env.MGC_EVIDENCE_DIR }}
+            ${{ env.MGC_DROP_DIR }}
+            ${{ env.MGC_WEB_DIR }}
+          if-no-files-found: ignore
