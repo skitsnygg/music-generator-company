@@ -314,4 +314,5 @@ def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> No
     # If your CLI supports global --json, we still accept a local flag too
     b.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
 
-    b.set_defaults(fn=cmd_submission_build)
+    b.set_defaults(func=cmd_submission_build)
+
