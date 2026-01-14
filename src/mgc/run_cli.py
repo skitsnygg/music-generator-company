@@ -20,9 +20,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
+
 from mgc.context import build_prompt, get_context_spec
-from mgc.providers import GenerateRequest, get_provider
 from mgc.hash_utils import sha256_file, sha256_tree
+from mgc.providers import GenerateRequest, get_provider
 
 @contextlib.contextmanager
 def _silence_stdout(enabled: bool = True):

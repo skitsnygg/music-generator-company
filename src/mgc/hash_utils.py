@@ -2,25 +2,19 @@
 """
 src/mgc/hash_utils.py
 
-Small deterministic hashing helpers used across the MGC CLI.
+Hash + determinism utilities used across the CLI.
 
-Contract:
-- sha256_file(path): hex sha256 of file bytes
-- sha256_tree(root): deterministic "tree hash" of a directory, stable across OS/filesystems:
-    * enumerate files in sorted relpath order
-    * for each file: sha256_file(bytes)
-    * build lines: "<file_sha256>  <relpath_posix>"
-    * tree hash = sha256(concat(lines + trailing newline))
+Goals:
+- Single, stable implementation of common hashing helpers.
+- No heavy dependencies.
+- Works on Python 3.11+ (CI runner) and newer.
 """
 
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Iterable, Union
-
-
-PathLike = Union[str, Path]
+from typing import Iterable, List, Tuple
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -29,13 +23,10 @@ def sha256_bytes(data: bytes) -> str:
     return h.hexdigest()
 
 
-def sha256_text(s: str, *, encoding: str = "utf-8") -> str:
-    return sha256_bytes(s.encode(encoding))
-
-
-def sha256_file(path: PathLike, *, chunk_size: int = 1024 * 1024) -> str:
+def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     """
-    Hash a file's raw bytes. Chunked for large files.
+    SHA256 of a file's bytes.
+    Uses chunked reads to support large files.
     """
     p = Path(path)
     h = hashlib.sha256()
@@ -45,34 +36,46 @@ def sha256_file(path: PathLike, *, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _iter_files(root: Path) -> Iterable[Path]:
-    # Only files, stable order by posix relpath.
-    files = [p for p in root.rglob("*") if p.is_file()]
-    files.sort(key=lambda p: p.relative_to(root).as_posix())
+def _iter_files_sorted(root: Path) -> List[Path]:
+    r = Path(root).resolve()
+    files = [p for p in r.rglob("*") if p.is_file()]
+    files.sort(key=lambda p: p.relative_to(r).as_posix())
     return files
 
 
-def sha256_tree(root: PathLike) -> str:
+def sha256_tree(root: Path) -> str:
     """
     Deterministic directory tree hash.
 
-    The output changes if:
-    - any file contents change
-    - any file is added/removed
-    - any file's relative path changes
+    Algorithm:
+      - For each file (sorted by relpath):
+          line = "<sha256(file)>  <relpath>"
+      - sha256 of the concatenated lines with trailing newline
     """
     r = Path(root).resolve()
-    lines = []
-    for p in _iter_files(r):
+    files = _iter_files_sorted(r)
+
+    lines: List[str] = []
+    for p in files:
         rel = p.relative_to(r).as_posix()
         lines.append(f"{sha256_file(p)}  {rel}")
+
     joined = ("\n".join(lines) + "\n").encode("utf-8")
+    return sha256_bytes(joined)
+
+
+def sha256_manifest_lines(lines: Iterable[str]) -> str:
+    """
+    Deterministic hash of manifest-style lines.
+    Caller is responsible for sorting if needed.
+    """
+    joined = ("\n".join(list(lines)) + "\n").encode("utf-8")
     return sha256_bytes(joined)
 
 
 __all__ = [
     "sha256_bytes",
-    "sha256_text",
     "sha256_file",
     "sha256_tree",
+    "sha256_manifest_lines",
 ]
