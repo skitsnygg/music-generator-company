@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
-
+from mgc.submission_cli import register_submission_subcommand
 
 DEFAULT_DB = "data/db.sqlite"
 DEFAULT_PLAYLIST_DIR = Path("data/playlists")
@@ -46,7 +46,6 @@ DEFAULT_TRACKS_EXPORT = DEFAULT_TRACKS_DIR / "tracks.json"
 LOG_FMT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
 LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
-
 # ----------------------------
 # basic utils
 # ----------------------------
@@ -54,32 +53,25 @@ LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
-
 def die(msg: str, code: int = 2) -> NoReturn:
     eprint(msg)
     raise SystemExit(code)
 
-
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
-
 
 def write_text(path: Path, text: str) -> None:
     ensure_parent_dir(path)
     path.write_text(text, encoding="utf-8")
 
-
 def read_json_file(path: Path) -> Any:
     return json.loads(read_text(path))
 
-
 def stable_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
 
 def write_json_file(path: Path, obj: Any) -> None:
     ensure_parent_dir(path)
@@ -88,14 +80,11 @@ def write_json_file(path: Path, obj: Any) -> None:
         encoding="utf-8",
     )
 
-
 def _truthy(a: bool, b: bool) -> bool:
     return bool(a) or bool(b)
 
-
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
 
 # ----------------------------
 # argv preprocessing (make global flags work anywhere)
@@ -112,14 +101,12 @@ _GLOBAL_FLAG_WITH_VALUE = {
     "--log-file",
 }
 
-
 def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
     # supports --db=path style
     if arg.startswith("--") and "=" in arg:
         k, v = arg.split("=", 1)
         return k, v
     return arg, None
-
 
 def _hoist_global_flags(argv: List[str]) -> List[str]:
     """
@@ -174,7 +161,6 @@ def _hoist_global_flags(argv: List[str]) -> List[str]:
     # Keep global flags in the order encountered
     return globals_found + out
 
-
 # ----------------------------
 # logging (deterministic, no duplicates)
 # ----------------------------
@@ -186,7 +172,6 @@ class _UTCFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         return dt.isoformat(timespec="seconds")
 
-
 def _parse_level(level: str) -> int:
     try:
         return int(level)
@@ -194,7 +179,6 @@ def _parse_level(level: str) -> int:
         pass
     lvl = logging.getLevelName(str(level).upper())
     return lvl if isinstance(lvl, int) else logging.INFO
-
 
 def _clear_all_non_root_handlers() -> None:
     root = logging.getLogger()
@@ -210,7 +194,6 @@ def _clear_all_non_root_handlers() -> None:
         for h in list(logger_obj.handlers):
             logger_obj.removeHandler(h)
         logger_obj.propagate = True
-
 
 def _configure_logging(
     *,
@@ -257,7 +240,6 @@ def _configure_logging(
         force=True,
     )
 
-
 # ----------------------------
 # DB helpers
 # ----------------------------
@@ -273,7 +255,6 @@ class DBConn:
         conn.row_factory = sqlite3.Row
         return conn
 
-
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
@@ -281,22 +262,18 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone()
     return row is not None
 
-
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return [r["name"] for r in rows]
 
-
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
-
 
 def _maybe_int(v: Any) -> Optional[int]:
     try:
         return int(v)
     except Exception:
         return None
-
 
 def _safe_select_playlist_rows(
     conn: sqlite3.Connection,
@@ -332,7 +309,6 @@ def _safe_select_playlist_rows(
     params.append(limit)
 
     return conn.execute(q, tuple(params)).fetchall()
-
 
 def _safe_select_latest_playlists_by_slug(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     if not _table_exists(conn, "playlists"):
@@ -1241,7 +1217,8 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
     pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
     pub.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)")
-    pub.set_defaults(func=cmd_publish_marketing)
+    b.set_defaults(func=cmd_submission_build)
+
 
     drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
     drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
@@ -1605,6 +1582,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     _web_registrar(sub)
+
+    # -------- submission --------
+    register_submission_subcommand(sub)
 
     # -------- run (REQUIRED) --------
     try:
