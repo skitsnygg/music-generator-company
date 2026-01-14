@@ -1139,20 +1139,57 @@ def db_insert_marketing_post(
 
 
 def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> List[sqlite3.Row]:
-    cols = db_table_columns(con, "marketing_posts")
-    if not cols:
-        raise sqlite3.OperationalError("table marketing_posts does not exist")
+    """
+    Return pending marketing posts with schema drift tolerance.
 
-    status_col = _pick_first_existing(cols, ["status", "state"])
-    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on", "occurred_at"])
-    if not status_col:
+    Supports schemas where the primary key is either:
+      - id
+      - post_id
+      - marketing_post_id
+
+    Also tolerates created_at / created_ts naming.
+    """
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(marketing_posts)").fetchall()}
+
+    # pick PK column
+    if "id" in cols:
+        pk = "id"
+    elif "post_id" in cols:
+        pk = "post_id"
+    elif "marketing_post_id" in cols:
+        pk = "marketing_post_id"
+    else:
+        # fall back: pick the first column that looks like an id
+        pk_candidates = [c for c in cols if c.endswith("_id")]
+        pk = pk_candidates[0] if pk_candidates else "rowid"
+
+    # pick created timestamp column for ordering
+    if "created_at" in cols:
+        created_col = "created_at"
+    elif "created_ts" in cols:
+        created_col = "created_ts"
+    elif "ts" in cols:
+        created_col = "ts"
+    else:
+        created_col = pk  # last resort ordering
+
+    # status column name drift
+    status_col = "status" if "status" in cols else ("state" if "state" in cols else None)
+    if status_col is None:
+        # can't filter drafts; return empty rather than crashing CI
         return []
 
-    order = f"{ts_col} ASC, id ASC" if ts_col else "id ASC"
-    sql = f"SELECT * FROM marketing_posts WHERE {status_col} = ? ORDER BY {order} LIMIT ?"
+    # select everything, but ensure deterministic ordering and stable limit
+    sql = f"""
+    SELECT *
+    FROM marketing_posts
+    WHERE {status_col} = ?
+    ORDER BY {created_col} ASC, {pk} ASC
+    LIMIT ?
+    """
+
     cur = con.execute(sql, ("draft", int(limit)))
     return list(cur.fetchall())
-
 
 def db_marketing_post_set_status(
     con: sqlite3.Connection,
