@@ -173,7 +173,10 @@ jobs:
               con.close()
           PY
 
-      - name: Run CI gate (twice)
+      # -----------------------------
+      # FAST gate: PRs and main
+      # -----------------------------
+      - name: Run CI gate (fast; twice)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -181,12 +184,34 @@ jobs:
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_CI_MODE: "fast"
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
+      # -----------------------------
+      # FULL gate: only on main pushes
+      # -----------------------------
+      - name: Run CI gate (full; once)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_CI_MODE: "full"
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_gate.sh
+
+      # -----------------------------
+      # Legacy / extra checks: full only
+      # -----------------------------
       - name: Run determinism gate (existing)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           MGC_DETERMINISTIC: "1"
@@ -199,6 +224,7 @@ jobs:
           bash scripts/ci_run_determinism.sh
 
       - name: Web player build (real drop bundle -> playlist -> build)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
@@ -239,10 +265,12 @@ jobs:
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
 
       - name: Submission artifact check (reads drop_evidence.json safely)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
         run: |
           set -euxo pipefail
 
