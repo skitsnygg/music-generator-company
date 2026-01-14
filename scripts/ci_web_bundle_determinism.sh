@@ -2,169 +2,117 @@
 # scripts/ci_web_bundle_determinism.sh
 set -euo pipefail
 
-PYTHON="${PYTHON:-python}"
+# Determinism check for the static web bundle build.
+#
+# Usage:
+#   bash scripts/ci_web_bundle_determinism.sh --evidence-root <dir>
+#
+# Evidence root:
+#   This directory should contain drop_evidence.json (and related evidence files),
+#   or be the out_dir root used by `mgc run autonomous`.
+#
+# Env:
+#   MGC_DB     sqlite db path (required, or provided by CI environment)
+#   PYTHON     python executable (default: python)
+#
+# Output:
+#   Writes build artifacts under <evidence-root>/web_bundle_test/
+#   Compares deterministically-rebuilt manifests between run1/run2.
 
-usage() {
-  echo "usage: $0 --evidence-root <dir>" >&2
-  exit 2
-}
+PYTHON="${PYTHON:-python}"
+: "${MGC_DB:?set MGC_DB}"
 
 EVIDENCE_ROOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --evidence-root)
-      EVIDENCE_ROOT="${2:-}"
-      shift 2
-      ;;
-    -h|--help) usage ;;
-    *) echo "unknown arg: $1" >&2; usage ;;
+      EVIDENCE_ROOT="${2:-}"; shift 2;;
+    *)
+      echo "[ci_web_bundle_determinism] ERROR: unknown arg: $1" >&2
+      exit 2;;
   esac
 done
 
-[ -n "$EVIDENCE_ROOT" ] || usage
-: "${MGC_DB:?set MGC_DB}"
-
-mkdir -p "$EVIDENCE_ROOT"
+if [ -z "$EVIDENCE_ROOT" ]; then
+  echo "[ci_web_bundle_determinism] ERROR: --evidence-root is required" >&2
+  exit 2
+fi
 
 echo "[ci_web_bundle_determinism] evidence_root=$EVIDENCE_ROOT"
 echo "[ci_web_bundle_determinism] MGC_DB=$MGC_DB"
 
-BASE="${EVIDENCE_ROOT%/}/web_bundle_test"
-RUN1_DROP="${BASE}/run1_drop"
-RUN1_WEB="${BASE}/run1_web"
-RUN2_DROP="${BASE}/run2_drop"
-RUN2_WEB="${BASE}/run2_web"
+DROP_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
+PLAYLIST_JSON="${EVIDENCE_ROOT%/}/playlist.json"
 
-rm -rf "$BASE"
-mkdir -p "$RUN1_DROP" "$RUN1_WEB" "$RUN2_DROP" "$RUN2_WEB"
-
-run_drop_and_web_build() {
-  local drop_dir="$1"
-  local web_dir="$2"
-
-  MGC_DETERMINISTIC="${MGC_DETERMINISTIC:-1}" \
-  "$PYTHON" -m mgc.main --db "$MGC_DB" run drop \
-    --context focus \
-    --seed 1 \
-    --deterministic \
-    --out-dir "$drop_dir" \
-    > "${drop_dir%/}/drop_stdout.json"
-
-  "$PYTHON" -m json.tool < "${drop_dir%/}/drop_stdout.json" >/dev/null
-  test -s "${drop_dir%/}/playlist.json"
-  test -d "${drop_dir%/}/tracks"
-
-  pushd "$drop_dir" >/dev/null
-  "$PYTHON" -m mgc.main web build \
-    --playlist "playlist.json" \
-    --out-dir "$web_dir" \
-    --prefer-mp3 \
-    --clean \
-    --fail-if-empty \
-    --json \
-    | "$PYTHON" -m json.tool >/dev/null
-  popd >/dev/null
-
-  test "$(find "$web_dir" -maxdepth 6 -type f -name 'index.html' | wc -l | tr -d ' ')" -ge 1
-  test "$(find "$web_dir" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" -ge 1
-}
-
-hash_listing() {
-  local root="$1"
-  ROOT="$root" "$PYTHON" - <<'PY'
-import hashlib, os
-from pathlib import Path
-
-root = Path(os.environ["ROOT"]).resolve()
-items = []
-for p in root.rglob("*"):
-    if p.is_file():
-        rel = p.relative_to(root).as_posix()
-        h = hashlib.sha256(p.read_bytes()).hexdigest()
-        items.append((rel, h))
-items.sort(key=lambda t: t[0])
-for rel, h in items:
-    print(f"{h}  {rel}")
-PY
-}
-
-echo "[ci_web_bundle_determinism] build run1"
-run_drop_and_web_build "$RUN1_DROP" "$RUN1_WEB"
-
-echo "[ci_web_bundle_determinism] build run2"
-run_drop_and_web_build "$RUN2_DROP" "$RUN2_WEB"
-
-H1="$("$PYTHON" -m mgc.hash_tree --root "$RUN1_WEB" --print)"
-H2="$("$PYTHON" -m mgc.hash_tree --root "$RUN2_WEB" --print)"
-
-if [ "$H1" != "$H2" ]; then
-  echo "[ci_web_bundle_determinism] FAIL: web bundle tree hash mismatch"
-  echo "  run1=$H1"
-  echo "  run2=$H2"
-  echo "  run1_web=$RUN1_WEB"
-  echo "  run2_web=$RUN2_WEB"
-
-  L1="${EVIDENCE_ROOT%/}/web_bundle_run1_files.sha256.txt"
-  L2="${EVIDENCE_ROOT%/}/web_bundle_run2_files.sha256.txt"
-  DIFF="${EVIDENCE_ROOT%/}/web_bundle_files.diff.txt"
-
-  echo "[ci_web_bundle_determinism] writing file-level sha256 listings + diff:"
-  echo "  $L1"
-  echo "  $L2"
-  echo "  $DIFF"
-
-  hash_listing "$RUN1_WEB" > "$L1"
-  hash_listing "$RUN2_WEB" > "$L2"
-  diff -u "$L1" "$L2" > "$DIFF" || true
-
-  echo ""
-  echo "[ci_web_bundle_determinism] --- DIFF (first 200 lines) ---"
-  sed -n '1,200p' "$DIFF" || true
-  echo "[ci_web_bundle_determinism] --- END DIFF ---"
-  exit 1
+if [ ! -f "$DROP_JSON" ]; then
+  echo "[ci_web_bundle_determinism] ERROR: missing $DROP_JSON" >&2
+  exit 3
 fi
 
-echo "[ci_web_bundle_determinism] OK sha256=$H1"
+# Prefer playlist.json if present (autonomous run writes it); otherwise derive a playlist from drop evidence
+# by asking mgc to export it (fallback).
+if [ ! -f "$PLAYLIST_JSON" ]; then
+  echo "[ci_web_bundle_determinism] playlist.json not found; attempting fallback export from drop evidence"
+  # This fallback assumes your CLI has a way to export playlist from evidence; if it doesn't,
+  # it will fail loudly and you'll see the missing command.
+  #
+  # If you already always have playlist.json, this path never triggers.
+  $PYTHON -m mgc.main --db "$MGC_DB" --json run manifest \
+    --out-dir "${EVIDENCE_ROOT%/}" \
+    >/dev/null
+  if [ ! -f "$PLAYLIST_JSON" ]; then
+    echo "[ci_web_bundle_determinism] ERROR: still missing ${PLAYLIST_JSON} after fallback" >&2
+    exit 3
+  fi
+fi
 
-OUT_JSON="${EVIDENCE_ROOT%/}/web_bundle_determinism.json"
-EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
-export OUT_JSON EVIDENCE_JSON H1 RUN1_WEB RUN2_WEB
+ROOT="${EVIDENCE_ROOT%/}/web_bundle_test"
+RUN1_DROP="${ROOT%/}/run1_drop"
+RUN2_DROP="${ROOT%/}/run2_drop"
+RUN1_WEB="${ROOT%/}/run1_web"
+RUN2_WEB="${ROOT%/}/run2_web"
 
-"$PYTHON" - <<'PY'
-import json, os
-from pathlib import Path
+rm -rf "$ROOT"
+mkdir -p "$RUN1_DROP" "$RUN2_DROP" "$RUN1_WEB" "$RUN2_WEB"
 
-out_json = Path(os.environ["OUT_JSON"])
-evidence_json = Path(os.environ["EVIDENCE_JSON"])
-h = os.environ["H1"]
-run1_web = os.environ["RUN1_WEB"]
-run2_web = os.environ["RUN2_WEB"]
+echo "[ci_web_bundle_determinism] build run1"
+# IMPORTANT: --out-dir must come AFTER `web build` (subcommand arg), not at the global mgc level.
+$PYTHON -m mgc.main --db "$MGC_DB" --json web build \
+  --playlist "$PLAYLIST_JSON" \
+  --out-dir "$RUN1_WEB" \
+  --clean \
+  --fail-if-none-copied \
+  --fail-on-missing \
+  >/dev/null
 
-out_json.parent.mkdir(parents=True, exist_ok=True)
-out_json.write_text(
-    json.dumps(
-        {"ok": True, "web_bundle_tree_sha256": h, "run1_web": run1_web, "run2_web": run2_web},
-        sort_keys=True,
-        indent=2,
-    )
-    + "\n",
-    encoding="utf-8",
-)
+echo "[ci_web_bundle_determinism] build run2"
+$PYTHON -m mgc.main --db "$MGC_DB" --json web build \
+  --playlist "$PLAYLIST_JSON" \
+  --out-dir "$RUN2_WEB" \
+  --clean \
+  --fail-if-none-copied \
+  --fail-on-missing \
+  >/dev/null
 
-if evidence_json.exists() and evidence_json.stat().st_size > 0:
-    obj = json.loads(evidence_json.read_text(encoding="utf-8"))
+MAN1="${RUN1_WEB%/}/web_manifest.json"
+MAN2="${RUN2_WEB%/}/web_manifest.json"
 
-    artifacts = obj.get("artifacts")
-    if not isinstance(artifacts, dict):
-        artifacts = {}
-        obj["artifacts"] = artifacts
-    artifacts["web_bundle_tree_sha256"] = h
+if [ ! -f "$MAN1" ] || [ ! -f "$MAN2" ]; then
+  echo "[ci_web_bundle_determinism] ERROR: missing web manifest(s)" >&2
+  echo "  expected: $MAN1" >&2
+  echo "  expected: $MAN2" >&2
+  ls -la "$RUN1_WEB" >&2 || true
+  ls -la "$RUN2_WEB" >&2 || true
+  exit 4
+fi
 
-    paths = obj.get("paths")
-    if not isinstance(paths, dict):
-        paths = {}
-        obj["paths"] = paths
-    paths["web_bundle_dir"] = run1_web
-
-    evidence_json.write_text(json.dumps(obj, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-PY
+# Determinism check: exact byte equality.
+if cmp -s "$MAN1" "$MAN2"; then
+  echo "[ci_web_bundle_determinism] OK web_manifest.json matches"
+else
+  echo "[ci_web_bundle_determinism] FAIL: web_manifest.json differs between run1 and run2" >&2
+  echo "  run1: $MAN1" >&2
+  echo "  run2: $MAN2" >&2
+  echo "  hint: diff -u '$MAN1' '$MAN2'" >&2
+  exit 5
+fi

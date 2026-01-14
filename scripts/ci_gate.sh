@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # CI gate with modes:
-#   - fast (default): compile + rebuild/verify + (optional) golden tree hashes (WARN-only by default)
+#   - fast (default): compile + rebuild/verify + optional golden tree hashes (WARN-only by default)
 #   - full: everything (autonomous smoke + submission/web determinism + publish determinism + manifest diff + golden checks)
 #
 # Env:
@@ -18,9 +18,10 @@ set -euo pipefail
 #                      - full: enforce golden tree hashes + known-good submission hash
 #                      - fast: enforce golden tree hashes (otherwise warn-only)
 #
-# Optional golden-tree hashes (recommended):
-#   fixtures/golden_hashes.json
-#   scripts/ci_golden_check.py (uses mgc.hash_tree)
+# Evidence conventions (robust):
+#   - Some code paths write evidence files directly under <out_dir>/ (drop_evidence.json, manifest.json, etc.)
+#   - Some code paths may write under <out_dir>/evidence/
+#   - CI auto-detects which one is real by locating drop_evidence.json
 #
 # Full mode extras:
 #   - manifest diff: if since-ok not available, SKIP (do not fail CI)
@@ -41,7 +42,6 @@ if [ "$CI_MODE" != "fast" ] && [ "$CI_MODE" != "full" ]; then
   exit 2
 fi
 
-# truthy helper
 _env_truthy() {
   local v="${1:-}"
   v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
@@ -182,18 +182,32 @@ else
 fi
 
 # -----------------------------
+# helpers: evidence root detection
+# -----------------------------
+_detect_evidence_root() {
+  # Prefer <out_dir>/evidence if it contains drop_evidence.json; otherwise <out_dir>.
+  local out_dir="$1"
+  if [ -f "${out_dir%/}/evidence/drop_evidence.json" ]; then
+    echo "${out_dir%/}/evidence"
+    return 0
+  fi
+  if [ -f "${out_dir%/}/drop_evidence.json" ]; then
+    echo "${out_dir%/}"
+    return 0
+  fi
+  # Not found
+  echo ""
+  return 1
+}
+
+# -----------------------------
 # full-mode gates
 # -----------------------------
 if [ "$CI_MODE" = "full" ]; then
   AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
-  EVIDENCE_DIR="${AUTO_OUT%/}/evidence"
-  mkdir -p "$AUTO_OUT" "$EVIDENCE_DIR"
+  mkdir -p "$AUTO_OUT"
 
-  # Force a single evidence root for *everything* in full mode,
-  # so run diff --since-ok never looks at data/evidence by accident.
-  export MGC_EVIDENCE_DIR="$EVIDENCE_DIR"
-
-  echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT evidence_dir=$MGC_EVIDENCE_DIR"
+  echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
   MGC_DETERMINISTIC=1 \
   $PYTHON -m mgc.main --db "$MGC_DB" --json run autonomous \
     --context focus \
@@ -203,11 +217,26 @@ if [ "$CI_MODE" = "full" ]; then
     --no-resume \
     > "${AUTO_OUT%/}/autonomous.json"
 
-  echo "[ci_gate] determinism gate: submission.zip (evidence-root=$AUTO_OUT)"
-  bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
+  EVIDENCE_ROOT="$(_detect_evidence_root "$AUTO_OUT" || true)"
+  if [ -z "$EVIDENCE_ROOT" ]; then
+    echo "[ci_gate] FAIL: could not locate drop_evidence.json under $AUTO_OUT or $AUTO_OUT/evidence" >&2
+    echo "[ci_gate] contents of $AUTO_OUT:" >&2
+    ls -la "$AUTO_OUT" >&2 || true
+    if [ -d "${AUTO_OUT%/}/evidence" ]; then
+      echo "[ci_gate] contents of ${AUTO_OUT%/}/evidence:" >&2
+      ls -la "${AUTO_OUT%/}/evidence" >&2 || true
+    fi
+    exit 4
+  fi
 
-  echo "[ci_gate] determinism gate: web bundle (evidence-root=$AUTO_OUT)"
-  bash scripts/ci_web_bundle_determinism.sh --evidence-root "$AUTO_OUT"
+  export MGC_EVIDENCE_DIR="$EVIDENCE_ROOT"
+  echo "[ci_gate] evidence_root=$EVIDENCE_ROOT"
+
+  echo "[ci_gate] determinism gate: submission.zip (evidence-root=$EVIDENCE_ROOT)"
+  bash scripts/ci_submission_determinism.sh --evidence-root "$EVIDENCE_ROOT"
+
+  echo "[ci_gate] determinism gate: web bundle (evidence-root=$EVIDENCE_ROOT)"
+  bash scripts/ci_web_bundle_determinism.sh --evidence-root "$EVIDENCE_ROOT"
 
   echo "[ci_gate] drops list smoke (global --json hoist)"
   $PYTHON -m mgc.main --db "$MGC_DB" drops list --json >/dev/null
@@ -222,20 +251,19 @@ if [ "$CI_MODE" = "full" ]; then
   # -----------------------------
   # manifest diff gate (since-ok, strict JSON)
   # - if since-ok not available in CI workspace, SKIP (do not fail)
-  # - IMPORTANT: pass --out-dir so it reads the same evidence dir we wrote above
   # -----------------------------
-  echo "[ci_gate] manifest diff gate (since-ok, strict JSON) evidence_dir=$MGC_EVIDENCE_DIR"
+  echo "[ci_gate] manifest diff gate (since-ok, strict JSON) evidence_root=$EVIDENCE_ROOT"
 
   set +e
   DIFF_OUT="$($PYTHON -m mgc.main --db "$MGC_DB" run diff \
     --since-ok --fail-on-changes --summary-only --json \
-    --out-dir "$MGC_EVIDENCE_DIR" \
+    --out-dir "$EVIDENCE_ROOT" \
     2>/dev/null)"
   rc_diff=$?
   set -e
 
   if [ $rc_diff -ne 0 ]; then
-    if echo "$DIFF_OUT" | grep -q '"reason":[[:space:]]*"since_ok_not_found"'; then
+    if echo "$DIFF_OUT" | grep -q '"reason"[[:space:]]*:[[:space:]]*"since_ok_not_found"'; then
       echo "$DIFF_OUT" | $PYTHON -m json.tool
       echo "[ci_gate] manifest diff gate SKIP (since-ok not present)"
     else
@@ -250,7 +278,6 @@ if [ "$CI_MODE" = "full" ]; then
   # -----------------------------
   # golden SUBMISSION hash gate (known-good list)
   # - warn by default; strict only if MGC_GOLDEN_STRICT truthy
-  # - IMPORTANT: warn mode must NOT fail the workflow even if the gate returns nonzero
   # -----------------------------
   echo "[ci_gate] golden submission hash gate (warn by default)"
 
@@ -261,7 +288,7 @@ if [ "$CI_MODE" = "full" ]; then
 
   set +e
   bash scripts/ci_golden_hash_gate.sh \
-    --evidence-root "$AUTO_OUT" \
+    --evidence-root "$EVIDENCE_ROOT" \
     --known-file "ci/known_good_submission_sha256.txt" \
     --mode "$SUB_MODE"
   rc_sub=$?
