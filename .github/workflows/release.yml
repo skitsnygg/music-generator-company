@@ -21,10 +21,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/release" >> "$GITHUB_ENV"
+          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
           echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_release" >> "$GITHUB_ENV"
           echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web_release" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/artifacts/release" "${RUNNER_TEMP}/mgc_drop_release" "${RUNNER_TEMP}/mgc_web_release"
+          mkdir -p "${RUNNER_TEMP}/artifacts/ci" "${RUNNER_TEMP}/mgc_drop_release" "${RUNNER_TEMP}/mgc_web_release"
 
       - name: Set up Python
         uses: actions/setup-python@v5
