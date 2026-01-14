@@ -146,6 +146,16 @@ GOLDEN_JSON="fixtures/golden_hashes.json"
 if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
   echo "[ci_gate] golden tree hash gate"
 
+  # Optional: bless goldens from the current outputs (useful to align with CI runner).
+  # Only does anything if MGC_GOLDEN_BLESS is truthy.
+  if _env_truthy "${MGC_GOLDEN_BLESS:-0}"; then
+    echo "[ci_gate] blessing golden hashes (MGC_GOLDEN_BLESS=1)"
+    "$PYTHON" scripts/ci_golden_bless.py --golden "$GOLDEN_JSON" --key ci.rebuild.playlists --root "$OUT_PLAYLISTS"
+    "$PYTHON" scripts/ci_golden_bless.py --golden "$GOLDEN_JSON" --key ci.rebuild.tracks    --root "$OUT_TRACKS"
+    echo "[ci_gate] golden hashes blessed"
+  fi
+
+
   GOLDEN_STRICT=0
   if [ "$CI_MODE" = "full" ]; then
     GOLDEN_STRICT=1
