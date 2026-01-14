@@ -1,0 +1,9 @@
+{
+  "ci": {
+    "rebuild": {
+      "playlists": "88e8351e935697eb28541fc3a08a0e3511787372a0e33ca51a03f2123caacf47",
+      "tracks": "19320d1ff7fcfca83502726ef1da689648a81cce8db76cf9aa4467c2eb88e606",
+      "verify": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}
