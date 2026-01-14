@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write  # needed to upload assets to the GitHub Release
+      contents: write
 
     steps:
       - name: Checkout repo
@@ -22,7 +22,9 @@ jobs:
         run: |
           set -euxo pipefail
           echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/release" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/artifacts/release"
+          echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_release" >> "$GITHUB_ENV"
+          echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web_release" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/artifacts/release" "${RUNNER_TEMP}/mgc_drop_release" "${RUNNER_TEMP}/mgc_web_release"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,8 +56,6 @@ jobs:
           python scripts/make_fixture_db.py
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
           echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
-
-          # Keep checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
       - name: Run full CI gate (release)
@@ -66,7 +66,7 @@ jobs:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
           MGC_CI_MODE: "full"
-          MGC_GOLDEN_STRICT: "1"   # releases should be strict
+          MGC_GOLDEN_STRICT: "1"
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
@@ -78,8 +78,78 @@ jobs:
           python -m build
           ls -la dist
 
-      - name: Create GitHub Release + upload dist/*
+      - name: Build deterministic drop + web bundle (release artifacts)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          DROP_DIR: ${{ env.MGC_DROP_DIR }}
+          WEB_DIR: ${{ env.MGC_WEB_DIR }}
+        run: |
+          set -euxo pipefail
+
+          rm -rf "${DROP_DIR}" "${WEB_DIR}"
+          mkdir -p "${DROP_DIR}" "${WEB_DIR}"
+
+          python -m mgc.main run drop \
+            --context focus \
+            --seed 1 \
+            --deterministic \
+            --out-dir "${DROP_DIR}" \
+            > "${DROP_DIR}/drop_stdout.json"
+
+          python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
+          test -s "${DROP_DIR}/playlist.json"
+          test -d "${DROP_DIR}/tracks"
+
+          pushd "${DROP_DIR}" >/dev/null
+          python -m mgc.main web build \
+            --playlist "playlist.json" \
+            --out-dir "${WEB_DIR}" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json \
+            | python -m json.tool
+          popd >/dev/null
+
+          test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
+
+      - name: Build submission.zip from release drop bundle
+        shell: bash
+        env:
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          DROP_DIR: ${{ env.MGC_DROP_DIR }}
+        run: |
+          set -euxo pipefail
+
+          # Build submission.zip directly from the bundle dir.
+          # This assumes mgc.submission_cli.py supports --bundle-dir + --out
+          python -m mgc.submission_cli build \
+            --bundle-dir "${DROP_DIR}" \
+            --out "${RUNNER_TEMP}/submission.zip"
+
+          test -s "${RUNNER_TEMP}/submission.zip"
+          sha256sum "${RUNNER_TEMP}/submission.zip"
+
+      - name: Zip web bundle for release
+        shell: bash
+        env:
+          WEB_DIR: ${{ env.MGC_WEB_DIR }}
+        run: |
+          set -euxo pipefail
+          cd "${WEB_DIR}"
+          # zip the contents (not the parent folder)
+          zip -r "${RUNNER_TEMP}/web_bundle.zip" .
+          test -s "${RUNNER_TEMP}/web_bundle.zip"
+          sha256sum "${RUNNER_TEMP}/web_bundle.zip"
+
+      - name: Create GitHub Release + upload assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*
+            ${{ runner.temp }}/submission.zip
+            ${{ runner.temp }}/web_bundle.zip

@@ -2,7 +2,9 @@
 # scripts/ci_gate.sh
 set -euo pipefail
 
-# CI gate: compile + rebuild/verify + determinism checks + autonomous smoke + golden hash (optional)
+# CI gate with modes:
+#   - fast (default): compile + rebuild/verify + golden tree hashes
+#   - full: everything (autonomous smoke + submission/web determinism + publish determinism + manifest diff + golden checks)
 #
 # Env:
 #   MGC_DB             DB path (required)
@@ -11,6 +13,7 @@ set -euo pipefail
 #   MGC_OUT_ROOT       override output root for rebuilds:
 #                      - if set to "data", writes to data/playlists + data/tracks
 #                      - otherwise writes under $MGC_ARTIFACTS_DIR/rebuild/...
+#   MGC_CI_MODE        fast|full (default: fast)
 #   MGC_GOLDEN_STRICT  if "1"/"true"/"yes", fail CI if submission.zip sha not in ci/known_good_submission_sha256.txt
 #
 # Optional golden-tree hashes (recommended):
@@ -20,10 +23,6 @@ set -euo pipefail
 # If fixtures/golden_hashes.json exists, we will check:
 #   - ci.rebuild.playlists against rebuild playlists output dir
 #   - ci.rebuild.tracks    against rebuild tracks output dir
-#
-# Bless/update via:
-#   python scripts/ci_golden_bless.py --golden fixtures/golden_hashes.json --key ci.rebuild.playlists --root <dir>
-#   python scripts/ci_golden_bless.py --golden fixtures/golden_hashes.json --key ci.rebuild.tracks    --root <dir>
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -33,9 +32,16 @@ cd "$repo_root"
 PYTHON="${PYTHON:-python}"
 ARTIFACTS_DIR="${MGC_ARTIFACTS_DIR:-artifacts/ci}"
 OUT_ROOT="${MGC_OUT_ROOT:-}"
+CI_MODE="${MGC_CI_MODE:-fast}"
+
+if [ "$CI_MODE" != "fast" ] && [ "$CI_MODE" != "full" ]; then
+  echo "[ci_gate] ERROR: MGC_CI_MODE must be 'fast' or 'full' (got: $CI_MODE)" >&2
+  exit 2
+fi
 
 mkdir -p "$ARTIFACTS_DIR"
 
+echo "[ci_gate] mode=$CI_MODE"
 echo "[ci_gate] MGC_ARTIFACTS_DIR=$ARTIFACTS_DIR"
 echo "[ci_gate] Repo: $repo_root"
 echo "[ci_gate] MGC_DB=$MGC_DB"
@@ -66,52 +72,21 @@ $PYTHON -m py_compile \
   src/mgc/main.py \
   src/mgc/run_cli.py \
   src/mgc/web_cli.py \
-  src/mgc/submission_cli.py
+  src/mgc/submission_cli.py \
+  2>/dev/null || {
+    # fallback: show full output if compile fails
+    $PYTHON -m py_compile \
+      src/mgc/main.py \
+      src/mgc/run_cli.py \
+      src/mgc/web_cli.py \
+      src/mgc/submission_cli.py
+  }
 
 # -----------------------------
-# autonomous deterministic smoke
-# -----------------------------
-AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
-mkdir -p "$AUTO_OUT"
-
-echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
-MGC_DETERMINISTIC=1 \
-$PYTHON -m mgc.main --db "$MGC_DB" --json run autonomous \
-  --context focus \
-  --seed 1 \
-  --out-dir "$AUTO_OUT" \
-  --repo-root "$repo_root" \
-  --no-resume \
-  > "${AUTO_OUT%/}/autonomous.json"
-
-# -----------------------------
-# submission determinism + artifact check
-# -----------------------------
-echo "[ci_gate] submission artifact check"
-bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
-echo "[ci_gate] submission artifact check OK"
-
-echo "[ci_gate] determinism gate: submission.zip (evidence-root=$AUTO_OUT)"
-bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
-
-# -----------------------------
-# web bundle determinism (optional)
-# -----------------------------
-echo "[ci_gate] determinism gate: web bundle (evidence-root=$AUTO_OUT)"
-bash scripts/ci_web_bundle_determinism.sh --evidence-root "$AUTO_OUT"
-
-# -----------------------------
-# drops list smoke (global --json hoist)
-# -----------------------------
-echo "[ci_gate] drops list smoke (global --json hoist)"
-$PYTHON -m mgc.main --db "$MGC_DB" drops list --json >/dev/null
-
-# -----------------------------
-# rebuild + verify
+# rebuild + verify (fast + full)
 # -----------------------------
 echo "[ci_gate] rebuild + verify"
 
-# Default paths (also used for golden-tree hashing below)
 OUT_PLAYLISTS=""
 OUT_TRACKS=""
 STAMP="ci"
@@ -127,8 +102,7 @@ fi
 mkdir -p "$OUT_PLAYLISTS" "$OUT_TRACKS"
 
 if [ -x "scripts/ci_rebuild_verify.sh" ]; then
-  # Keep compatibility with your existing helper, but ensure it targets the same output dirs when possible.
-  # If your helper ignores these env vars, it can still do its own thing; golden checks will use the dirs above.
+  # Best effort: pass target dirs + stamp; helper may ignore these.
   MGC_OUT_PLAYLISTS="$OUT_PLAYLISTS" \
   MGC_OUT_TRACKS="$OUT_TRACKS" \
   MGC_STAMP="$STAMP" \
@@ -167,19 +141,16 @@ echo "  playlists: $OUT_PLAYLISTS"
 echo "  tracks:    $OUT_TRACKS"
 
 # -----------------------------
-# golden TREE hash gate (fixtures/golden_hashes.json) - optional
+# golden TREE hash gate (fast + full, optional)
 # -----------------------------
 GOLDEN_JSON="fixtures/golden_hashes.json"
 if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
   echo "[ci_gate] golden tree hash gate (golden_hashes.json)"
-
-  # Playlists
   $PYTHON scripts/ci_golden_check.py \
     --golden "$GOLDEN_JSON" \
     --key "ci.rebuild.playlists" \
     --root "$OUT_PLAYLISTS"
 
-  # Tracks
   $PYTHON scripts/ci_golden_check.py \
     --golden "$GOLDEN_JSON" \
     --key "ci.rebuild.tracks" \
@@ -191,34 +162,63 @@ else
 fi
 
 # -----------------------------
-# publish receipts determinism
+# full-mode gates
 # -----------------------------
-echo "[ci_gate] publish receipts determinism"
-if [ -x "scripts/ci_publish_determinism.sh" ]; then
-  bash scripts/ci_publish_determinism.sh
-else
-  echo "[ci_gate] (skip) scripts/ci_publish_determinism.sh not found"
+if [ "$CI_MODE" = "full" ]; then
+  # autonomous deterministic smoke
+  AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
+  mkdir -p "$AUTO_OUT"
+
+  echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
+  MGC_DETERMINISTIC=1 \
+  $PYTHON -m mgc.main --db "$MGC_DB" --json run autonomous \
+    --context focus \
+    --seed 1 \
+    --out-dir "$AUTO_OUT" \
+    --repo-root "$repo_root" \
+    --no-resume \
+    > "${AUTO_OUT%/}/autonomous.json"
+
+  # submission determinism + artifact check
+  echo "[ci_gate] submission artifact check"
+  bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
+  echo "[ci_gate] submission artifact check OK"
+
+  echo "[ci_gate] determinism gate: submission.zip (evidence-root=$AUTO_OUT)"
+  bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
+
+  # web bundle determinism (optional)
+  echo "[ci_gate] determinism gate: web bundle (evidence-root=$AUTO_OUT)"
+  bash scripts/ci_web_bundle_determinism.sh --evidence-root "$AUTO_OUT"
+
+  # drops list smoke (global --json hoist)
+  echo "[ci_gate] drops list smoke (global --json hoist)"
+  $PYTHON -m mgc.main --db "$MGC_DB" drops list --json >/dev/null
+
+  # publish receipts determinism
+  echo "[ci_gate] publish receipts determinism"
+  if [ -x "scripts/ci_publish_determinism.sh" ]; then
+    bash scripts/ci_publish_determinism.sh
+  else
+    echo "[ci_gate] (skip) scripts/ci_publish_determinism.sh not found"
+  fi
+
+  # manifest diff gate (since-ok, strict JSON)
+  echo "[ci_gate] manifest diff gate (since-ok, strict JSON)"
+  $PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json | $PYTHON -m json.tool
+
+  # golden SUBMISSION hash gate (known-good list) - warn by default
+  echo "[ci_gate] golden submission hash gate (warn by default)"
+  MODE="warn"
+  v="${MGC_GOLDEN_STRICT:-0}"
+  if [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ]; then
+    MODE="strict"
+  fi
+
+  bash scripts/ci_golden_hash_gate.sh \
+    --evidence-root "$AUTO_OUT" \
+    --known-file "ci/known_good_submission_sha256.txt" \
+    --mode "$MODE"
 fi
-
-# -----------------------------
-# manifest diff gate (since-ok, strict JSON)
-# -----------------------------
-echo "[ci_gate] manifest diff gate (since-ok, strict JSON)"
-$PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json | $PYTHON -m json.tool
-
-# -----------------------------
-# golden SUBMISSION hash gate (known-good list) - warn by default
-# -----------------------------
-echo "[ci_gate] golden submission hash gate (warn by default)"
-MODE="warn"
-v="${MGC_GOLDEN_STRICT:-0}"
-if [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ]; then
-  MODE="strict"
-fi
-
-bash scripts/ci_golden_hash_gate.sh \
-  --evidence-root "$AUTO_OUT" \
-  --known-file "ci/known_good_submission_sha256.txt" \
-  --mode "$MODE"
 
 echo "[ci_gate] OK"
