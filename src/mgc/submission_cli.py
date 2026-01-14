@@ -228,6 +228,51 @@ def _find_latest_bundle_dir_by_scan(evidence_root: Path) -> Optional[Path]:
     candidates.sort(key=mtime, reverse=True)
     return candidates[0].resolve()
 
+def cmd_submission_verify(args: argparse.Namespace) -> int:
+    import argparse
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    from mgc.bundle_validate import validate_bundle
+
+    zip_path = Path(args.zip).expanduser().resolve()
+    if not zip_path.exists() or not zip_path.is_file():
+        raise SystemExit(f"[submission verify] zip not found: {zip_path}")
+
+    try:
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            names = zf.namelist()
+            # Expect our deterministic packaging layout
+            expected_prefix = "submission/drop_bundle/"
+            if not any(n.startswith(expected_prefix) for n in names):
+                raise SystemExit(
+                    "[submission verify] invalid layout: expected files under submission/drop_bundle/"
+                )
+
+            with tempfile.TemporaryDirectory(prefix="mgc_submission_verify_") as td:
+                td_path = Path(td).resolve()
+                zf.extractall(td_path)
+
+                bundle_dir = td_path / "submission" / "drop_bundle"
+                if not bundle_dir.exists() or not bundle_dir.is_dir():
+                    raise SystemExit(
+                        f"[submission verify] extracted bundle missing: {bundle_dir}"
+                    )
+
+                # Will raise on invalid
+                validate_bundle(bundle_dir)
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"[submission verify] failed: {e}") from e
+
+    if getattr(args, "json", False):
+        print(stable_json_dumps({"ok": True, "zip": str(zip_path)}))
+    else:
+        print(f"[submission verify] OK: {zip_path}")
+    return 0
 
 def _build_readme(evidence_obj: Dict[str, Any]) -> str:
     ids = evidence_obj.get("ids") if isinstance(evidence_obj.get("ids"), dict) else {}
@@ -428,21 +473,26 @@ def cmd_submission_latest(args: argparse.Namespace) -> int:
 
 def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("submission", help="Build submission bundles")
-    sp = p.add_subparsers(dest="submission_cmd", required=True)
+    p.set_defaults(_mgc_group="submission")
 
-    b = sp.add_parser("build", help="Build a submission zip for a drop bundle")
-    b.add_argument("--out", required=True, help="Output zip path (e.g. submission.zip)")
-    b.add_argument("--bundle-dir", help="Path to an existing portable bundle directory")
-    b.add_argument("--drop-id", help="Drop id to locate bundle from DB (best-effort)")
-    b.add_argument("--db", default="data/db.sqlite", help="DB path for --drop-id lookup")
-    b.add_argument("--web-dir", help="Optional static web build directory to include under submission/web")
-    b.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
-    b.set_defaults(func=cmd_submission_build)
+    s = p.add_subparsers(dest="submission_cmd", required=True)
 
-    l = sp.add_parser("latest", help="Build a submission zip for the latest available bundle (DB first, then scan)")
-    l.add_argument("--out", required=True, help="Output zip path (e.g. submission.zip)")
-    l.add_argument("--db", default="data/db.sqlite", help="DB path to find latest drop")
-    l.add_argument("--evidence-root", default="data/evidence", help="Fallback scan root for bundle directories")
-    l.add_argument("--web-dir", help="Optional static web build directory to include under submission/web")
-    l.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
-    l.set_defaults(func=cmd_submission_latest)
+    build = s.add_parser("build", help="Build a submission zip")
+    build.add_argument("--out", required=True, help="Output zip path (e.g. submission.zip)")
+    build.add_argument("--bundle-dir", default=None, help="Path to an existing portable bundle directory")
+    build.add_argument("--drop-id", default=None, help="Drop id to locate bundle from DB (best-effort)")
+    build.add_argument("--db", default=None, help="DB path for --drop-id lookup")
+    build.add_argument("--web-dir", default=None, help="Optional static web build directory to include under submission/web")
+    build.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    build.set_defaults(func=cmd_submission_build)
+
+    latest = s.add_parser("latest", help="Build submission zip from the latest drop bundle")
+    latest.add_argument("--out", required=True, help="Output zip path")
+    latest.add_argument("--db", default=None, help="DB path")
+    latest.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    latest.set_defaults(func=cmd_submission_latest)
+
+    verify = s.add_parser("verify", help="Verify a submission.zip (unzip + bundle validation)")
+    verify.add_argument("zip", help="Path to submission.zip")
+    verify.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    verify.set_defaults(func=cmd_submission_verify)
