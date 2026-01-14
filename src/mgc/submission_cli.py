@@ -2,38 +2,28 @@
 """
 src/mgc/submission_cli.py
 
-Build a submission ZIP for a specific drop bundle.
+Build a submission ZIP for a specific drop bundle (or the latest).
 
 Design goals:
 - No DB mutation.
-- Deterministic outputs (stable JSON/README, stable zip file ordering + timestamps).
+- Deterministic outputs (stable README, stable zip ordering + timestamps).
 - Bundle validation before packaging.
-- Works with either:
-    (a) explicit --bundle-dir, or
-    (b) --drop-id + DB lookup (best-effort).
 
-Expected bundle layout (v1):
-  <bundle>/
-    tracks/
-      <track_id>.<ext>
-    playlist.json
-    daily_evidence.json
-    daily_evidence_<drop_id>.json (optional)
-
-CLI:
-  mgc submission build --bundle-dir <dir> --out submission.zip
-  mgc submission build --drop-id <drop_id> --db data/db.sqlite --out submission.zip
+Commands:
+  mgc submission build  --bundle-dir <dir> --out submission.zip
+  mgc submission build  --drop-id <drop_id> --db data/db.sqlite --out submission.zip
+  mgc submission latest --db data/db.sqlite --out submission.zip [--evidence-root data/evidence]
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sqlite3
 import tempfile
 import zipfile
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -77,8 +67,7 @@ def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
             arcname = f"{arc_root}/{_posix_rel(rel)}"
             entries.append((arcname, file_path))
 
-    # Deterministic ordering
-    entries.sort(key=lambda x: x[0])
+    entries.sort(key=lambda x: x[0])  # deterministic
 
     fixed_dt = (2020, 1, 1, 0, 0, 0)
 
@@ -86,67 +75,163 @@ def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
         data = file_path.read_bytes()
         zi = zipfile.ZipInfo(filename=arcname, date_time=fixed_dt)
         zi.compress_type = zipfile.ZIP_DEFLATED
-        zi.external_attr = 0o644 << 16  # permissions
+        zi.external_attr = 0o644 << 16
         zf.writestr(zi, data)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r[1]) for r in rows}  # (cid, name, type, notnull, dflt_value, pk)
+    except Exception:
+        return set()
 
 
 def _find_bundle_dir_by_drop_id(con: sqlite3.Connection, drop_id: str) -> Optional[Path]:
     """
     Best-effort lookup: tries to find a usable bundle directory for a drop_id.
 
-    This is intentionally conservative because repo layouts vary. We check common patterns:
-      - drops table contains evidence_path / bundle_dir / out_dir columns (if present)
-      - evidence JSON path referenced in drops.meta (if you store it)
-      - fallback: data/evidence/daily_evidence_<drop_id>.json (common)
+    Conservative heuristics:
+    - drops.meta may contain bundle_dir/out_dir/evidence_path/evidence_dir pointers
+    - fallback: data/evidence/daily_evidence_<drop_id>.json (common)
     """
     drop_id = drop_id.strip()
     if not drop_id:
         return None
 
-    # 1) Try reading drops.meta for an evidence/bundle hint.
+    # 1) Try reading drops.meta for a hint.
     try:
-        cur = con.execute("SELECT meta FROM drops WHERE id = ? OR drop_id = ? LIMIT 1", (drop_id, drop_id))
-        row = cur.fetchone()
-        if row and row[0]:
-            # meta may be JSON string
-            import json
-            try:
-                meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                if isinstance(meta, dict):
-                    for k in ("bundle_dir", "out_dir", "evidence_dir", "evidence_path"):
-                        v = meta.get(k)
-                        if isinstance(v, str) and v:
-                            p = Path(v)
-                            if p.is_file():
-                                # evidence_path -> bundle dir is parent
-                                bd = p.parent
-                                if (bd / "playlist.json").exists() and (bd / "daily_evidence.json").exists():
-                                    return bd.resolve()
-                            if p.is_dir():
-                                if (p / "playlist.json").exists() and (p / "daily_evidence.json").exists():
-                                    return p.resolve()
-            except Exception:
-                pass
+        if _table_exists(con, "drops"):
+            cols = _columns(con, "drops")
+            id_col = "id" if "id" in cols else ("drop_id" if "drop_id" in cols else None)
+            meta_col = "meta" if "meta" in cols else ("meta_json" if "meta_json" in cols else None)
+            if id_col and meta_col:
+                cur = con.execute(f"SELECT {meta_col} FROM drops WHERE {id_col} = ? LIMIT 1", (drop_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        if isinstance(meta, dict):
+                            for k in ("bundle_dir", "out_dir", "evidence_dir", "evidence_path"):
+                                v = meta.get(k)
+                                if isinstance(v, str) and v:
+                                    p = Path(v)
+                                    if p.is_file():
+                                        bd = p.parent
+                                        if (bd / "playlist.json").exists() and (bd / "daily_evidence.json").exists():
+                                            return bd.resolve()
+                                    if p.is_dir():
+                                        if (p / "playlist.json").exists() and (p / "daily_evidence.json").exists():
+                                            return p.resolve()
+                    except Exception:
+                        pass
     except Exception:
-        # drops schema may differ; ignore
         pass
 
-    # 2) Common default evidence location: data/evidence/daily_evidence_<drop_id>.json
+    # 2) Common default evidence location
     candidate = Path.cwd() / "data" / "evidence" / f"daily_evidence_{drop_id}.json"
     if candidate.exists() and candidate.is_file():
         bd = candidate.parent
-        # In some layouts evidence might be separate; still attempt parent-as-bundle only if required files exist.
         if (bd / "playlist.json").exists() and (bd / "daily_evidence.json").exists() and (bd / "tracks").is_dir():
             return bd.resolve()
 
-    # 3) Nothing found
     return None
 
 
-def _build_readme(bundle_dir: Path, evidence_obj: Dict[str, Any]) -> str:
+def _latest_drop_id(con: sqlite3.Connection) -> Optional[str]:
+    """
+    Best-effort: fetch the latest drop id from drops table.
+    Handles column drift: id vs drop_id, created_at vs ts vs created_ts.
+    """
+    if not _table_exists(con, "drops"):
+        return None
+
+    cols = _columns(con, "drops")
+    id_col = "id" if "id" in cols else ("drop_id" if "drop_id" in cols else None)
+    if not id_col:
+        return None
+
+    ts_col = None
+    for c in ("created_at", "ts", "created_ts", "published_ts"):
+        if c in cols:
+            ts_col = c
+            break
+
+    try:
+        if ts_col:
+            row = con.execute(
+                f"SELECT {id_col} AS did FROM drops ORDER BY {ts_col} DESC LIMIT 1"
+            ).fetchone()
+        else:
+            # fall back: order by rowid
+            row = con.execute(
+                f"SELECT {id_col} AS did FROM drops ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+    except Exception:
+        return None
+
+    return None
+
+
+def _is_bundle_dir(p: Path) -> bool:
+    return (
+        p.is_dir()
+        and (p / "tracks").is_dir()
+        and (p / "playlist.json").is_file()
+        and (p / "daily_evidence.json").is_file()
+    )
+
+
+def _find_latest_bundle_dir_by_scan(evidence_root: Path) -> Optional[Path]:
+    """
+    Scan evidence_root for the most recently modified directory that looks like a bundle.
+    Only scans 2 levels deep to avoid going crazy.
+    """
+    evidence_root = evidence_root.resolve()
+    if not evidence_root.exists() or not evidence_root.is_dir():
+        return None
+
+    candidates: list[Path] = []
+
+    # include root itself
+    if _is_bundle_dir(evidence_root):
+        candidates.append(evidence_root)
+
+    # 1-level and 2-level children
+    for child in sorted(evidence_root.iterdir()):
+        if child.is_dir() and _is_bundle_dir(child):
+            candidates.append(child)
+        if child.is_dir():
+            for grand in sorted(child.iterdir()):
+                if grand.is_dir() and _is_bundle_dir(grand):
+                    candidates.append(grand)
+
+    if not candidates:
+        return None
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    candidates.sort(key=mtime, reverse=True)
+    return candidates[0].resolve()
+
+
+def _build_readme(evidence_obj: Dict[str, Any]) -> str:
     ids = evidence_obj.get("ids") if isinstance(evidence_obj.get("ids"), dict) else {}
     paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
-    sha = evidence_obj.get("sha256") if isinstance(evidence_obj.get("sha256"), dict) else {}
 
     drop_id = ids.get("drop_id", "")
     run_id = ids.get("run_id", "")
@@ -180,23 +265,92 @@ def _build_readme(bundle_dir: Path, evidence_obj: Dict[str, Any]) -> str:
             "- daily_evidence.json: provenance + sha256 hashes",
             "",
             "## How to review",
-            "1) Open playlist.json in the static web player (if included) OR inspect it directly.",
+            "1) Inspect playlist.json (it references the bundled track under tracks/).",
             "2) Confirm hashes in daily_evidence.json match the files in the bundle.",
             "",
             "## Notes",
-            f"- Generated at: {_utc_now_iso()}",
+            f"- Packaged at: {_utc_now_iso()}",
         ]
     ) + "\n"
 
 
+def _package_bundle_to_zip(
+    *,
+    bundle_dir: Path,
+    out_path: Path,
+    web_dir: Optional[Path] = None,
+    json_mode: bool = False,
+) -> int:
+    # Validate bundle before packaging
+    validate_bundle(bundle_dir)
+
+    evidence_main = bundle_dir / "daily_evidence.json"
+    evidence_obj = json.loads(_read_text(evidence_main))
+
+    with tempfile.TemporaryDirectory(prefix="mgc_submission_") as td:
+        stage = Path(td).resolve()
+        pkg_root = stage / "submission"
+        _safe_mkdir(pkg_root)
+
+        # Copy bundle into submission/drop_bundle
+        drop_bundle_dst = pkg_root / "drop_bundle"
+        shutil.copytree(bundle_dir, drop_bundle_dst)
+
+        # Write README.md
+        readme_text = _build_readme(evidence_obj)
+        (pkg_root / "README.md").write_text(readme_text, encoding="utf-8")
+
+        # Optional web build directory
+        if web_dir is not None:
+            if not web_dir.exists() or not web_dir.is_dir():
+                raise SystemExit(f"--web-dir not found: {web_dir}")
+            shutil.copytree(web_dir, pkg_root / "web")
+
+        # Build zip deterministically
+        if out_path.exists():
+            out_path.unlink()
+        _safe_mkdir(out_path.parent)
+
+        with zipfile.ZipFile(str(out_path), mode="w") as zf:
+            # Add README first
+            fixed_dt = (2020, 1, 1, 0, 0, 0)
+            zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zi.external_attr = 0o644 << 16
+            zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
+
+            _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
+            if (pkg_root / "web").exists():
+                _zip_add_dir(zf, pkg_root / "web", arc_root="submission/web")
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "out": str(out_path),
+                    "bundle_dir": str(bundle_dir),
+                    "included_web": web_dir is not None,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        print(f"[submission] wrote: {out_path}")
+        print(f"[submission] bundle: {bundle_dir}")
+        if web_dir is not None:
+            print(f"[submission] web: {web_dir}")
+
+    return 0
+
+
 # -----------------------------
-# Command implementation
+# Command implementations
 # -----------------------------
 
 def cmd_submission_build(args: argparse.Namespace) -> int:
     out_path = Path(args.out).expanduser().resolve()
-    _safe_mkdir(out_path.parent)
-
     bundle_dir: Optional[Path] = None
 
     if args.bundle_dir:
@@ -220,99 +374,75 @@ def cmd_submission_build(args: argparse.Namespace) -> int:
                 "Re-run with --bundle-dir pointing at the portable bundle directory."
             )
 
-    # Validate bundle before packaging
-    validate_bundle(bundle_dir)
+    web_dir = Path(args.web_dir).expanduser().resolve() if args.web_dir else None
+    return _package_bundle_to_zip(
+        bundle_dir=bundle_dir,
+        out_path=out_path,
+        web_dir=web_dir,
+        json_mode=bool(getattr(args, "json", False)),
+    )
 
-    # Load evidence for README
-    import json
-    evidence_main = bundle_dir / "daily_evidence.json"
-    evidence_obj = json.loads(_read_text(evidence_main))
 
-    # Build staging directory
-    with tempfile.TemporaryDirectory(prefix="mgc_submission_") as td:
-        stage = Path(td).resolve()
-        pkg_root = stage / "submission"
-        _safe_mkdir(pkg_root)
+def cmd_submission_latest(args: argparse.Namespace) -> int:
+    out_path = Path(args.out).expanduser().resolve()
+    db_path = Path(args.db).expanduser().resolve()
+    evidence_root = Path(args.evidence_root).expanduser().resolve()
 
-        # Copy bundle into submission/drop_bundle
-        drop_bundle_dst = pkg_root / "drop_bundle"
-        shutil.copytree(bundle_dir, drop_bundle_dst)
+    bundle_dir: Optional[Path] = None
 
-        # Write README.md
-        readme_text = _build_readme(bundle_dir, evidence_obj)
-        (pkg_root / "README.md").write_text(readme_text, encoding="utf-8")
+    # 1) Try DB -> latest drop id -> locate bundle
+    if db_path.exists():
+        con = sqlite3.connect(str(db_path))
+        try:
+            did = _latest_drop_id(con)
+            if did:
+                bundle_dir = _find_bundle_dir_by_drop_id(con, did)
+        finally:
+            con.close()
 
-        # Optional: include web build directory if user points at one
-        if args.web_dir:
-            web_src = Path(args.web_dir).expanduser().resolve()
-            if not web_src.exists() or not web_src.is_dir():
-                raise SystemExit(f"--web-dir not found: {web_src}")
-            shutil.copytree(web_src, pkg_root / "web")
+    # 2) Fallback: scan evidence_root for newest bundle-shaped dir
+    if bundle_dir is None:
+        bundle_dir = _find_latest_bundle_dir_by_scan(evidence_root)
 
-        # Build zip deterministically
-        if out_path.exists():
-            out_path.unlink()
-
-        with zipfile.ZipFile(str(out_path), mode="w") as zf:
-            # Add README first for nicer browsing order
-            fixed_dt = (2020, 1, 1, 0, 0, 0)
-            zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            zi.external_attr = 0o644 << 16
-            zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
-
-            _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
-            if (pkg_root / "web").exists():
-                _zip_add_dir(zf, pkg_root / "web", arc_root="submission/web")
-
-    if getattr(args, "json", False):
-        import json as _json
-        print(
-            _json.dumps(
-                {
-                    "ok": True,
-                    "out": str(out_path),
-                    "bundle_dir": str(bundle_dir),
-                    "included_web": bool(args.web_dir),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+    if bundle_dir is None:
+        raise SystemExit(
+            "Could not find a bundle to package.\n"
+            f"- DB tried: {db_path}\n"
+            f"- evidence_root scanned: {evidence_root}\n"
+            "Tip: run a daily/drop with an out-dir that contains tracks/ + playlist.json + daily_evidence.json, "
+            "or use `mgc submission build --bundle-dir <dir>`."
         )
-    else:
-        print(f"[submission] wrote: {out_path}")
-        print(f"[submission] bundle: {bundle_dir}")
-        if args.web_dir:
-            print(f"[submission] web: {Path(args.web_dir).expanduser().resolve()}")
 
-    return 0
+    web_dir = Path(args.web_dir).expanduser().resolve() if args.web_dir else None
+    return _package_bundle_to_zip(
+        bundle_dir=bundle_dir,
+        out_path=out_path,
+        web_dir=web_dir,
+        json_mode=bool(getattr(args, "json", False)),
+    )
 
+
+# -----------------------------
+# CLI wiring
+# -----------------------------
 
 def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    """
-    Hook this into main.py's parser wiring.
-
-    Example (in main.py):
-        sub = parser.add_subparsers(dest="cmd", required=True)
-        ...
-        register_submission_subcommand(sub)
-    """
     p = subparsers.add_parser("submission", help="Build submission bundles")
     sp = p.add_subparsers(dest="submission_cmd", required=True)
 
     b = sp.add_parser("build", help="Build a submission zip for a drop bundle")
     b.add_argument("--out", required=True, help="Output zip path (e.g. submission.zip)")
-
-    # Choose one:
     b.add_argument("--bundle-dir", help="Path to an existing portable bundle directory")
     b.add_argument("--drop-id", help="Drop id to locate bundle from DB (best-effort)")
     b.add_argument("--db", default="data/db.sqlite", help="DB path for --drop-id lookup")
-
-    # Optional extras
     b.add_argument("--web-dir", help="Optional static web build directory to include under submission/web")
-
-    # If your CLI supports global --json, we still accept a local flag too
     b.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
-
     b.set_defaults(func=cmd_submission_build)
 
+    l = sp.add_parser("latest", help="Build a submission zip for the latest available bundle (DB first, then scan)")
+    l.add_argument("--out", required=True, help="Output zip path (e.g. submission.zip)")
+    l.add_argument("--db", default="data/db.sqlite", help="DB path to find latest drop")
+    l.add_argument("--evidence-root", default="data/evidence", help="Fallback scan root for bundle directories")
+    l.add_argument("--web-dir", help="Optional static web build directory to include under submission/web")
+    l.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    l.set_defaults(func=cmd_submission_latest)
