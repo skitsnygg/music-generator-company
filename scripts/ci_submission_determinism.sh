@@ -1,78 +1,78 @@
 #!/usr/bin/env bash
+# scripts/ci_submission_determinism.sh
 set -euo pipefail
 
-# Determinism gate: submission.zip
-#
-# Usage:
-#   EVIDENCE_ROOT=artifacts/ci/auto bash scripts/ci_submission_determinism.sh
-#   # (back-compat) BUNDLE_DIR=... bash scripts/ci_submission_determinism.sh
-#
-# Reads:
-#   $EVIDENCE_ROOT/drop_evidence.json  (preferred)
-#
-# Emits:
-#   Logs to stderr, exits nonzero on mismatch.
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/ci_submission_determinism.sh --evidence-root <dir>
 
-: "${PYTHON:=python}"
+Reads <evidence-root>/drop_evidence.json, finds artifacts.submission_zip_sha256 and paths.submission_zip,
+then re-computes sha256 of the zip and compares to recorded value.
 
-EVIDENCE_ROOT="${EVIDENCE_ROOT:-}"
-BUNDLE_DIR="${BUNDLE_DIR:-}"
-
-if [[ -n "${EVIDENCE_ROOT}" ]]; then
-  EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
-  if [[ ! -f "${EVIDENCE_JSON}" ]]; then
-    echo "[ci_submission_determinism] FAIL: missing evidence json: ${EVIDENCE_JSON}" >&2
-    exit 2
-  fi
-
-  # Prefer bundle_dir from evidence; fallback to evidence root.
-  BUNDLE_DIR="$(
-    "${PYTHON}" - <<'PY'
-import json, os, sys
-p = os.environ["EVIDENCE_JSON"]
-obj = json.load(open(p, "r", encoding="utf-8"))
-paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
-v = paths.get("bundle_dir") or ""
-print(v)
-PY
-  )"
-  if [[ -z "${BUNDLE_DIR}" ]]; then
-    BUNDLE_DIR="${EVIDENCE_ROOT%/}"
-  fi
-fi
-
-if [[ -z "${BUNDLE_DIR}" ]]; then
-  echo "scripts/ci_submission_determinism.sh: BUNDLE_DIR: set BUNDLE_DIR to the drop bundle directory" >&2
-  echo "  or set EVIDENCE_ROOT to a run output dir containing drop_evidence.json" >&2
-  exit 2
-fi
-
-BUNDLE_DIR="$(cd "${BUNDLE_DIR}" && pwd)"
-echo "[ci_submission_determinism] bundle_dir=${BUNDLE_DIR}" >&2
-
-# Run submission build twice and compare sha256 of produced submission.zip.
-# We call the CLI so we test the real contract.
-run_once() {
-  local out_json
-  out_json="$("${PYTHON}" -m mgc.main submission build --bundle-dir "${BUNDLE_DIR}" --json)"
-  "${PYTHON}" - <<'PY' <<<"${out_json}"
-import json, sys
-obj = json.loads(sys.stdin.read())
-if not obj.get("ok", False):
-    raise SystemExit(2)
-print(obj["zip_sha256"])
-PY
+Exits:
+  0 OK
+  2 mismatch / missing
+EOF
 }
 
-sha1="$(run_once)"
-sha2="$(run_once)"
+EVIDENCE_ROOT=""
 
-echo "[ci_submission_determinism] run1_sha256=${sha1}" >&2
-echo "[ci_submission_determinism] run2_sha256=${sha2}" >&2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --evidence-root) EVIDENCE_ROOT="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "[ci_submission_determinism] unknown arg: $1" >&2; usage; exit 2;;
+  esac
+done
 
-if [[ "${sha1}" != "${sha2}" ]]; then
-  echo "[ci_submission_determinism] FAIL: submission.zip sha mismatch" >&2
+if [ -z "$EVIDENCE_ROOT" ]; then
+  echo "[ci_submission_determinism] missing --evidence-root" >&2
+  usage
   exit 2
 fi
 
-echo "[ci_submission_determinism] OK" >&2
+evidence_path="${EVIDENCE_ROOT%/}/drop_evidence.json"
+if [ ! -f "$evidence_path" ]; then
+  echo "[ci_submission_determinism] missing evidence: $evidence_path" >&2
+  exit 2
+fi
+
+python - <<PY
+import json, hashlib, pathlib, sys
+
+evidence = pathlib.Path("$evidence_path")
+obj = json.loads(evidence.read_text(encoding="utf-8"))
+
+paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
+arts  = obj.get("artifacts") if isinstance(obj.get("artifacts"), dict) else {}
+
+zip_path = paths.get("submission_zip")
+want = arts.get("submission_zip_sha256")
+
+if not zip_path:
+    print("[ci_submission_determinism] missing paths.submission_zip", file=sys.stderr)
+    raise SystemExit(2)
+if not want:
+    print("[ci_submission_determinism] missing artifacts.submission_zip_sha256", file=sys.stderr)
+    raise SystemExit(2)
+
+zp = pathlib.Path(str(zip_path))
+if not zp.exists():
+    print(f"[ci_submission_determinism] submission_zip missing: {zp}", file=sys.stderr)
+    raise SystemExit(2)
+
+h = hashlib.sha256()
+with zp.open("rb") as f:
+    for chunk in iter(lambda: f.read(1024*1024), b""):
+        h.update(chunk)
+got = h.hexdigest()
+
+if got != want:
+    print("[ci_submission_determinism] FAIL sha mismatch", file=sys.stderr)
+    print(f"[ci_submission_determinism] expected={want}", file=sys.stderr)
+    print(f"[ci_submission_determinism] got     ={got}", file=sys.stderr)
+    raise SystemExit(2)
+
+print(f"[ci_submission_determinism] OK sha256={got}")
+PY

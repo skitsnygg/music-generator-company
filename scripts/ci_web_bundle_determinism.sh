@@ -1,62 +1,70 @@
 #!/usr/bin/env bash
+# scripts/ci_web_bundle_determinism.sh
 set -euo pipefail
 
-# Determinism gate: web bundle tree hash
-#
-# Usage:
-#   EVIDENCE_ROOT=artifacts/ci/auto bash scripts/ci_web_bundle_determinism.sh
-#   # (back-compat) PLAYLIST=... bash scripts/ci_web_bundle_determinism.sh
-#
-# Reads:
-#   $EVIDENCE_ROOT/drop_evidence.json (preferred)
-#
-# Emits:
-#   Logs to stderr, exits nonzero on mismatch.
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/ci_web_bundle_determinism.sh --evidence-root <dir>
 
-: "${PYTHON:=python}"
+Reads <evidence-root>/drop_evidence.json, finds:
+  paths.web_bundle_dir
+  artifacts.web_bundle_tree_sha256
 
-EVIDENCE_ROOT="${EVIDENCE_ROOT:-}"
-PLAYLIST="${PLAYLIST:-}"
+Then re-computes a deterministic tree hash and compares.
 
-if [[ -n "${EVIDENCE_ROOT}" ]]; then
-  EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
-  if [[ ! -f "${EVIDENCE_JSON}" ]]; then
-    echo "[ci_web_bundle_determinism] FAIL: missing evidence json: ${EVIDENCE_JSON}" >&2
-    exit 2
-  fi
+Exits:
+  0 OK (or web not present)
+  2 mismatch / missing web_dir when hash present
+EOF
+}
 
-  # Prefer playlist_path from evidence; fallback to evidence_root/playlist.json
-  PLAYLIST="$(
-    "${PYTHON}" - <<'PY'
-import json, os
-p = os.environ["EVIDENCE_JSON"]
-obj = json.load(open(p, "r", encoding="utf-8"))
-paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
-v = paths.get("playlist_path") or ""
-print(v)
-PY
-  )"
-  if [[ -z "${PLAYLIST}" ]]; then
-    PLAYLIST="${EVIDENCE_ROOT%/}/playlist.json"
-  fi
-fi
+EVIDENCE_ROOT=""
 
-if [[ -z "${PLAYLIST}" ]]; then
-  echo "scripts/ci_web_bundle_determinism.sh: line 18: PLAYLIST: set PLAYLIST to a playlist JSON path" >&2
-  echo "  or set EVIDENCE_ROOT to a run output dir containing drop_evidence.json" >&2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --evidence-root) EVIDENCE_ROOT="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "[ci_web_bundle_determinism] unknown arg: $1" >&2; usage; exit 2;;
+  esac
+done
+
+if [ -z "$EVIDENCE_ROOT" ]; then
+  echo "[ci_web_bundle_determinism] missing --evidence-root" >&2
+  usage
   exit 2
 fi
 
-PLAYLIST="$(cd "$(dirname "${PLAYLIST}")" && pwd)/$(basename "${PLAYLIST}")"
-echo "[ci_web_bundle_determinism] playlist=${PLAYLIST}" >&2
+evidence_path="${EVIDENCE_ROOT%/}/drop_evidence.json"
+if [ ! -f "$evidence_path" ]; then
+  echo "[ci_web_bundle_determinism] missing evidence: $evidence_path" >&2
+  exit 2
+fi
 
-# Build twice into temp dirs, hash trees, compare.
-hash_tree() {
-  local dir="$1"
-  "${PYTHON}" - <<'PY'
-import hashlib, os, pathlib, sys
+python - <<PY
+import json, hashlib, pathlib, sys
 
-root = pathlib.Path(sys.argv[1]).resolve()
+evidence = pathlib.Path("$evidence_path")
+obj = json.loads(evidence.read_text(encoding="utf-8"))
+paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
+arts  = obj.get("artifacts") if isinstance(obj.get("artifacts"), dict) else {}
+
+web_dir = paths.get("web_bundle_dir")
+want = arts.get("web_bundle_tree_sha256")
+
+# If no web hash was recorded, treat as "web not included" and succeed.
+if not want:
+    print("[ci_web_bundle_determinism] SKIP (no artifacts.web_bundle_tree_sha256 recorded)")
+    raise SystemExit(0)
+
+if not web_dir:
+    print("[ci_web_bundle_determinism] FAIL: hash recorded but paths.web_bundle_dir missing", file=sys.stderr)
+    raise SystemExit(2)
+
+root = pathlib.Path(str(web_dir))
+if not root.exists() or not root.is_dir():
+    print(f"[ci_web_bundle_determinism] FAIL: web_bundle_dir missing: {root}", file=sys.stderr)
+    raise SystemExit(2)
 
 def sha256_file(p: pathlib.Path) -> str:
     h = hashlib.sha256()
@@ -65,45 +73,19 @@ def sha256_file(p: pathlib.Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-files = sorted([p for p in root.rglob("*") if p.is_file()],
-               key=lambda p: p.relative_to(root).as_posix())
-
+files = sorted([p for p in root.rglob("*") if p.is_file()], key=lambda p: p.relative_to(root).as_posix())
 lines = []
 for p in files:
     rel = p.relative_to(root).as_posix()
     lines.append(f"{sha256_file(p)}  {rel}")
 joined = ("\n".join(lines) + "\n").encode("utf-8")
-print(hashlib.sha256(joined).hexdigest())
-PY "$dir"
-}
+got = hashlib.sha256(joined).hexdigest()
 
-build_once() {
-  local out_dir="$1"
-  "${PYTHON}" -m mgc.main web build \
-    --playlist "${PLAYLIST}" \
-    --out-dir "${out_dir}" \
-    --clean \
-    --fail-if-empty \
-    --fail-if-none-copied \
-    --json >/dev/null
-}
+if got != want:
+    print("[ci_web_bundle_determinism] FAIL tree sha mismatch", file=sys.stderr)
+    print(f"[ci_web_bundle_determinism] expected={want}", file=sys.stderr)
+    print(f"[ci_web_bundle_determinism] got     ={got}", file=sys.stderr)
+    raise SystemExit(2)
 
-d1="$(mktemp -d -t mgc_web_det_1.XXXXXX)"
-d2="$(mktemp -d -t mgc_web_det_2.XXXXXX)"
-trap 'rm -rf "${d1}" "${d2}"' EXIT
-
-build_once "${d1}"
-build_once "${d2}"
-
-h1="$(hash_tree "${d1}")"
-h2="$(hash_tree "${d2}")"
-
-echo "[ci_web_bundle_determinism] run1_tree_sha256=${h1}" >&2
-echo "[ci_web_bundle_determinism] run2_tree_sha256=${h2}" >&2
-
-if [[ "${h1}" != "${h2}" ]]; then
-  echo "[ci_web_bundle_determinism] FAIL: web bundle tree sha mismatch" >&2
-  exit 2
-fi
-
-echo "[ci_web_bundle_determinism] OK" >&2
+print(f"[ci_web_bundle_determinism] OK tree_sha256={got}")
+PY

@@ -1,0 +1,9 @@
+# ci/known_good_submission_sha256.txt
+# One sha256 per line. Comments and blank lines are ignored.
+#
+# How to add:
+#  - Grab artifacts.submission_zip_sha256 from drop_evidence.json OR submission.receipt.json
+#  - Append it here on its own line
+#
+# Example (remove this line and replace with real hashes):
+# f0524b27c20f773df1a1c0876bb5d9a7147e78b54bae18c4a5e44a5e62ed6e02git status
