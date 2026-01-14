@@ -22,13 +22,9 @@ set -euo pipefail
 #   fixtures/golden_hashes.json
 #   scripts/ci_golden_check.py (uses mgc.hash_tree)
 #
-# If fixtures/golden_hashes.json exists, we will check:
-#   - ci.rebuild.playlists against rebuild playlists output dir
-#   - ci.rebuild.tracks    against rebuild tracks output dir
-#
 # Full mode extras:
 #   - manifest diff: if since-ok not available, SKIP (do not fail CI)
-#   - golden submission hash gate: warn-only truly warns (nonzero rc is ignored unless strict)
+#   - golden submission hash gate: warn-only truly warns (nonzero rc ignored unless strict)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -55,10 +51,9 @@ _env_truthy() {
 mkdir -p "$ARTIFACTS_DIR"
 
 echo "[ci_gate] mode=$CI_MODE"
-echo "[ci_gate] MGC_ARTIFACTS_DIR=$ARTIFACTS_DIR"
 echo "[ci_gate] Repo: $repo_root"
 echo "[ci_gate] MGC_DB=$MGC_DB"
-echo "[ci_gate] ARTIFACTS_DIR=$ARTIFACTS_DIR"
+echo "[ci_gate] MGC_ARTIFACTS_DIR=$ARTIFACTS_DIR"
 echo "[ci_gate] MGC_OUT_ROOT=$OUT_ROOT"
 echo "[ci_gate] git_sha: $(git rev-parse HEAD)"
 echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD)"
@@ -85,14 +80,7 @@ $PYTHON -m py_compile \
   src/mgc/main.py \
   src/mgc/run_cli.py \
   src/mgc/web_cli.py \
-  src/mgc/submission_cli.py \
-  2>/dev/null || {
-    $PYTHON -m py_compile \
-      src/mgc/main.py \
-      src/mgc/run_cli.py \
-      src/mgc/web_cli.py \
-      src/mgc/submission_cli.py
-  }
+  src/mgc/submission_cli.py
 
 # -----------------------------
 # rebuild + verify (fast + full)
@@ -150,13 +138,13 @@ echo "  tracks:    $OUT_TRACKS"
 
 # -----------------------------
 # golden TREE hash gate (fast + full, optional)
-# - In fast mode: WARN-ONLY by default
-# - In full mode: STRICT by default
+# - fast: WARN-only by default
+# - full: STRICT by default
 # - MGC_GOLDEN_STRICT forces STRICT in either mode
 # -----------------------------
 GOLDEN_JSON="fixtures/golden_hashes.json"
 if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
-  echo "[ci_gate] golden tree hash gate (golden_hashes.json)"
+  echo "[ci_gate] golden tree hash gate"
 
   GOLDEN_STRICT=0
   if [ "$CI_MODE" = "full" ]; then
@@ -190,7 +178,7 @@ if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
     echo "[ci_gate] golden tree hash OK"
   fi
 else
-  echo "[ci_gate] golden tree hash SKIP (missing $GOLDEN_JSON or scripts/ci_golden_check.py)"
+  echo "[ci_gate] golden tree hash SKIP (missing fixtures/golden_hashes.json or scripts/ci_golden_check.py)"
 fi
 
 # -----------------------------
@@ -198,9 +186,14 @@ fi
 # -----------------------------
 if [ "$CI_MODE" = "full" ]; then
   AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
-  mkdir -p "$AUTO_OUT"
+  EVIDENCE_DIR="${AUTO_OUT%/}/evidence"
+  mkdir -p "$AUTO_OUT" "$EVIDENCE_DIR"
 
-  echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
+  # Force a single evidence root for *everything* in full mode,
+  # so run diff --since-ok never looks at data/evidence by accident.
+  export MGC_EVIDENCE_DIR="$EVIDENCE_DIR"
+
+  echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT evidence_dir=$MGC_EVIDENCE_DIR"
   MGC_DETERMINISTIC=1 \
   $PYTHON -m mgc.main --db "$MGC_DB" --json run autonomous \
     --context focus \
@@ -209,10 +202,6 @@ if [ "$CI_MODE" = "full" ]; then
     --repo-root "$repo_root" \
     --no-resume \
     > "${AUTO_OUT%/}/autonomous.json"
-
-  echo "[ci_gate] submission artifact check"
-  bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
-  echo "[ci_gate] submission artifact check OK"
 
   echo "[ci_gate] determinism gate: submission.zip (evidence-root=$AUTO_OUT)"
   bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
@@ -233,11 +222,15 @@ if [ "$CI_MODE" = "full" ]; then
   # -----------------------------
   # manifest diff gate (since-ok, strict JSON)
   # - if since-ok not available in CI workspace, SKIP (do not fail)
+  # - IMPORTANT: pass --out-dir so it reads the same evidence dir we wrote above
   # -----------------------------
-  echo "[ci_gate] manifest diff gate (since-ok, strict JSON)"
+  echo "[ci_gate] manifest diff gate (since-ok, strict JSON) evidence_dir=$MGC_EVIDENCE_DIR"
 
   set +e
-  DIFF_OUT="$($PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json 2>/dev/null)"
+  DIFF_OUT="$($PYTHON -m mgc.main --db "$MGC_DB" run diff \
+    --since-ok --fail-on-changes --summary-only --json \
+    --out-dir "$MGC_EVIDENCE_DIR" \
+    2>/dev/null)"
   rc_diff=$?
   set -e
 
@@ -246,7 +239,6 @@ if [ "$CI_MODE" = "full" ]; then
       echo "$DIFF_OUT" | $PYTHON -m json.tool
       echo "[ci_gate] manifest diff gate SKIP (since-ok not present)"
     else
-      # Unknown failure: surface output and fail
       echo "$DIFF_OUT" >&2
       echo "[ci_gate] manifest diff gate FAIL"
       exit $rc_diff
