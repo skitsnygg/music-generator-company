@@ -1206,6 +1206,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # GLOBALS ONLY: do NOT repeat these on subparsers
     p.add_argument("--db", default=os.environ.get("MGC_DB", DEFAULT_DB))
+    p.add_argument("--repo-root", default=os.environ.get("MGC_REPO_ROOT", "."), help="Repository root (CI may pass this before subcommands)")
     p.add_argument("--log-level", default=os.environ.get("MGC_LOG_LEVEL", "INFO"))
     p.add_argument("--log-file", default=os.environ.get("MGC_LOG_FILE"))
     p.add_argument("--log-console", action="store_true")
@@ -1359,7 +1360,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     return p
 
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
 
@@ -1384,3 +1384,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
