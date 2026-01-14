@@ -1388,6 +1388,7 @@ def _stub_daily_run(
       - staged providers (suno, diffsinger)
     """
     import hashlib
+    import os
     import shutil
 
     def _sha256_file(p: Path) -> str:
@@ -1396,6 +1397,9 @@ def _stub_daily_run(
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+    def _posix(p: Path) -> str:
+        return str(p).replace("\\", "/")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1456,7 +1460,7 @@ def _stub_daily_run(
         provider=result.provider,
         mood=context,
         genre=result.meta.get("genre") if isinstance(result.meta, dict) else None,
-        artifact_path=str(artifact_rel).replace("\\", "/"),
+        artifact_path=_posix(artifact_rel),
         meta={
             "run_id": run_id,
             "drop_id": drop_id,
@@ -1507,7 +1511,7 @@ def _stub_daily_run(
             "run_id": run_id,
             "drop_id": drop_id,
             "track_id": track_id,
-            "artifact_path": str(artifact_rel).replace("\\", "/"),
+            "artifact_path": _posix(artifact_rel),
             "provider": result.provider,
         },
     )
@@ -1558,6 +1562,118 @@ def _stub_daily_run(
             "post_ids": post_ids,
         },
     )
+
+    # ---------------------------------------------------------------------
+    # Portable bundle outputs (tracks + playlist.json)
+    # ---------------------------------------------------------------------
+    bundle_tracks_dir = out_dir / "tracks"
+    bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Bundle uses track_id + provider extension (same as repo artifact)
+    bundled_name = f"{track_id}{artifact_path.suffix}"
+    bundled_track_rel = Path("tracks") / bundled_name
+    bundled_track_path = (out_dir / bundled_track_rel).resolve()
+
+    # Copy repo artifact into bundle (portable)
+    shutil.copy2(str(artifact_path), str(bundled_track_path))
+
+    # Write playlist.json pointing at bundled track (web-build friendly)
+    playlist_rel = Path("playlist.json")
+    playlist_path = (out_dir / playlist_rel).resolve()
+
+    playlist_obj: Dict[str, Any] = {
+        "schema": "mgc.playlist.v1",
+        "context": context,
+        "ts": ts,
+        "drop_id": drop_id,
+        "run_id": run_id,
+        "deterministic": deterministic,
+        "tracks": [
+            {
+                "track_id": track_id,
+                "title": title,
+                "provider": result.provider,
+                "path": _posix(bundled_track_rel),
+            }
+        ],
+    }
+    playlist_path.write_text(stable_json_dumps(playlist_obj), encoding="utf-8")
+
+    # Hashes
+    repo_artifact_sha256 = _sha256_file(artifact_path)
+    bundled_track_sha256 = _sha256_file(bundled_track_path)
+    playlist_sha256 = _sha256_file(playlist_path)
+
+    # Evidence JSON (write a stable filename + an id-scoped filename)
+    evidence_obj: Dict[str, Any] = {
+        "schema": "mgc.daily_evidence.v1",
+        "ts": ts,
+        "context": context,
+        "seed": seed,
+        "deterministic": deterministic,
+        "provider": result.provider,
+        "ids": {
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "track_id": track_id,
+            "marketing_post_ids": post_ids,
+        },
+        "paths": {
+            "repo_artifact": _posix(artifact_rel),
+            "bundle_track": _posix(bundled_track_rel),
+            "playlist": _posix(playlist_rel),
+        },
+        "sha256": {
+            "repo_artifact": repo_artifact_sha256,
+            "bundle_track": bundled_track_sha256,
+            "playlist": playlist_sha256,
+        },
+    }
+
+    evidence_rel_main = Path("daily_evidence.json")
+    evidence_rel_scoped = Path(f"daily_evidence_{drop_id}.json")
+    evidence_path_main = (out_dir / evidence_rel_main).resolve()
+    evidence_path_scoped = (out_dir / evidence_rel_scoped).resolve()
+
+    evidence_text = stable_json_dumps(evidence_obj)
+    evidence_path_main.write_text(evidence_text, encoding="utf-8")
+    evidence_path_scoped.write_text(evidence_text, encoding="utf-8")
+
+    db_insert_event(
+        con,
+        event_id=stable_uuid5("event", "drop.bundle.written", drop_id),
+        ts=ts,
+        kind="drop.bundle.written",
+        actor="system",
+        meta={
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "track_id": track_id,
+            "bundle_track": _posix(bundled_track_rel),
+            "playlist": _posix(playlist_rel),
+            "evidence": [_posix(evidence_rel_main), _posix(evidence_rel_scoped)],
+        },
+    )
+
+    return {
+        "run_id": run_id,
+        "drop_id": drop_id,
+        "track_id": track_id,
+        "provider": result.provider,
+        "context": context,
+        "seed": seed,
+        "deterministic": deterministic,
+        "repo_artifact_path": _posix(artifact_rel),
+        "bundle_track_path": _posix(bundled_track_rel),
+        "playlist_path": _posix(playlist_rel),
+        "evidence_paths": [_posix(evidence_rel_main), _posix(evidence_rel_scoped)],
+        "sha256": {
+            "repo_artifact": repo_artifact_sha256,
+            "bundle_track": bundled_track_sha256,
+            "playlist": playlist_sha256,
+        },
+        "marketing_post_ids": post_ids,
+    }
 
     # ------------------------------------------------------------------
     # Bundle materialization in out_dir
@@ -1879,11 +1995,95 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
       - ensure manifest.json exists under out_dir
       - run the daily generator (stub/riffusion/...) to materialize audio + DB rows
       - write drop_evidence.json under out_dir, including bundle track + playlist paths
+      - build a submission zip at data/submissions/<drop_id>/submission.zip (non-dry-run)
       - print a small JSON summary to stdout
     """
-    import sqlite3
     import os
+    import sqlite3
+    import tempfile
+    import zipfile
+    import shutil
+    import json
     from pathlib import Path
+    from datetime import datetime, timezone
+
+    from mgc.bundle_validate import validate_bundle
+
+    def _utc_now_iso() -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    def _safe_mkdir(p: Path) -> None:
+        p.mkdir(parents=True, exist_ok=True)
+
+    def _posix_rel(p: Path) -> str:
+        return str(p).replace("\\", "/")
+
+    def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
+        root = root.resolve()
+        entries = []
+        for dp, dn, fn in os.walk(root):
+            dn.sort()
+            fn.sort()
+            dp_path = Path(dp)
+            for name in fn:
+                file_path = (dp_path / name).resolve()
+                rel = file_path.relative_to(root)
+                arcname = f"{arc_root}/{_posix_rel(rel)}"
+                entries.append((arcname, file_path))
+        entries.sort(key=lambda x: x[0])
+
+        fixed_dt = (2020, 1, 1, 0, 0, 0)
+        for arcname, file_path in entries:
+            data = file_path.read_bytes()
+            zi = zipfile.ZipInfo(filename=arcname, date_time=fixed_dt)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zi.external_attr = 0o644 << 16
+            zf.writestr(zi, data)
+
+    def _build_readme(evidence_obj: dict) -> str:
+        # Use run ts (not current time) so deterministic runs stay deterministic.
+        ids = evidence_obj.get("ids") if isinstance(evidence_obj.get("ids"), dict) else {}
+        paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
+
+        drop_id = ids.get("drop_id", evidence_obj.get("drop_id", ""))
+        run_id = ids.get("run_id", evidence_obj.get("run_id", ""))
+        track_id = ids.get("track_id", evidence_obj.get("track_id", ""))
+        provider = evidence_obj.get("provider", "")
+        context = evidence_obj.get("context", evidence_obj.get("context", ""))
+        ts_local = evidence_obj.get("ts", "")
+
+        bundle_track = paths.get("bundle_track", paths.get("bundle_track_path", ""))
+        playlist = paths.get("playlist", paths.get("playlist_path", "playlist.json"))
+
+        deterministic_local = evidence_obj.get("deterministic", "")
+
+        lines = [
+            "# Music Generator Company – Drop Submission",
+            "",
+            "## Identifiers",
+            f"- drop_id: {drop_id}",
+            f"- run_id: {run_id}",
+            f"- track_id: {track_id}",
+            "",
+            "## Run metadata",
+            f"- ts: {ts_local}",
+            f"- context: {context}",
+            f"- provider: {provider}",
+            f"- deterministic: {deterministic_local}",
+            "",
+            "## Contents",
+            f"- {playlist}: playlist pointing at bundled audio",
+            f"- {bundle_track}: bundled audio asset",
+            "- daily_evidence.json (or drop bundle evidence): provenance + sha256 hashes",
+            "",
+            "## How to review",
+            "1) Inspect playlist.json (it references the bundled track under tracks/).",
+            "2) Confirm hashes match the files in the bundle.",
+            "",
+            "## Notes",
+            f"- Packaged at: {ts_local or _utc_now_iso()}",
+        ]
+        return "\n".join(lines) + "\n"
 
     deterministic = bool(getattr(args, "deterministic", False)) or bool(
         (os.environ.get("MGC_DETERMINISTIC") or "").strip().lower() in ("1", "true", "yes")
@@ -1928,7 +2128,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     # Run the generator path (this is what actually creates audio + DB rows)
     # ---------------------------------------------------------------------
     if dry_run:
-        # In dry-run, we don't mutate DB or write audio; just emit the metadata we can.
         drop_id = stable_uuid5("drop", run_id)
         evidence_obj = {
             "schema": "mgc.drop_evidence.v1",
@@ -1949,7 +2148,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         con = sqlite3.connect(db_path)
         try:
             con.execute("PRAGMA foreign_keys = ON")
-            # This call is now the canonical place where audio is produced and bundled.
             daily = _stub_daily_run(
                 con=con,
                 context=context,
@@ -1963,9 +2161,9 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         finally:
             con.close()
 
-        # daily contains: run_id/drop_id/track/artifact_path + NEW bundle fields + playlist.json written
         drop_id = str(daily.get("drop_id") or stable_uuid5("drop", run_id))
-        track_id = None
+
+        track_id = ""
         try:
             track_id = str((daily.get("track") or {}).get("id") or "")
         except Exception:
@@ -1987,7 +2185,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "daily": daily,
         }
 
-        # Surface the bundle paths at top-level for convenience
         bundle = (daily or {}).get("bundle") if isinstance(daily, dict) else None
         if isinstance(bundle, dict):
             evidence_obj["paths"].update(
@@ -2010,7 +2207,66 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
 
     # ---------------------------------------------------------------------
-    # Print stdout summary JSON (keep your shape, but include bundle paths if present)
+    # Build submission zip (non-dry-run only)
+    # ---------------------------------------------------------------------
+    submission_zip_path: Optional[Path] = None
+    if not dry_run:
+        # Determine bundle dir (should be the same out_dir used by _stub_daily_run)
+        pths = evidence_obj.get("paths") or {}
+        bundle_dir = Path(str(pths.get("bundle_dir") or out_dir)).expanduser().resolve()
+
+        # Validate bundle before packaging
+        validate_bundle(bundle_dir)
+
+        # Read daily evidence object if present (for README). Prefer daily_evidence.json if it exists.
+        daily_ev_path = bundle_dir / "daily_evidence.json"
+        if daily_ev_path.exists():
+            try:
+                daily_ev_obj = json.loads(daily_ev_path.read_text(encoding="utf-8"))
+            except Exception:
+                daily_ev_obj = {"ts": ts, "drop_id": evidence_obj.get("drop_id"), "run_id": run_id, "context": context, "deterministic": deterministic}
+        else:
+            daily_ev_obj = {"ts": ts, "drop_id": evidence_obj.get("drop_id"), "run_id": run_id, "context": context, "deterministic": deterministic}
+
+        # Build destination
+        submissions_root = Path("data") / "submissions" / str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id))
+        _safe_mkdir(submissions_root)
+        submission_zip_path = (submissions_root / "submission.zip").resolve()
+
+        # Stage + zip deterministically
+        with tempfile.TemporaryDirectory(prefix="mgc_submission_") as td:
+            stage = Path(td).resolve()
+            pkg_root = stage / "submission"
+            _safe_mkdir(pkg_root)
+
+            # Copy bundle
+            drop_bundle_dst = pkg_root / "drop_bundle"
+            shutil.copytree(bundle_dir, drop_bundle_dst)
+
+            # Write README.md (stable-ish)
+            (pkg_root / "README.md").write_text(_build_readme(daily_ev_obj), encoding="utf-8")
+
+            # Write zip
+            if submission_zip_path.exists():
+                submission_zip_path.unlink()
+
+            with zipfile.ZipFile(str(submission_zip_path), mode="w") as zf:
+                fixed_dt = (2020, 1, 1, 0, 0, 0)
+                zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.external_attr = 0o644 << 16
+                zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
+
+                _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
+
+        # Record in evidence
+        evidence_obj.setdefault("paths", {})
+        evidence_obj["paths"]["submission_zip"] = str(submission_zip_path)
+        # Re-write evidence so it includes submission pointer
+        evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
+
+    # ---------------------------------------------------------------------
+    # Print stdout summary JSON
     # ---------------------------------------------------------------------
     out = {
         "deterministic": bool(deterministic),
@@ -2030,6 +2286,8 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         for k in ("bundle_dir", "bundle_track_path", "bundle_track_sha256", "playlist_path", "playlist_sha256"):
             if k in p and p[k]:
                 out["paths"][k] = p[k]
+        if submission_zip_path is not None:
+            out["paths"]["submission_zip"] = str(submission_zip_path)
     except Exception:
         pass
 
