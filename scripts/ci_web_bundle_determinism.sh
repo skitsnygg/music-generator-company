@@ -70,28 +70,28 @@ run_drop_and_web_build() {
 
   # Deterministic drop
   MGC_DETERMINISTIC="${MGC_DETERMINISTIC:-1}" \
-  $PYTHON -m mgc.main --db "$MGC_DB" run drop \
+  "$PYTHON" -m mgc.main --db "$MGC_DB" run drop \
     --context focus \
     --seed 1 \
     --deterministic \
     --out-dir "$drop_dir" \
     > "${drop_dir%/}/drop_stdout.json"
 
-  $PYTHON -m json.tool < "${drop_dir%/}/drop_stdout.json" >/dev/null
+  "$PYTHON" -m json.tool < "${drop_dir%/}/drop_stdout.json" >/dev/null
 
   test -s "${drop_dir%/}/playlist.json"
   test -d "${drop_dir%/}/tracks"
 
   # Web build from inside drop dir (relative paths)
   pushd "$drop_dir" >/dev/null
-  $PYTHON -m mgc.main web build \
+  "$PYTHON" -m mgc.main web build \
     --playlist "playlist.json" \
     --out-dir "$web_dir" \
     --prefer-mp3 \
     --clean \
     --fail-if-empty \
     --json \
-    | $PYTHON -m json.tool >/dev/null
+    | "$PYTHON" -m json.tool >/dev/null
   popd >/dev/null
 
   test "$(find "$web_dir" -maxdepth 6 -type f -name 'index.html' | wc -l | tr -d ' ')" -ge 1
@@ -104,9 +104,9 @@ run_drop_and_web_build "$RUN1_DROP" "$RUN1_WEB"
 echo "[ci_web_bundle_determinism] build run2"
 run_drop_and_web_build "$RUN2_DROP" "$RUN2_WEB"
 
-# Tree hashes (requires src/mgc/hash_tree.py => module mgc.hash_tree)
-H1="$($PYTHON -m mgc.hash_tree --root "$RUN1_WEB" --print)"
-H2="$($PYTHON -m mgc.hash_tree --root "$RUN2_WEB" --print)"
+# Tree hashes (requires module mgc.hash_tree)
+H1="$("$PYTHON" -m mgc.hash_tree --root "$RUN1_WEB" --print)"
+H2="$("$PYTHON" -m mgc.hash_tree --root "$RUN2_WEB" --print)"
 
 if [ "$H1" != "$H2" ]; then
   echo "[ci_web_bundle_determinism] FAIL: web bundle tree hash mismatch"
@@ -120,45 +120,52 @@ fi
 echo "[ci_web_bundle_determinism] OK sha256=$H1"
 
 OUT_JSON="${EVIDENCE_ROOT%/}/web_bundle_determinism.json"
-$PYTHON - <<PY
-import json
-from pathlib import Path
-
-p = Path(${OUT_JSON!r})
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps({
-  "ok": True,
-  "web_bundle_tree_sha256": ${H1!r},
-  "run1_web": ${RUN1_WEB!r},
-  "run2_web": ${RUN2_WEB!r},
-}, sort_keys=True, indent=2) + "\\n", encoding="utf-8")
-PY
-
-# Best-effort: record into drop_evidence.json if it exists
 EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
-if [ -s "$EVIDENCE_JSON" ]; then
-  $PYTHON - <<'PY'
+
+export OUT_JSON EVIDENCE_JSON H1 RUN1_WEB RUN2_WEB
+
+"$PYTHON" - <<'PY'
 import json, os
 from pathlib import Path
 
-evidence_path = Path(os.environ["EVIDENCE_JSON"])
-h = os.environ["WEB_HASH"]
-web_dir = os.environ["WEB_DIR"]
+out_json = Path(os.environ["OUT_JSON"])
+evidence_json = Path(os.environ["EVIDENCE_JSON"])
+h = os.environ["H1"]
+run1_web = os.environ["RUN1_WEB"]
+run2_web = os.environ["RUN2_WEB"]
 
-obj = json.loads(evidence_path.read_text(encoding="utf-8"))
+out_json.parent.mkdir(parents=True, exist_ok=True)
+out_json.write_text(
+    json.dumps(
+        {
+            "ok": True,
+            "web_bundle_tree_sha256": h,
+            "run1_web": run1_web,
+            "run2_web": run2_web,
+        },
+        sort_keys=True,
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 
-artifacts = obj.get("artifacts")
-if not isinstance(artifacts, dict):
-  artifacts = {}
-obj["artifacts"] = artifacts
-artifacts["web_bundle_tree_sha256"] = h
+# Best-effort: record into drop_evidence.json if it exists
+if evidence_json.exists() and evidence_json.stat().st_size > 0:
+    obj = json.loads(evidence_json.read_text(encoding="utf-8"))
 
-paths = obj.get("paths")
-if not isinstance(paths, dict):
-  paths = {}
-obj["paths"] = paths
-paths["web_bundle_dir"] = web_dir
+    artifacts = obj.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+        obj["artifacts"] = artifacts
+    artifacts["web_bundle_tree_sha256"] = h
 
-evidence_path.write_text(json.dumps(obj, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    paths = obj.get("paths")
+    if not isinstance(paths, dict):
+        paths = {}
+        obj["paths"] = paths
+    # store the canonical run1 output dir
+    paths["web_bundle_dir"] = run1_web
+
+    evidence_json.write_text(json.dumps(obj, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-fi
