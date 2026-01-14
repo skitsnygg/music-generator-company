@@ -114,7 +114,7 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
             if isinstance(it, str):
                 add_path(it)
             elif isinstance(it, dict):
-                for k in ("artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
+                for k in ("bundle_track_path", "artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
                     if k in it:
                         add_path(it.get(k))
                         break
@@ -296,6 +296,24 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
             pass
 
 
+def _resolve_media_path(playlist_path: Path, media_path: str) -> Path:
+    """
+    Resolve a media path from playlist content into a filesystem path.
+
+    Rule:
+      - absolute paths stay absolute
+      - relative paths resolve relative to the playlist file's directory
+
+    This is what makes portable drop bundles work in CI:
+      <DROP_DIR>/playlist.json references "tracks/<id>.wav"
+      and the track exists at <DROP_DIR>/tracks/<id>.wav
+    """
+    p = Path(str(media_path)).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (playlist_path.parent / p).resolve()
+
+
 @dataclass(frozen=True)
 class BuildResult:
     ok: bool
@@ -359,9 +377,10 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     bundled: List[Dict[str, Any]] = []
 
     for i, raw in enumerate(raw_paths):
-        rp = Path(raw)
-        if not rp.is_absolute():
-            rp = (Path.cwd() / rp).resolve()
+        # IMPORTANT FIX:
+        # resolve relative media paths relative to the playlist's directory,
+        # not CWD. This is required for portable drop bundles.
+        rp = _resolve_media_path(playlist_path, raw)
 
         if bool(getattr(args, "prefer_mp3", False)):
             rp = _prefer_mp3_path(rp)
