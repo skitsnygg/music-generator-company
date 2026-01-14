@@ -16,6 +16,7 @@ set -euo pipefail
 #
 # Notes:
 # - Uses `run autonomous` as the primary smoke test (drop + submission verify).
+# - In CI, DO NOT assume repo-local data/ exists. Use $MGC_ARTIFACTS_DIR outputs.
 # - Keeps stdout clean where possible; writes a ci_gate.log always.
 # - Hygiene: if fixtures/ci_db.sqlite is tracked, restores it on exit.
 
@@ -45,14 +46,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-require_file() {
-  local p="$1"
-  if [[ ! -f "$p" ]]; then
-    err "Missing file: $p"
-    return 2
-  fi
-}
-
 python_compile() {
   info "py_compile"
   "$PYTHON" -m py_compile src/mgc/main.py
@@ -64,41 +57,81 @@ python_compile() {
   [[ -f src/mgc/drops_cli.py ]] && "$PYTHON" -m py_compile src/mgc/drops_cli.py || true
 }
 
+_dump_tree_quick() {
+  # Helpful for CI debugging when something is missing.
+  # Kept quiet unless caller wants it (caller can redirect to log_file).
+  local root="$1"
+  if [[ -d "$root" ]]; then
+    info "tree (top) for: $root"
+    find "$root" -maxdepth 4 -type f | sed 's#^#  #'
+  else
+    info "tree skipped (missing dir): $root"
+  fi
+}
+
 autonomous_smoke() {
   local out_dir="$1"
   info "autonomous smoke test (deterministic) out_dir=$out_dir"
 
+  mkdir -p "$out_dir"
+
   # Deterministic + fixed time so CI is stable.
-  # This should:
-  #   - write evidence under out_dir
-  #   - produce data/submissions/<drop_id>/submission.zip
-  #   - verify submission.zip internally (unless --no-verify-submission)
+  # This should write a portable bundle under out_dir:
+  #   - tracks/
+  #   - playlist.json
+  #   - daily_evidence.json
   MGC_DB="$DB" MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" \
     "$PYTHON" -m mgc.main run autonomous --context focus --seed 1 --out-dir "$out_dir" >/dev/null
 
   info "submission artifact check"
 
-  # Require at least one submission folder exists + contains expected artifacts
-  if ! ls -1d data/submissions/* >/dev/null 2>&1; then
-    err "No data/submissions/<drop_id> directories found"
+  # CI contract: ensure the portable bundle exists somewhere under out_dir.
+  # We DO NOT assume repo-local data/submissions in CI.
+  local evidence_path
+  evidence_path="$(find "$out_dir" -maxdepth 6 -type f -name "daily_evidence.json" | head -n 1 || true)"
+  if [[ -z "${evidence_path}" ]]; then
+    err "No daily_evidence.json found under out_dir=$out_dir (autonomous run didn't produce a portable bundle)"
+    _dump_tree_quick "$out_dir" >&2 || true
     return 2
   fi
-  if ! ls -1 data/submissions/*/submission.zip >/dev/null 2>&1; then
-    err "Missing data/submissions/*/submission.zip"
+
+  local bundle_dir
+  bundle_dir="$(cd "$(dirname "$evidence_path")" && pwd)"
+  if [[ ! -d "$bundle_dir/tracks" ]]; then
+    err "Bundle dir missing tracks/: $bundle_dir"
+    _dump_tree_quick "$bundle_dir" >&2 || true
     return 2
   fi
-  if ! ls -1 data/submissions/*/submission.json >/dev/null 2>&1; then
-    err "Missing data/submissions/*/submission.json"
+  if [[ ! -f "$bundle_dir/playlist.json" ]]; then
+    err "Bundle dir missing playlist.json: $bundle_dir"
+    _dump_tree_quick "$bundle_dir" >&2 || true
     return 2
   fi
 
   # Exercise submission "latest" builder (CLI contract)
+  #
+  # IMPORTANT:
+  # - In CI, data/db.sqlite and data/evidence may not exist.
+  # - The autonomous smoke writes its portable bundle under out_dir.
+  # So we must pass the DB path explicitly and point evidence scanning at out_dir.
   rm -f /tmp/ci_submission.zip /tmp/ci_submission_build.json >/dev/null 2>&1 || true
-  "$PYTHON" -m mgc.main submission latest --out /tmp/ci_submission.zip --json >/tmp/ci_submission_build.json
+
+  "$PYTHON" -m mgc.main submission latest \
+    --db "$DB" \
+    --evidence-root "$out_dir" \
+    --out /tmp/ci_submission.zip \
+    --json \
+    >/tmp/ci_submission_build.json
+
   if [[ ! -s /tmp/ci_submission.zip ]]; then
     err "submission latest produced empty /tmp/ci_submission.zip"
+    err "submission latest output:"
+    cat /tmp/ci_submission_build.json >&2 || true
     return 2
   fi
+
+  # Tight contract: verify the zip we just built (fast)
+  "$PYTHON" -m mgc.main submission verify --zip /tmp/ci_submission.zip --json >/dev/null
 
   info "submission artifact check OK"
 }
@@ -121,7 +154,7 @@ run_gate() {
 
   python_compile
 
-  # Primary smoke test: end-to-end autonomous run (drop + submission verify)
+  # Primary smoke test: end-to-end autonomous run (portable bundle + submission zip)
   autonomous_smoke "$ARTIFACTS_DIR/auto"
 
   # Optional: if drops CLI exists, ensure global --json hoisting still works.

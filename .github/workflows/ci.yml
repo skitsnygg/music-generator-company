@@ -167,6 +167,10 @@ jobs:
 
       - name: Run CI gate (twice)
         shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
