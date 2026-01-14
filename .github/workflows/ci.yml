@@ -21,7 +21,6 @@ jobs:
           echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
           echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_test" >> "$GITHUB_ENV"
           echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
-          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci" "${RUNNER_TEMP}/mgc_drop_test" "${RUNNER_TEMP}/mgc_web"
 
       - name: Prepare temp dirs (always)
@@ -55,7 +54,7 @@ jobs:
           ffmpeg -version
           ffprobe -version
 
-      - name: Build fixture DB (copy to temp; keep checkout clean)
+      - name: Build fixture DB (copy to temp; reset repo file)
         shell: bash
         run: |
           set -euxo pipefail
@@ -65,13 +64,84 @@ jobs:
           ls -la fixtures
           sha256sum fixtures/ci_db.sqlite
 
-          cp -f fixtures/ci_db.sqlite "${MGC_DB}"
+          cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
+          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
 
-          # Keep checkout clean (in case make_fixture_db touched tracked file)
+          # Keep checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
-          ls -la "${MGC_DB}"
-          sha256sum "${MGC_DB}"
+          ls -la "${RUNNER_TEMP}/ci_db.sqlite"
+          sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
+
+      - name: Ensure DB schema has required tables (CI bootstrap)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os, sqlite3
+
+          p = os.environ["MGC_DB"]
+          con = sqlite3.connect(p)
+          try:
+              con.execute("PRAGMA foreign_keys = ON")
+              con.executescript("""
+              CREATE TABLE IF NOT EXISTS tracks (
+                track_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                title TEXT,
+                provider TEXT,
+                mood TEXT,
+                genre TEXT,
+                artifact_path TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS drops (
+                drop_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                context TEXT,
+                seed TEXT,
+                run_id TEXT,
+                track_id TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                kind TEXT,
+                actor TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS marketing_posts (
+                post_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                platform TEXT,
+                status TEXT,
+                content TEXT,
+                meta TEXT
+              );
+
+              CREATE TABLE IF NOT EXISTS playlists (
+                playlist_id TEXT PRIMARY KEY,
+                ts TEXT,
+                context TEXT,
+                payload TEXT,
+                meta TEXT
+              );
+              """)
+              con.commit()
+
+              tables = [r[0] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+              ).fetchall()]
+              print("tables:", tables)
+              assert "drops" in tables, "drops table missing"
+              assert "playlists" in tables, "playlists table missing"
+          finally:
+              con.close()
+          PY
 
       - name: Preflight DB (must pass)
         shell: bash
@@ -89,9 +159,10 @@ jobs:
                   "select name from sqlite_master where type='table' order by name"
               ).fetchall()]
               print("tables:", tables)
-              # keep this flexible—CI gate also validates schema
-              if not tables:
-                  print(f"ERROR: {p} has no tables", file=sys.stderr)
+              required = {"tracks", "drops", "events", "marketing_posts", "playlists"}
+              missing = sorted(required - set(tables))
+              if missing:
+                  print(f"ERROR: {p} missing tables: {missing}", file=sys.stderr)
                   sys.exit(1)
           finally:
               con.close()
@@ -110,6 +181,57 @@ jobs:
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
+      - name: Run determinism gate (existing)
+        shell: bash
+        env:
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_DB: ${{ env.MGC_DB }}
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_run_determinism.sh
+
+      - name: Web player build (real drop bundle -> playlist -> build)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          DROP_DIR: ${{ env.MGC_DROP_DIR }}
+          WEB_DIR: ${{ env.MGC_WEB_DIR }}
+        run: |
+          set -euxo pipefail
+
+          rm -rf "${DROP_DIR}" "${WEB_DIR}"
+          mkdir -p "${DROP_DIR}" "${WEB_DIR}"
+
+          python -m mgc.main run drop \
+            --context focus \
+            --seed 1 \
+            --deterministic \
+            --out-dir "${DROP_DIR}" \
+            > "${DROP_DIR}/drop_stdout.json"
+
+          python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
+          test -s "${DROP_DIR}/playlist.json"
+          test -d "${DROP_DIR}/tracks"
+
+          pushd "${DROP_DIR}" >/dev/null
+          python -m mgc.main web build \
+            --playlist "playlist.json" \
+            --out-dir "${WEB_DIR}" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json \
+            | python -m json.tool
+          popd >/dev/null
+
+          test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
+          test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
+
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
         run: |
@@ -122,9 +244,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-artifacts
+          if-no-files-found: ignore
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
             ${{ env.MGC_DROP_DIR }}
             ${{ env.MGC_WEB_DIR }}
-          if-no-files-found: ignore
