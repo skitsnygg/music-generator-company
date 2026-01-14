@@ -122,63 +122,71 @@ def _split_eq(arg: str) -> Tuple[str, Optional[str]]:
     return arg, None
 
 
-def _hoist_global_flags(argv: List[str]) -> List[str]:
+def _hoist_global_flags(argv: list[str]) -> list[str]:
     """
-    Argparse normally requires global flags to appear before the subcommand.
-    CI (and humans) often do: `mgc submission verify foo.zip --json --db ...`.
-    This function hoists known global flags (and their values) to the front.
+    Allow global flags to appear anywhere in argv (before or after subcommands)
+    by hoisting them to the front before argparse parses.
 
-    Notes:
-    - Preserves order encountered for global flags.
-    - Respects `--` end-of-options marker.
-    - Supports `--flag=value` for value globals.
+    This is required because CI may invoke:
+      mgc run daily --repo-root /path ...
+
+    Without hoisting, argparse treats --repo-root as a subcommand arg and errors.
     """
-    if not argv:
-        return argv
 
-    out: List[str] = []
-    globals_found: List[str] = []
+    # Globals that take a value
+    flags_with_value = {
+        "--db",
+        "--repo-root",
+        "--log-level",
+        "--log-file",
+    }
+
+    # Globals that are booleans (store_true)
+    flags_no_value = {
+        "--log-console",
+        "--json",
+    }
+
+    hoisted: list[str] = []
+    rest: list[str] = []
 
     i = 0
-    while i < len(argv):
-        a = argv[i]
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
 
-        # Respect end-of-options marker.
-        if a == "--":
-            out.extend(argv[i:])
-            break
-
-        k, v = _split_eq(a)
-
-        # no-value globals
-        if k in _GLOBAL_FLAG_NO_VALUE:
-            globals_found.append(k)
+        # Handle --flag=value form
+        if tok.startswith("--") and "=" in tok:
+            name, _val = tok.split("=", 1)
+            if name in flags_with_value or name in flags_no_value:
+                hoisted.append(tok)
+            else:
+                rest.append(tok)
             i += 1
             continue
 
-        # value globals
-        if k in _GLOBAL_FLAG_WITH_VALUE:
-            if v is not None:
-                globals_found.append(f"{k}={v}")
-                i += 1
-                continue
-
-            # consume next token as value if present
-            if i + 1 < len(argv):
-                globals_found.extend([k, argv[i + 1]])
+        # Handle flags that take a value: --flag VALUE
+        if tok in flags_with_value:
+            hoisted.append(tok)
+            if i + 1 < n:
+                hoisted.append(argv[i + 1])
                 i += 2
-                continue
+            else:
+                # Let argparse complain later; keep shape stable
+                i += 1
+            continue
 
-            # missing value; leave it to argparse to error (but keep it in place)
-            out.append(a)
+        # Handle boolean flags: --flag
+        if tok in flags_no_value:
+            hoisted.append(tok)
             i += 1
             continue
 
-        out.append(a)
+        # Otherwise keep in place
+        rest.append(tok)
         i += 1
 
-    return globals_found + out
-
+    return hoisted + rest
 
 # ----------------------------
 # logging (deterministic, no duplicates)
@@ -1384,4 +1392,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

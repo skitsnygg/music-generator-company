@@ -446,6 +446,30 @@ def _stable_int_from_key(key: str, lo: int, hi: int) -> int:
 def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
     name = col.name.lower()
 
+    # Prefer explicit IDs if present (prevents FK failures)
+    # row_data may include these directly, or inside row_data["meta"].
+    meta = row_data.get("meta")
+    meta_dict: Dict[str, Any] = meta if isinstance(meta, dict) else {}
+
+    def _pick_id(key: str) -> Optional[str]:
+        v = row_data.get(key)
+        if v is None:
+            v = row_data.get(key.lower())
+        if v is None and meta_dict:
+            v = meta_dict.get(key) or meta_dict.get(key.lower())
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    if name in ("run_id", "drop_id", "track_id", "marketing_batch_id", "batch_id", "post_id", "id"):
+        v = _pick_id(name)
+        if v is not None:
+            return v
+        # If required and missing, do NOT invent a non-existent FK id; return empty string last.
+        # The calling insert should generally provide these explicitly when schema requires them.
+        return ""
+
     ts = (
         row_data.get("ts")
         or row_data.get("occurred_at")
@@ -478,7 +502,7 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
         return _stable_int_from_key(stable_key, 15, 180)
 
     if name == "provider":
-        return str(row_data.get("provider") or "stub")
+        return str(row_data.get("provider") or meta_dict.get("provider") or "stub")
     if name in ("kind", "event_kind", "type"):
         return str(row_data.get("kind") or "unknown")
     if name in ("actor", "source"):
@@ -501,7 +525,6 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
     if "BLOB" in t:
         return b""
     return ""
-
 
 def _insert_row(con: sqlite3.Connection, table: str, data: Dict[str, Any]) -> None:
     info = db_table_info(con, table)
@@ -1117,6 +1140,12 @@ def db_insert_marketing_post(
     content_col = _detect_marketing_content_col(cols)
     meta_col = _detect_marketing_meta_col(cols)
 
+    # IMPORTANT: satisfy FK/NOT NULL columns if your fixtures schema enforces them.
+    run_id_col = _pick_first_existing(cols, ["run_id"])
+    drop_id_col = _pick_first_existing(cols, ["drop_id"])
+    track_id_col = _pick_first_existing(cols, ["track_id"])
+    batch_id_col = _pick_first_existing(cols, ["batch_id", "marketing_batch_id"])
+
     best_payload = None
     if not content_col and not meta_col:
         best_payload = _best_text_payload_column(
@@ -1125,11 +1154,12 @@ def db_insert_marketing_post(
             reserved=["id", "post_id", "ts", "created_at", "platform", "channel", "destination", "status", "state"],
         )
 
-    meta_to_store = dict(meta)
+    meta_to_store = dict(meta or {})
     if not content_col:
         meta_to_store["content"] = content
 
     data: Dict[str, Any] = {"id": post_id, "post_id": post_id}
+
     if ts_col:
         data[ts_col] = ts
     if platform_col:
@@ -1137,6 +1167,17 @@ def db_insert_marketing_post(
     if status_col:
         data[status_col] = status
 
+    # Satisfy FK columns when present
+    if run_id_col and meta_to_store.get("run_id"):
+        data[run_id_col] = str(meta_to_store["run_id"])
+    if drop_id_col and meta_to_store.get("drop_id"):
+        data[drop_id_col] = str(meta_to_store["drop_id"])
+    if track_id_col and meta_to_store.get("track_id"):
+        data[track_id_col] = str(meta_to_store["track_id"])
+    if batch_id_col and meta_to_store.get("batch_id"):
+        data[batch_id_col] = str(meta_to_store["batch_id"])
+
+    # Store content/meta in the best-fitting schema
     if content_col:
         data[content_col] = content
     elif meta_col:
@@ -1144,11 +1185,11 @@ def db_insert_marketing_post(
     elif best_payload:
         data[best_payload] = stable_json_dumps(meta_to_store) if meta_to_store else content
 
+    # Also populate meta col if it exists and we didn't already
     if meta_col and meta_col not in data:
-        data[meta_col] = stable_json_dumps(meta)
+        data[meta_col] = stable_json_dumps(meta_to_store)
 
     _insert_row(con, "marketing_posts", data)
-
 
 def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> List[sqlite3.Row]:
     cols = {r["name"] for r in con.execute("PRAGMA table_info(marketing_posts)").fetchall()}
