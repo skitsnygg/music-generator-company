@@ -11,17 +11,15 @@ from mgc.providers.base import GenerateRequest, GenerateResult
 # IMPORTANT:
 # Update this import path to wherever your existing RiffusionProvider lives.
 # Example possibilities:
-#   from mgc.riffusion_provider import RiffusionProvider
 #   from mgc.providers.riffusion_provider import RiffusionProvider
-from mgc.riffusion_provider import RiffusionProvider  # <- change if needed
-
+#   from mgc.providers.riffusion_provider import RiffusionProvider
+from mgc.providers.riffusion_provider import RiffusionProvider
 
 def _stable_int_from_key(key: str, lo: int, hi: int) -> int:
     if hi <= lo:
         return lo
     h = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
     return lo + (h % (hi - lo + 1))
-
 
 class RiffusionAdapter:
     name = "riffusion"
