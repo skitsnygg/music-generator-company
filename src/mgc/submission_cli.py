@@ -6,7 +6,7 @@ Build + verify deterministic submission ZIPs.
 
 Design goals:
 - No DB mutation.
-- Deterministic ZIP outputs (stable ordering + fixed timestamps).
+- Deterministic ZIP outputs (stable ordering + fixed timestamps + fixed compression).
 - Validate bundle before packaging.
 - Verify one or more submission.zip files (unzip + validate_bundle).
 - Optional: embed a static web player build inside the submission ZIP (submission/web).
@@ -36,6 +36,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -84,16 +85,35 @@ def _posix_rel(p: Path) -> str:
 
 
 # -----------------------------
-# ZIP utilities
+# ZIP utilities (deterministic)
 # -----------------------------
+
+_FIXED_ZIP_DT = (2020, 1, 1, 0, 0, 0)  # YYYY,MM,DD,hh,mm,ss
+_ZIP_COMPRESSLEVEL = 9
+
+
+def _zipinfo_for_file(arcname: str, *, is_executable: bool = False) -> zipfile.ZipInfo:
+    zi = zipfile.ZipInfo(filename=arcname, date_time=_FIXED_ZIP_DT)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.create_system = 3  # Unix
+
+    # Stable permissions
+    mode = 0o755 if is_executable else 0o644
+    zi.external_attr = (mode & 0xFFFF) << 16
+    return zi
 
 
 def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
     """
     Add directory contents to zip with deterministic ordering and fixed timestamps.
+
+    - stable file list (sorted arcname)
+    - fixed ZipInfo date_time
+    - fixed compression + compresslevel
+    - normalized permissions
     """
     root = root.resolve()
-    entries: list[tuple[str, Path]] = []
+    entries: list[tuple[str, Path, bool]] = []
 
     for dp, dn, fn in os.walk(root):
         dn.sort()
@@ -103,17 +123,26 @@ def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
             file_path = (dp_path / name).resolve()
             rel = file_path.relative_to(root)
             arcname = f"{arc_root}/{_posix_rel(rel)}"
-            entries.append((arcname, file_path))
 
-    entries.sort(key=lambda x: x[0])  # deterministic
+            try:
+                st = file_path.stat()
+                is_exec = bool(st.st_mode & stat.S_IXUSR)
+            except Exception:
+                is_exec = False
 
-    fixed_dt = (2020, 1, 1, 0, 0, 0)
-    for arcname, file_path in entries:
+            entries.append((arcname, file_path, is_exec))
+
+    entries.sort(key=lambda x: x[0])  # deterministic by archive path
+
+    for arcname, file_path, is_exec in entries:
         data = file_path.read_bytes()
-        zi = zipfile.ZipInfo(filename=arcname, date_time=fixed_dt)
-        zi.compress_type = zipfile.ZIP_DEFLATED
-        zi.external_attr = 0o644 << 16
-        zf.writestr(zi, data)
+        zi = _zipinfo_for_file(arcname, is_executable=is_exec)
+        zf.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=_ZIP_COMPRESSLEVEL)
+
+
+def _zip_write_text(zf: zipfile.ZipFile, arcname: str, text: str) -> None:
+    zi = _zipinfo_for_file(arcname, is_executable=False)
+    zf.writestr(zi, text.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED, compresslevel=_ZIP_COMPRESSLEVEL)
 
 
 # -----------------------------
@@ -288,7 +317,8 @@ def _build_readme(evidence_obj: Dict[str, Any], *, included_web: bool) -> str:
     bundle_track = paths.get("bundle_track_path", paths.get("bundle_track", ""))
     playlist = paths.get("playlist_path", paths.get("playlist", "playlist.json"))
 
-    packaged_at = ts or _utc_now_iso()
+    # Determinism: never use wall-clock time here.
+    packaged_at = ts or "2020-01-01T00:00:00+00:00"
 
     lines = [
         "# Music Generator Company – Drop Submission",
@@ -365,6 +395,7 @@ def _build_web_bundle_from_portable_bundle(
         str(web_out_dir),
         "--clean",
         "--fail-if-empty",
+        "--strip-paths",  # NEW: makes playlist.json + web_manifest.json portable/deterministic
         "--json",
     ]
 
@@ -377,7 +408,6 @@ def _build_web_bundle_from_portable_bundle(
         env=os.environ.copy(),
     )
 
-    # Expect strict JSON on stdout
     stdout = (proc.stdout or "").strip()
     if proc.returncode != 0:
         msg = proc.stderr.strip() or "web build failed"
@@ -394,12 +424,10 @@ def _build_web_bundle_from_portable_bundle(
     if not isinstance(payload, dict) or not payload.get("ok", False):
         raise RuntimeError(f"web build returned ok=false: {payload}")
 
-    # Tight contract: require at least one audio file copied into the web bundle
     copied = int(payload.get("copied_count", 0) or 0)
     if copied < 1:
         raise RuntimeError(f"web build copied_count={copied} (expected >= 1): {payload}")
 
-    # Basic sanity checks on output shape
     idx = web_out_dir / "index.html"
     pl = web_out_dir / "playlist.json"
     tr = web_out_dir / "tracks"
@@ -440,28 +468,23 @@ def _package_bundle_to_zip(
                 web_out_dir=web_dst,
             )
 
-        (pkg_root / "README.md").write_text(
-            _build_readme(evidence_obj, included_web=include_web),
-            encoding="utf-8",
-        )
+        readme_text = _build_readme(evidence_obj, included_web=include_web)
+        (pkg_root / "README.md").write_text(readme_text, encoding="utf-8")
 
         if out_path.exists():
             out_path.unlink()
         _safe_mkdir(out_path.parent)
 
-        with zipfile.ZipFile(str(out_path), mode="w") as zf:
-            fixed_dt = (2020, 1, 1, 0, 0, 0)
-
-            # README.md
-            zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            zi.external_attr = 0o644 << 16
-            zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
-
-            # drop bundle
+        with zipfile.ZipFile(
+            str(out_path),
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=_ZIP_COMPRESSLEVEL,
+            strict_timestamps=False,
+        ) as zf:
+            _zip_write_text(zf, "submission/README.md", readme_text)
             _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
 
-            # optional web
             if include_web and (pkg_root / "web").exists():
                 _zip_add_dir(zf, pkg_root / "web", arc_root="submission/web")
 
@@ -627,7 +650,6 @@ def _verify_optional_web(extracted_root: Path) -> None:
     if not tracks.exists() or not tracks.is_dir():
         raise FileNotFoundError(f"web bundle missing tracks/: {tracks}")
 
-    # require at least one audio file (mp3/wav) in web/tracks
     audio = list(tracks.glob("*.mp3")) + list(tracks.glob("*.wav"))
     if not audio:
         raise ValueError(f"web bundle has no audio files under {tracks} (expected *.mp3 or *.wav)")

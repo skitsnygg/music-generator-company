@@ -301,6 +301,24 @@ def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
     return (playlist_dir / rp).resolve()
 
 
+def _display_path_strip(p: Path, *, base_dir: Path) -> str:
+    """
+    Make a stable, portable display path for JSON outputs that will be written to disk
+    (playlist.json, web_manifest.json), avoiding temp dirs/absolute paths when possible.
+    """
+    try:
+        rp = p.resolve()
+    except Exception:
+        rp = p
+    try:
+        # If under base_dir, make it relative.
+        rel = rp.relative_to(base_dir.resolve())
+        return _as_posix(rel)
+    except Exception:
+        # Otherwise, fall back to basename only (portable; avoids temp paths).
+        return rp.name
+
+
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(args.playlist)).expanduser().resolve()
     if not playlist_path.exists():
@@ -366,6 +384,12 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     bundled: List[Dict[str, Any]] = []
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
+    strip_paths = bool(getattr(args, "strip_paths", False))
+
+    # For deterministic outputs written to disk, never embed absolute temp paths:
+    playlist_display = (
+        _display_path_strip(playlist_path, base_dir=playlist_dir) if strip_paths else str(playlist_path)
+    )
 
     for i, raw in enumerate(raw_paths):
         rp = _resolve_input_path(raw, playlist_dir=playlist_dir)
@@ -378,8 +402,8 @@ def cmd_web_build(args: argparse.Namespace) -> int:
             bundled.append(
                 {
                     "index": i,
-                    "source": raw,
-                    "resolved": str(rp),
+                    "source": raw if not strip_paths else str(Path(raw)).replace("\\", "/"),
+                    "resolved": (str(rp) if not strip_paths else _display_path_strip(rp, base_dir=playlist_dir)),
                     "ok": False,
                     "reason": "missing",
                     "resolved_from": resolved_from,
@@ -389,6 +413,9 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
         dest = tracks_dir / rp.name
         if dest.exists():
+            # Collision resolution is deterministic given:
+            # - clean output dir
+            # - stable raw_paths order
             stem = dest.stem
             suf = dest.suffix
             n = 1
@@ -399,13 +426,14 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     break
                 n += 1
 
-        shutil.copy2(rp, dest)
+        # Copy bytes; metadata not important for our determinism gates (hash is on bytes).
+        shutil.copyfile(rp, dest)
         copied += 1
         bundled.append(
             {
                 "index": i,
-                "source": raw,
-                "resolved": str(rp),
+                "source": raw if not strip_paths else str(Path(raw)).replace("\\", "/"),
+                "resolved": (str(rp) if not strip_paths else _display_path_strip(rp, base_dir=playlist_dir)),
                 "ok": True,
                 "bundle_path": _as_posix(dest.relative_to(out_dir)),
                 "resolved_from": resolved_from,
@@ -442,9 +470,10 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
 
+    # Files written to disk must be stable across runs (esp. when built under temp dirs).
     web_playlist = {
         "version": 1,
-        "source_playlist": str(playlist_path),
+        "source_playlist": playlist_display,
         "resolved_from": resolved_from,
         "tracks": [t for t in bundled if t.get("ok")],
     }
@@ -507,24 +536,25 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 """
     index_path.write_text(index_html, encoding="utf-8", newline="\n")
 
-    _write_json(
-        manifest_path,
-        {
-            "ok": True,
-            "playlist": str(playlist_path),
-            "out_dir": str(out_dir),
-            "track_count": len(raw_paths),
-            "copied_count": copied,
-            "missing_count": missing,
-            "tracks_dir": _as_posix(tracks_dir.relative_to(out_dir)),
-            "playlist_json": _as_posix(out_playlist_path.relative_to(out_dir)),
-            "index_html": _as_posix(index_path.relative_to(out_dir)),
-            "resolved_from": resolved_from,
-            "items": bundled,
-            "db_resolution": db_resolution,
-        },
-    )
+    manifest_obj: Dict[str, Any] = {
+        "ok": True,
+        "playlist": playlist_display,
+        # For portability/determinism, never embed temp out_dir paths in files on disk.
+        "out_dir": ("." if strip_paths else str(out_dir)),
+        "track_count": len(raw_paths),
+        "copied_count": copied,
+        "missing_count": missing,
+        "tracks_dir": _as_posix(tracks_dir.relative_to(out_dir)),
+        "playlist_json": _as_posix(out_playlist_path.relative_to(out_dir)),
+        "index_html": _as_posix(index_path.relative_to(out_dir)),
+        "resolved_from": resolved_from,
+        "items": bundled,
+        "db_resolution": db_resolution,
+        "strip_paths": strip_paths,
+    }
+    _write_json(manifest_path, manifest_obj)
 
+    # CLI JSON output can remain absolute (debugging), but keep it stable JSON.
     out_obj: Dict[str, Any] = {
         "ok": True,
         "playlist": str(playlist_path),
@@ -534,6 +564,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "missing_count": missing,
         "manifest_path": str(manifest_path),
         "resolved_from": resolved_from,
+        "strip_paths": strip_paths,
     }
     if db_resolution is not None:
         out_obj["db_resolution"] = db_resolution
@@ -595,6 +626,12 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
         dest="require_bundled_tracks",
         action="store_true",
         help="Exit nonzero if DB resolution was used (forces portable bundle playlists with file paths)",
+    )
+    build.add_argument(
+        "--strip-paths",
+        dest="strip_paths",
+        action="store_true",
+        help="Write portable outputs: avoid embedding absolute/temp paths in playlist.json and web_manifest.json",
     )
     build.set_defaults(func=cmd_web_build)
 

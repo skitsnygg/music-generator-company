@@ -19,6 +19,10 @@ set -euo pipefail
 # - In CI, DO NOT assume repo-local data/ exists. Use $MGC_ARTIFACTS_DIR outputs.
 # - Keeps stdout clean where possible; writes a ci_gate.log always.
 # - Hygiene: if fixtures/ci_db.sqlite is tracked, restores it on exit.
+#
+# NEW:
+# - Determinism hash gate for submission.zip (build twice from same evidence-root).
+# - Determinism hash gate for web bundle (build twice from same playlist.json).
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -67,6 +71,28 @@ _dump_tree_quick() {
   else
     info "tree skipped (missing dir): $root"
   fi
+}
+
+_sha256_file() {
+  local f="$1"
+  shasum -a 256 "$f" | awk '{print $1}'
+}
+
+_tree_sha256() {
+  # Deterministic tree hash:
+  # - list files relative to root
+  # - sha256 each file
+  # - sha256 the combined listing (filehash + two spaces + relpath)
+  local root="$1"
+  (
+    cd "$root"
+    find . -type f -print | LC_ALL=C sort | while IFS= read -r p; do
+      local rel="${p#./}"
+      local h
+      h="$(shasum -a 256 "$rel" | awk '{print $1}')"
+      printf "%s  %s\n" "$h" "$rel"
+    done
+  ) | shasum -a 256 | awk '{print $1}'
 }
 
 autonomous_smoke() {
@@ -136,6 +162,99 @@ autonomous_smoke() {
   info "submission artifact check OK"
 }
 
+submission_zip_determinism_gate() {
+  local evidence_root="$1"
+  local out_root="$2"
+
+  info "determinism gate: submission.zip (evidence-root=$evidence_root)"
+  mkdir -p "$out_root"
+
+  local zip1="$out_root/run1/submission.zip"
+  local zip2="$out_root/run2/submission.zip"
+  mkdir -p "$(dirname "$zip1")" "$(dirname "$zip2")"
+
+  rm -f "$zip1" "$zip2" >/dev/null 2>&1 || true
+
+  "$PYTHON" -m mgc.main submission latest \
+    --db "$DB" \
+    --evidence-root "$evidence_root" \
+    --out "$zip1" \
+    --json \
+    >"$out_root/run1/build.json"
+
+  "$PYTHON" -m mgc.main submission latest \
+    --db "$DB" \
+    --evidence-root "$evidence_root" \
+    --out "$zip2" \
+    --json \
+    >"$out_root/run2/build.json"
+
+  if [[ ! -s "$zip1" || ! -s "$zip2" ]]; then
+    err "submission determinism: missing zip outputs"
+    _dump_tree_quick "$out_root" >&2 || true
+    return 2
+  fi
+
+  local h1 h2
+  h1="$(_sha256_file "$zip1")"
+  h2="$(_sha256_file "$zip2")"
+  info "submission.zip run1_sha256=$h1"
+  info "submission.zip run2_sha256=$h2"
+
+  if [[ "$h1" != "$h2" ]]; then
+    err "submission.zip determinism FAIL (sha mismatch)"
+    err "hint: diff zip listing: diff -u <(unzip -l '$zip1') <(unzip -l '$zip2')"
+    return 1
+  fi
+
+  info "submission.zip determinism OK"
+}
+
+web_bundle_determinism_gate() {
+  local playlist_path="$1"
+  local out_root="$2"
+
+  # Only run if web subcommand exists.
+  if ! "$PYTHON" -m mgc.main --help 2>/dev/null | grep -qE '\bweb\b'; then
+    info "web bundle determinism skipped (no web subcommand)"
+    return 0
+  fi
+
+  info "determinism gate: web bundle (playlist=$playlist_path)"
+  mkdir -p "$out_root"
+
+  local d1="$out_root/run1"
+  local d2="$out_root/run2"
+
+  rm -rf "$d1" "$d2" >/dev/null 2>&1 || true
+
+  "$PYTHON" -m mgc.main web build --playlist "$playlist_path" --out-dir "$d1" --clean --strip-paths >/dev/null
+  "$PYTHON" -m mgc.main web build --playlist "$playlist_path" --out-dir "$d2" --clean --strip-paths >/dev/null
+
+  if [[ ! -d "$d1" || ! -d "$d2" ]]; then
+    err "web bundle determinism: missing output dirs"
+    _dump_tree_quick "$out_root" >&2 || true
+    return 2
+  fi
+
+  local h1 h2
+  h1="$(_tree_sha256 "$d1")"
+  h2="$(_tree_sha256 "$d2")"
+  info "web bundle run1_tree_sha256=$h1"
+  info "web bundle run2_tree_sha256=$h2"
+
+  if [[ "$h1" != "$h2" ]]; then
+    err "web bundle determinism FAIL (tree hash mismatch)"
+    err "hint: write per-file sha lists and diff them:"
+    err "  (cd '$d1' && find . -type f -print | LC_ALL=C sort | xargs -I{} shasum -a 256 \"{}\") > '$out_root/run1_files.sha'"
+    err "  (cd '$d2' && find . -type f -print | LC_ALL=C sort | xargs -I{} shasum -a 256 \"{}\") > '$out_root/run2_files.sha'"
+    err "  diff -u '$out_root/run1_files.sha' '$out_root/run2_files.sha' || true"
+    return 1
+  fi
+
+  info "web bundle determinism OK"
+}
+
 run_gate() {
   info "MGC_ARTIFACTS_DIR=${MGC_ARTIFACTS_DIR}"
   info "Repo: $repo_root"
@@ -155,7 +274,23 @@ run_gate() {
   python_compile
 
   # Primary smoke test: end-to-end autonomous run (portable bundle + submission zip)
-  autonomous_smoke "$ARTIFACTS_DIR/auto"
+  local auto_dir="$ARTIFACTS_DIR/auto"
+  autonomous_smoke "$auto_dir"
+
+  # Determinism gates that use the portable outputs from autonomous smoke:
+  # 1) submission.zip built from the same evidence-root must be byte-identical.
+  submission_zip_determinism_gate "$auto_dir" "$ARTIFACTS_DIR/determinism/submission_zip"
+
+  # 2) web bundle built from the same playlist.json must be tree-identical (if web exists).
+  # Find the bundle playlist created by autonomous smoke (prefer the first match).
+  local playlist_path
+  playlist_path="$(find "$auto_dir" -maxdepth 6 -type f -name "playlist.json" | head -n 1 || true)"
+  if [[ -z "$playlist_path" ]]; then
+    err "No playlist.json found under auto_dir=$auto_dir for web determinism gate"
+    _dump_tree_quick "$auto_dir" >&2 || true
+    return 2
+  fi
+  web_bundle_determinism_gate "$playlist_path" "$ARTIFACTS_DIR/determinism/web_bundle"
 
   # Optional: if drops CLI exists, ensure global --json hoisting still works.
   # Keep it non-fatal if drops command isn't present.
