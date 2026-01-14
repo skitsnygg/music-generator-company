@@ -71,11 +71,11 @@ run_drop_and_web_build() {
 
 hash_listing() {
   local root="$1"
-  "$PYTHON" - <<'PY'
-import hashlib, sys
+  ROOT="$root" "$PYTHON" - <<'PY'
+import hashlib, os
 from pathlib import Path
 
-root = Path(sys.argv[1]).resolve()
+root = Path(os.environ["ROOT"]).resolve()
 items = []
 for p in root.rglob("*"):
     if p.is_file():
