@@ -9,11 +9,12 @@ Design goals:
 - Deterministic ZIP outputs (stable ordering + fixed timestamps).
 - Validate bundle before packaging.
 - Verify one or more submission.zip files (unzip + validate_bundle).
+- Optional: embed a static web player build inside the submission ZIP (submission/web).
 
 Commands:
-  mgc submission build   --bundle-dir <dir> --out submission.zip
-  mgc submission build   --drop-id <drop_id> --db data/db.sqlite --out submission.zip
-  mgc submission latest  --db data/db.sqlite --out submission.zip [--evidence-root data/evidence]
+  mgc submission build   --bundle-dir <dir> --out submission.zip [--with-web]
+  mgc submission build   --drop-id <drop_id> --db data/db.sqlite --out submission.zip [--with-web]
+  mgc submission latest  --db data/db.sqlite --out submission.zip [--evidence-root data/evidence] [--with-web]
   mgc submission verify  <zip1> [zip2 ...]
   mgc submission verify  --zip <zip1> --zip <zip2> ...
 
@@ -21,6 +22,11 @@ JSON behavior:
 - This module does NOT define any per-subcommand --json flags.
 - It relies exclusively on mgc.main's GLOBAL --json (args.json).
 - In JSON mode, commands emit valid JSON to stdout and nothing else.
+
+Notes on --with-web:
+- Builds a static web bundle from the portable bundle’s playlist.json and bundled audio.
+- Runs `mgc.main web build` in a subprocess with cwd=bundle_dir so relative paths resolve.
+- Includes output under submission/web in the resulting ZIP.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -44,6 +51,7 @@ from mgc.bundle_validate import validate_bundle
 # JSON + time utilities
 # -----------------------------
 
+
 def _json_mode(args: argparse.Namespace) -> bool:
     # Only global --json is honored (provided by mgc.main).
     return bool(getattr(args, "json", False))
@@ -56,7 +64,7 @@ def _json_dumps(obj: Any) -> str:
 
 def _emit_json(obj: Any) -> None:
     # JSON mode must always emit valid JSON to stdout.
-    sys.stdout.write(_json_dumps(obj) + "\n")
+    print(_json_dumps(obj))
 
 
 def _utc_now_iso() -> str:
@@ -78,6 +86,7 @@ def _posix_rel(p: Path) -> str:
 # -----------------------------
 # ZIP utilities
 # -----------------------------
+
 
 def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
     """
@@ -110,6 +119,7 @@ def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
 # -----------------------------
 # DB + bundle discovery helpers
 # -----------------------------
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
@@ -262,7 +272,8 @@ def _find_latest_bundle_dir_by_scan(evidence_root: Path) -> Optional[Path]:
 # README + packaging
 # -----------------------------
 
-def _build_readme(evidence_obj: Dict[str, Any]) -> str:
+
+def _build_readme(evidence_obj: Dict[str, Any], *, included_web: bool) -> str:
     ids = evidence_obj.get("ids") if isinstance(evidence_obj.get("ids"), dict) else {}
     paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
 
@@ -279,37 +290,135 @@ def _build_readme(evidence_obj: Dict[str, Any]) -> str:
 
     packaged_at = ts or _utc_now_iso()
 
-    return "\n".join(
-        [
-            "# Music Generator Company – Drop Submission",
-            "",
-            "## Identifiers",
-            f"- drop_id: {drop_id}",
-            f"- run_id: {run_id}",
-            f"- track_id: {track_id}",
-            "",
-            "## Run metadata",
-            f"- ts: {ts}",
-            f"- context: {context}",
-            f"- provider: {provider}",
-            f"- deterministic: {deterministic}",
-            "",
-            "## Contents",
-            f"- {playlist}: playlist pointing at bundled audio",
-            f"- {bundle_track}: bundled audio asset",
-            "- daily_evidence.json: provenance + sha256 hashes",
-            "",
-            "## How to review",
-            "1) Inspect playlist.json (it references the bundled track under tracks/).",
-            "2) Confirm hashes in daily_evidence.json match the files in the bundle.",
-            "",
-            "## Notes",
-            f"- Packaged at: {packaged_at}",
+    lines = [
+        "# Music Generator Company – Drop Submission",
+        "",
+        "## Identifiers",
+        f"- drop_id: {drop_id}",
+        f"- run_id: {run_id}",
+        f"- track_id: {track_id}",
+        "",
+        "## Run metadata",
+        f"- ts: {ts}",
+        f"- context: {context}",
+        f"- provider: {provider}",
+        f"- deterministic: {deterministic}",
+        "",
+        "## Contents",
+        f"- {playlist}: playlist pointing at bundled audio",
+        f"- {bundle_track}: bundled audio asset",
+        "- daily_evidence.json: provenance + sha256 hashes",
+    ]
+
+    if included_web:
+        lines += [
+            "- web/: static web player bundle (index.html + tracks/)",
         ]
-    ) + "\n"
+
+    lines += [
+        "",
+        "## How to review",
+        "1) Inspect playlist.json (it references the bundled track under tracks/).",
+        "2) Confirm hashes in daily_evidence.json match the files in the bundle.",
+    ]
+
+    if included_web:
+        lines += [
+            "3) Open web/index.html (or serve web/ with any static server) to listen.",
+        ]
+
+    lines += [
+        "",
+        "## Notes",
+        f"- Packaged at: {packaged_at}",
+    ]
+
+    return "\n".join(lines) + "\n"
 
 
-def _package_bundle_to_zip(*, bundle_dir: Path, out_path: Path, web_dir: Optional[Path]) -> None:
+def _build_web_bundle_from_portable_bundle(
+    *,
+    bundle_dir: Path,
+    web_out_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Build a web bundle from a *portable bundle dir* using mgc.main web build.
+
+    Critical detail:
+    - We run with cwd=bundle_dir so any relative audio paths inside playlist.json
+      resolve against the bundle directory (not the repo root).
+    """
+    playlist_path = bundle_dir / "playlist.json"
+    if not playlist_path.exists():
+        raise FileNotFoundError(f"bundle missing playlist.json: {playlist_path}")
+
+    # Use the same python running this process
+    cmd = [
+        sys.executable,
+        "-m",
+        "mgc.main",
+        "web",
+        "build",
+        "--playlist",
+        str(playlist_path),
+        "--out-dir",
+        str(web_out_dir),
+        "--clean",
+        "--fail-if-empty",
+        "--json",
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(bundle_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    # Expect strict JSON on stdout
+    stdout = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or "web build failed"
+        raise RuntimeError(f"web build failed (rc={proc.returncode}): {msg}")
+
+    try:
+        payload = json.loads(stdout) if stdout else {}
+    except Exception:
+        raise RuntimeError(
+            "web build did not emit valid JSON. "
+            f"stdout={stdout[:200]!r} stderr={(proc.stderr or '')[:200]!r}"
+        )
+
+    if not isinstance(payload, dict) or not payload.get("ok", False):
+        raise RuntimeError(f"web build returned ok=false: {payload}")
+
+    # Tight contract: require at least one audio file copied into the web bundle
+    copied = int(payload.get("copied_count", 0) or 0)
+    if copied < 1:
+        raise RuntimeError(f"web build copied_count={copied} (expected >= 1): {payload}")
+
+    # Basic sanity checks on output shape
+    idx = web_out_dir / "index.html"
+    pl = web_out_dir / "playlist.json"
+    tr = web_out_dir / "tracks"
+    if not idx.exists():
+        raise FileNotFoundError(f"web bundle missing index.html: {idx}")
+    if not pl.exists():
+        raise FileNotFoundError(f"web bundle missing playlist.json: {pl}")
+    if not tr.exists() or not tr.is_dir():
+        raise FileNotFoundError(f"web bundle missing tracks/: {tr}")
+
+    return payload
+
+
+def _package_bundle_to_zip(
+    *,
+    bundle_dir: Path,
+    out_path: Path,
+    include_web: bool,
+) -> Dict[str, Any]:
     validate_bundle(bundle_dir)
 
     evidence_main = bundle_dir / "daily_evidence.json"
@@ -323,12 +432,18 @@ def _package_bundle_to_zip(*, bundle_dir: Path, out_path: Path, web_dir: Optiona
         drop_bundle_dst = pkg_root / "drop_bundle"
         shutil.copytree(bundle_dir, drop_bundle_dst)
 
-        (pkg_root / "README.md").write_text(_build_readme(evidence_obj), encoding="utf-8")
+        web_build_meta: Optional[Dict[str, Any]] = None
+        if include_web:
+            web_dst = pkg_root / "web"
+            web_build_meta = _build_web_bundle_from_portable_bundle(
+                bundle_dir=bundle_dir,
+                web_out_dir=web_dst,
+            )
 
-        if web_dir is not None:
-            if not web_dir.exists() or not web_dir.is_dir():
-                raise FileNotFoundError(f"--web-dir not found: {web_dir}")
-            shutil.copytree(web_dir, pkg_root / "web")
+        (pkg_root / "README.md").write_text(
+            _build_readme(evidence_obj, included_web=include_web),
+            encoding="utf-8",
+        )
 
         if out_path.exists():
             out_path.unlink()
@@ -336,19 +451,27 @@ def _package_bundle_to_zip(*, bundle_dir: Path, out_path: Path, web_dir: Optiona
 
         with zipfile.ZipFile(str(out_path), mode="w") as zf:
             fixed_dt = (2020, 1, 1, 0, 0, 0)
+
+            # README.md
             zi = zipfile.ZipInfo(filename="submission/README.md", date_time=fixed_dt)
             zi.compress_type = zipfile.ZIP_DEFLATED
             zi.external_attr = 0o644 << 16
             zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
 
+            # drop bundle
             _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
-            if (pkg_root / "web").exists():
+
+            # optional web
+            if include_web and (pkg_root / "web").exists():
                 _zip_add_dir(zf, pkg_root / "web", arc_root="submission/web")
+
+    return {"included_web": include_web, "web_build": web_build_meta}
 
 
 # -----------------------------
 # Command implementations
 # -----------------------------
+
 
 def cmd_submission_build(args: argparse.Namespace) -> int:
     out_path = Path(args.out).expanduser().resolve()
@@ -381,10 +504,14 @@ def cmd_submission_build(args: argparse.Namespace) -> int:
                 "Re-run with --bundle-dir pointing at the portable bundle directory."
             )
 
-    web_dir = Path(args.web_dir).expanduser().resolve() if getattr(args, "web_dir", None) else None
+    include_web = bool(getattr(args, "with_web", False))
 
     try:
-        _package_bundle_to_zip(bundle_dir=bundle_dir, out_path=out_path, web_dir=web_dir)
+        meta = _package_bundle_to_zip(
+            bundle_dir=bundle_dir,
+            out_path=out_path,
+            include_web=include_web,
+        )
     except Exception as e:
         if _json_mode(args):
             _emit_json({"ok": False, "cmd": "submission.build", "error": str(e)})
@@ -392,21 +519,22 @@ def cmd_submission_build(args: argparse.Namespace) -> int:
         raise
 
     if _json_mode(args):
-        _emit_json(
-            {
-                "ok": True,
-                "cmd": "submission.build",
-                "out": str(out_path),
-                "bundle_dir": str(bundle_dir),
-                "included_web": web_dir is not None,
-            }
-        )
-        return 0
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "cmd": "submission.build",
+            "out": str(out_path),
+            "bundle_dir": str(bundle_dir),
+            "included_web": bool(meta.get("included_web", False)),
+        }
+        if meta.get("web_build") is not None:
+            payload["web_build"] = meta["web_build"]
+        _emit_json(payload)
+    else:
+        print(f"[submission] wrote: {out_path}")
+        print(f"[submission] bundle: {bundle_dir}")
+        if include_web:
+            print("[submission] included web bundle: submission/web")
 
-    sys.stdout.write(f"[submission] wrote: {out_path}\n")
-    sys.stdout.write(f"[submission] bundle: {bundle_dir}\n")
-    if web_dir is not None:
-        sys.stdout.write(f"[submission] web: {web_dir}\n")
     return 0
 
 
@@ -446,10 +574,14 @@ def cmd_submission_latest(args: argparse.Namespace) -> int:
             return 2
         raise SystemExit(msg)
 
-    web_dir = Path(args.web_dir).expanduser().resolve() if getattr(args, "web_dir", None) else None
+    include_web = bool(getattr(args, "with_web", False))
 
     try:
-        _package_bundle_to_zip(bundle_dir=bundle_dir, out_path=out_path, web_dir=web_dir)
+        meta = _package_bundle_to_zip(
+            bundle_dir=bundle_dir,
+            out_path=out_path,
+            include_web=include_web,
+        )
     except Exception as e:
         if _json_mode(args):
             _emit_json({"ok": False, "cmd": "submission.latest", "error": str(e)})
@@ -457,22 +589,48 @@ def cmd_submission_latest(args: argparse.Namespace) -> int:
         raise
 
     if _json_mode(args):
-        _emit_json(
-            {
-                "ok": True,
-                "cmd": "submission.latest",
-                "out": str(out_path),
-                "bundle_dir": str(bundle_dir),
-                "included_web": web_dir is not None,
-            }
-        )
-        return 0
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "cmd": "submission.latest",
+            "out": str(out_path),
+            "bundle_dir": str(bundle_dir),
+            "included_web": bool(meta.get("included_web", False)),
+        }
+        if meta.get("web_build") is not None:
+            payload["web_build"] = meta["web_build"]
+        _emit_json(payload)
+    else:
+        print(f"[submission] wrote: {out_path}")
+        print(f"[submission] bundle: {bundle_dir}")
+        if include_web:
+            print("[submission] included web bundle: submission/web")
 
-    sys.stdout.write(f"[submission] wrote: {out_path}\n")
-    sys.stdout.write(f"[submission] bundle: {bundle_dir}\n")
-    if web_dir is not None:
-        sys.stdout.write(f"[submission] web: {web_dir}\n")
     return 0
+
+
+def _verify_optional_web(extracted_root: Path) -> None:
+    """
+    If submission/web exists, verify it looks like a valid web bundle.
+    """
+    web_dir = extracted_root / "submission" / "web"
+    if not web_dir.exists():
+        return  # optional
+
+    idx = web_dir / "index.html"
+    pl = web_dir / "playlist.json"
+    tracks = web_dir / "tracks"
+
+    if not idx.exists():
+        raise FileNotFoundError(f"web bundle missing index.html: {idx}")
+    if not pl.exists():
+        raise FileNotFoundError(f"web bundle missing playlist.json: {pl}")
+    if not tracks.exists() or not tracks.is_dir():
+        raise FileNotFoundError(f"web bundle missing tracks/: {tracks}")
+
+    # require at least one audio file (mp3/wav) in web/tracks
+    audio = list(tracks.glob("*.mp3")) + list(tracks.glob("*.wav"))
+    if not audio:
+        raise ValueError(f"web bundle has no audio files under {tracks} (expected *.mp3 or *.wav)")
 
 
 def cmd_submission_verify(args: argparse.Namespace) -> int:
@@ -480,6 +638,7 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
     Verify one or more submission.zip files by:
       - unzipping to a temp dir
       - validating submission/drop_bundle via validate_bundle()
+      - if submission/web exists, validate it is usable (index.html + playlist.json + tracks/*.(mp3|wav))
 
     Accepts:
       - positional zips: mgc submission verify a.zip b.zip
@@ -526,6 +685,7 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
                         raise FileNotFoundError(f"extracted bundle missing: {bundle_dir}")
 
                     validate_bundle(bundle_dir)
+                    _verify_optional_web(td_path)
 
             item["ok"] = True
 
@@ -539,14 +699,12 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
 
     if _json_mode(args):
         _emit_json(payload)
-        return 0 if all_ok else 2
-
-    # Human mode: keep stdout/stderr separated (no mixed "looks like JSON" output).
-    for r in results:
-        if r["ok"]:
-            sys.stdout.write(f"OK: {r['zip']}\n")
-        else:
-            sys.stderr.write(f"INVALID: {r['zip']}\n{r['error']}\n")
+    else:
+        for r in results:
+            if r["ok"]:
+                print(f"OK: {r['zip']}")
+            else:
+                print(f"INVALID: {r['zip']}\n{r['error']}")
 
     return 0 if all_ok else 2
 
@@ -554,6 +712,7 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
 # -----------------------------
 # CLI wiring (mgc.main imports this)
 # -----------------------------
+
 
 def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("submission", help="Build submission bundles")
@@ -567,9 +726,9 @@ def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> No
     build.add_argument("--drop-id", default=None, help="Drop id to locate bundle from DB (best-effort)")
     build.add_argument("--db", default=None, help="DB path for --drop-id lookup")
     build.add_argument(
-        "--web-dir",
-        default=None,
-        help="Optional static web build directory to include under submission/web",
+        "--with-web",
+        action="store_true",
+        help="Include a static web player bundle under submission/web (built from bundle playlist.json)",
     )
     build.set_defaults(func=cmd_submission_build)
 
@@ -578,9 +737,9 @@ def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> No
     latest.add_argument("--db", default="data/db.sqlite", help="DB path")
     latest.add_argument("--evidence-root", default="data/evidence", help="Evidence root to scan if DB lookup fails")
     latest.add_argument(
-        "--web-dir",
-        default=None,
-        help="Optional static web build directory to include under submission/web",
+        "--with-web",
+        action="store_true",
+        help="Include a static web player bundle under submission/web (built from bundle playlist.json)",
     )
     latest.set_defaults(func=cmd_submission_latest)
 
