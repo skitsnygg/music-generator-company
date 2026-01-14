@@ -1,3 +1,4 @@
+# .github/workflows/release.yml
 name: Release
 
 on:
@@ -5,12 +6,12 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # needed to upload assets to the GitHub Release
 
     steps:
       - name: Checkout repo
@@ -20,11 +21,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
-          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
-          echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_test" >> "$GITHUB_ENV"
-          echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci" "${RUNNER_TEMP}/mgc_drop_test" "${RUNNER_TEMP}/mgc_web"
+          echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/release" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/artifacts/release"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,6 +36,7 @@ jobs:
           set -euxo pipefail
           python -m pip install -U pip
           python -m pip install -e .
+          python -m pip install -U build
 
       - name: Install ffmpeg (ffmpeg + ffprobe)
         shell: bash
@@ -48,104 +47,39 @@ jobs:
           ffmpeg -version
           ffprobe -version
 
-      - name: Build fixture DB (copy to temp; reset repo file)
+      - name: Build fixture DB (temp copy)
         shell: bash
         run: |
           set -euxo pipefail
           python scripts/make_fixture_db.py
           cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
           echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
+
+          # Keep checkout clean
           git checkout -- fixtures/ci_db.sqlite || true
 
-      - name: Run CI gate (deterministic)
+      - name: Run full CI gate (release)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
-          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_CI_MODE: "full"
+          MGC_GOLDEN_STRICT: "1"   # releases should be strict
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
 
-      - name: Collect release assets from evidence
+      - name: Build package (sdist + wheel)
         shell: bash
         run: |
           set -euxo pipefail
+          python -m build
+          ls -la dist
 
-          EVIDENCE="${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json"
-          test -s "$EVIDENCE"
-
-          SUB_ZIP="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          ev = json.loads(Path("'$EVIDENCE'").read_text(encoding="utf-8"))
-          p = ev.get("paths") if isinstance(ev.get("paths"), dict) else {}
-          print(p.get("submission_zip") or "")
-          PY
-          )"
-
-          RECEIPT="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          ev = json.loads(Path("'$EVIDENCE'").read_text(encoding="utf-8"))
-          a = ev.get("artifacts") if isinstance(ev.get("artifacts"), dict) else {}
-          print(a.get("submission_receipt_json") or "")
-          PY
-          )"
-
-          WEB_DIR="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          ev = json.loads(Path("'$EVIDENCE'").read_text(encoding="utf-8"))
-          p = ev.get("paths") if isinstance(ev.get("paths"), dict) else {}
-          print(p.get("web_bundle_dir") or "")
-          PY
-          )"
-
-          test -n "$SUB_ZIP"
-          test -f "$SUB_ZIP"
-          test -n "$RECEIPT"
-          test -f "$RECEIPT"
-
-          mkdir -p release_assets
-          cp -f "$SUB_ZIP" release_assets/submission.zip
-          cp -f "$RECEIPT" release_assets/submission.receipt.json
-
-          if [ -n "$WEB_DIR" ] && [ -d "$WEB_DIR" ]; then
-            tar -C "$WEB_DIR" -czf release_assets/web_bundle.tgz .
-          fi
-
-          ls -la release_assets
-
-      - name: Create GitHub Release and upload assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          TAG="${GITHUB_REF_NAME}"
-          TITLE="MGC ${TAG}"
-
-          NOTES_FILE="$(mktemp)"
-          {
-            echo "Release ${TAG}"
-            echo
-            echo "Assets:"
-            echo "- submission.zip"
-            echo "- submission.receipt.json"
-            if [ -f release_assets/web_bundle.tgz ]; then
-              echo "- web_bundle.tgz"
-            fi
-          } > "${NOTES_FILE}"
-
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" release_assets/* --clobber
-          else
-            gh release create "${TAG}" \
-              --title "${TITLE}" \
-              --notes-file "${NOTES_FILE}" \
-              release_assets/*
-          fi
+      - name: Create GitHub Release + upload dist/*
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
