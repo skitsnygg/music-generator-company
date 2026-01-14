@@ -319,6 +319,11 @@ def _display_path_strip(p: Path, *, base_dir: Path) -> str:
         return rp.name
 
 
+def _env_truthy(name: str) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(args.playlist)).expanduser().resolve()
     if not playlist_path.exists():
@@ -384,7 +389,12 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     bundled: List[Dict[str, Any]] = []
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
-    strip_paths = bool(getattr(args, "strip_paths", False))
+
+    # Determinism fix:
+    # If we're in deterministic mode, force strip_paths so files written to disk
+    # do NOT embed absolute temp paths (which differ between run1/run2 in CI).
+    strip_paths_flag = bool(getattr(args, "strip_paths", False))
+    strip_paths = strip_paths_flag or _env_truthy("MGC_DETERMINISTIC")
 
     # For deterministic outputs written to disk, never embed absolute temp paths:
     playlist_display = (
@@ -426,7 +436,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     break
                 n += 1
 
-        # Copy bytes; metadata not important for our determinism gates (hash is on bytes).
         shutil.copyfile(rp, dest)
         copied += 1
         bundled.append(
