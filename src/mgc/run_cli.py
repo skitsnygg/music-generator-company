@@ -1996,6 +1996,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
       - run the daily generator (stub/riffusion/...) to materialize audio + DB rows
       - write drop_evidence.json under out_dir, including bundle track + playlist paths
       - build a submission zip at data/submissions/<drop_id>/submission.zip (non-dry-run)
+      - write data/submissions/<drop_id>/submission.json (self-describing pointer)
       - print a small JSON summary to stdout
     """
     import os
@@ -2006,6 +2007,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     import json
     from pathlib import Path
     from datetime import datetime, timezone
+    from typing import Optional
 
     from mgc.bundle_validate import validate_bundle
 
@@ -2019,6 +2021,12 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         return str(p).replace("\\", "/")
 
     def _zip_add_dir(zf: zipfile.ZipFile, root: Path, arc_root: str) -> None:
+        """
+        Add directory contents to zip deterministically:
+          - stable traversal order (sorted dirs/files)
+          - stable archive ordering (sorted arcname)
+          - fixed timestamps in ZipInfo for deterministic builds
+        """
         root = root.resolve()
         entries = []
         for dp, dn, fn in os.walk(root):
@@ -2046,15 +2054,14 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         paths = evidence_obj.get("paths") if isinstance(evidence_obj.get("paths"), dict) else {}
 
         drop_id = ids.get("drop_id", evidence_obj.get("drop_id", ""))
-        run_id = ids.get("run_id", evidence_obj.get("run_id", ""))
-        track_id = ids.get("track_id", evidence_obj.get("track_id", ""))
+        run_id_local = ids.get("run_id", evidence_obj.get("run_id", ""))
+        track_id_local = ids.get("track_id", evidence_obj.get("track_id", ""))
         provider = evidence_obj.get("provider", "")
-        context = evidence_obj.get("context", evidence_obj.get("context", ""))
+        context_local = evidence_obj.get("context", evidence_obj.get("context", ""))
         ts_local = evidence_obj.get("ts", "")
 
         bundle_track = paths.get("bundle_track", paths.get("bundle_track_path", ""))
         playlist = paths.get("playlist", paths.get("playlist_path", "playlist.json"))
-
         deterministic_local = evidence_obj.get("deterministic", "")
 
         lines = [
@@ -2062,12 +2069,12 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "",
             "## Identifiers",
             f"- drop_id: {drop_id}",
-            f"- run_id: {run_id}",
-            f"- track_id: {track_id}",
+            f"- run_id: {run_id_local}",
+            f"- track_id: {track_id_local}",
             "",
             "## Run metadata",
             f"- ts: {ts_local}",
-            f"- context: {context}",
+            f"- context: {context_local}",
             f"- provider: {provider}",
             f"- deterministic: {deterministic_local}",
             "",
@@ -2201,17 +2208,18 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             evidence_obj["track_id"] = track_id
 
     # ---------------------------------------------------------------------
-    # Write drop evidence in out_dir
+    # Write drop evidence in out_dir (v1)
     # ---------------------------------------------------------------------
     evidence_path = out_dir / "drop_evidence.json"
     evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
 
     # ---------------------------------------------------------------------
-    # Build submission zip (non-dry-run only)
+    # Build submission zip + submission.json (non-dry-run only)
     # ---------------------------------------------------------------------
     submission_zip_path: Optional[Path] = None
+    submission_json_path: Optional[Path] = None
+
     if not dry_run:
-        # Determine bundle dir (should be the same out_dir used by _stub_daily_run)
         pths = evidence_obj.get("paths") or {}
         bundle_dir = Path(str(pths.get("bundle_dir") or out_dir)).expanduser().resolve()
 
@@ -2224,14 +2232,28 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             try:
                 daily_ev_obj = json.loads(daily_ev_path.read_text(encoding="utf-8"))
             except Exception:
-                daily_ev_obj = {"ts": ts, "drop_id": evidence_obj.get("drop_id"), "run_id": run_id, "context": context, "deterministic": deterministic}
+                daily_ev_obj = {
+                    "ts": ts,
+                    "drop_id": evidence_obj.get("drop_id"),
+                    "run_id": run_id,
+                    "context": context,
+                    "deterministic": deterministic,
+                }
         else:
-            daily_ev_obj = {"ts": ts, "drop_id": evidence_obj.get("drop_id"), "run_id": run_id, "context": context, "deterministic": deterministic}
+            daily_ev_obj = {
+                "ts": ts,
+                "drop_id": evidence_obj.get("drop_id"),
+                "run_id": run_id,
+                "context": context,
+                "deterministic": deterministic,
+            }
 
-        # Build destination
-        submissions_root = Path("data") / "submissions" / str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id))
+        drop_id_for_paths = str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id))
+        submissions_root = (Path("data") / "submissions" / drop_id_for_paths).resolve()
         _safe_mkdir(submissions_root)
+
         submission_zip_path = (submissions_root / "submission.zip").resolve()
+        submission_json_path = (submissions_root / "submission.json").resolve()
 
         # Stage + zip deterministically
         with tempfile.TemporaryDirectory(prefix="mgc_submission_") as td:
@@ -2246,7 +2268,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             # Write README.md (stable-ish)
             (pkg_root / "README.md").write_text(_build_readme(daily_ev_obj), encoding="utf-8")
 
-            # Write zip
+            # Write zip (deterministic ordering + timestamps)
             if submission_zip_path.exists():
                 submission_zip_path.unlink()
 
@@ -2256,13 +2278,24 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 zi.external_attr = 0o644 << 16
                 zf.writestr(zi, (pkg_root / "README.md").read_text(encoding="utf-8"))
-
                 _zip_add_dir(zf, drop_bundle_dst, arc_root="submission/drop_bundle")
 
-        # Record in evidence
+        # Write submission.json (self-describing pointer file; stable fields)
+        submission_obj = {
+            "schema": "mgc.submission.v1",
+            "drop_id": drop_id_for_paths,
+            "run_id": str(run_id),
+            "deterministic": bool(deterministic),
+            "ts": ts,  # use run ts for determinism
+            "submission_zip": "submission.zip",  # relative within submissions_root
+        }
+        submission_json_path.write_text(stable_json_dumps(submission_obj) + "\n", encoding="utf-8")
+
+        # Record in evidence + rewrite drop_evidence.json so pointer is included
         evidence_obj.setdefault("paths", {})
+        evidence_obj["paths"]["submission_dir"] = str(submissions_root)
         evidence_obj["paths"]["submission_zip"] = str(submission_zip_path)
-        # Re-write evidence so it includes submission pointer
+        evidence_obj["paths"]["submission_json"] = str(submission_json_path)
         evidence_path.write_text(stable_json_dumps(evidence_obj) + "\n", encoding="utf-8")
 
     # ---------------------------------------------------------------------
@@ -2288,6 +2321,8 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 out["paths"][k] = p[k]
         if submission_zip_path is not None:
             out["paths"]["submission_zip"] = str(submission_zip_path)
+        if submission_json_path is not None:
+            out["paths"]["submission_json"] = str(submission_json_path)
     except Exception:
         pass
 
