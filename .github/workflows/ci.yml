@@ -13,10 +13,9 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     env:
-      # Keep CI outputs in runner temp so we can cache + upload consistently
-      MGC_ARTIFACTS_DIR: ${{ runner.temp }}/artifacts/ci
-      # Your CI already sets MGC_DB; keep it in runner temp too
-      MGC_DB: ${{ runner.temp }}/ci_db.sqlite
+      # Use built-in runner env var (works everywhere) instead of ${{ runner.temp }}
+      MGC_ARTIFACTS_DIR: ${{ env.RUNNER_TEMP }}/artifacts/ci
+      MGC_DB: ${{ env.RUNNER_TEMP }}/ci_db.sqlite
       # Optional: enforce "golden" submission.zip hashes.
       # Set to "1" (or "true") to fail if the submission.zip sha isn't in ci/known_good_submission_sha256.txt
       MGC_GOLDEN_STRICT: "0"
@@ -49,7 +48,6 @@ jobs:
 
       - name: Seed CI DB
         run: |
-          # Prefer fixtures/ci_db.sqlite if you keep it in-repo; otherwise adjust this step.
           cp fixtures/ci_db.sqlite "${MGC_DB}"
 
       - name: Run CI gate
@@ -81,7 +79,6 @@ jobs:
           retention-days: 14
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}/**
-            # If your pipeline writes submissions into repo data/, include them too:
             data/submissions/**
 
       # Also upload a tight “release bundle” (submission.zip + receipt + web) derived from evidence
@@ -98,7 +95,6 @@ jobs:
             ${{ env.MGC_ARTIFACTS_DIR }}/auto/playlist.json
             ${{ env.MGC_ARTIFACTS_DIR }}/auto/tracks/**
             ${{ env.MGC_ARTIFACTS_DIR }}/auto/*.log
-            # Best effort: if these live elsewhere, they’ll still be captured by mgc-ci-artifacts above
             data/submissions/**/submission.zip
             data/submissions/**/submission.receipt.json
             data/submissions/**/web/**
