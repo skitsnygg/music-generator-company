@@ -19,13 +19,15 @@ jobs:
           set -euxo pipefail
           echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
           echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci"
+          echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_test" >> "$GITHUB_ENV"
+          echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/mgc_evidence" "${RUNNER_TEMP}/artifacts/ci" "${RUNNER_TEMP}/mgc_drop_test" "${RUNNER_TEMP}/mgc_web"
 
       - name: Prepare temp dirs (always)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}"
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_DROP_DIR}" "${MGC_WEB_DIR}"
           echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
           ls -la "${MGC_ARTIFACTS_DIR}"
           ls -la "${MGC_EVIDENCE_DIR}"
@@ -56,6 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           python scripts/make_fixture_db.py
 
           ls -la fixtures
@@ -171,6 +174,8 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_DETERMINISTIC: "1"
+          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
@@ -194,11 +199,12 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          DROP_DIR: ${{ env.MGC_DROP_DIR }}
+          WEB_DIR: ${{ env.MGC_WEB_DIR }}
         run: |
           set -euxo pipefail
 
-          DROP_DIR="${RUNNER_TEMP}/mgc_drop_test"
-          WEB_DIR="${RUNNER_TEMP}/mgc_web"
+          rm -rf "${DROP_DIR}" "${WEB_DIR}"
           mkdir -p "${DROP_DIR}" "${WEB_DIR}"
 
           # Produce a real deterministic drop bundle (writes tracks/ + playlist.json)
@@ -211,16 +217,21 @@ jobs:
 
           python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
           test -s "${DROP_DIR}/playlist.json"
+          test -d "${DROP_DIR}/tracks"
 
-          # Build the web player from the drop playlist
+          # IMPORTANT:
+          # Many playlists reference tracks with relative paths (e.g. tracks/<id>.wav).
+          # Run web build from inside DROP_DIR so relative paths resolve correctly.
+          pushd "${DROP_DIR}" >/dev/null
           python -m mgc.main web build \
-            --playlist "${DROP_DIR}/playlist.json" \
+            --playlist "playlist.json" \
             --out-dir "${WEB_DIR}" \
             --prefer-mp3 \
             --clean \
             --fail-if-empty \
             --json \
             | python -m json.tool
+          popd >/dev/null
 
           # Validate build output
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
@@ -244,6 +255,6 @@ jobs:
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
-            ${{ runner.temp }}/mgc_drop_test
-            ${{ runner.temp }}/mgc_web
+            ${{ env.MGC_DROP_DIR }}
+            ${{ env.MGC_WEB_DIR }}
           if-no-files-found: ignore
