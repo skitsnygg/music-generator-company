@@ -1,68 +1,78 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Determinism gate for submission.zip
+# Determinism gate: submission.zip
 #
-# Env:
-#   PYTHON         python executable (default: python)
-#   BUNDLE_DIR     bundle dir to package (required)
-#   ARTIFACTS_DIR  where to write logs/outputs (default: artifacts/ci)
+# Usage:
+#   EVIDENCE_ROOT=artifacts/ci/auto bash scripts/ci_submission_determinism.sh
+#   # (back-compat) BUNDLE_DIR=... bash scripts/ci_submission_determinism.sh
 #
-# Output:
-#   $ARTIFACTS_DIR/submission_determinism/run1/submission.zip
-#   $ARTIFACTS_DIR/submission_determinism/run2/submission.zip
-#   and a hash comparison
+# Reads:
+#   $EVIDENCE_ROOT/drop_evidence.json  (preferred)
+#
+# Emits:
+#   Logs to stderr, exits nonzero on mismatch.
 
-PYTHON="${PYTHON:-python}"
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
-: "${BUNDLE_DIR:?set BUNDLE_DIR to the drop bundle directory}"
+: "${PYTHON:=python}"
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+EVIDENCE_ROOT="${EVIDENCE_ROOT:-}"
+BUNDLE_DIR="${BUNDLE_DIR:-}"
 
-out_root="$ARTIFACTS_DIR/submission_determinism"
-run1_dir="$out_root/run1"
-run2_dir="$out_root/run2"
-mkdir -p "$run1_dir" "$run2_dir"
+if [[ -n "${EVIDENCE_ROOT}" ]]; then
+  EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
+  if [[ ! -f "${EVIDENCE_JSON}" ]]; then
+    echo "[ci_submission_determinism] FAIL: missing evidence json: ${EVIDENCE_JSON}" >&2
+    exit 2
+  fi
 
-zip1="$run1_dir/submission.zip"
-zip2="$run2_dir/submission.zip"
-
-echo "[ci_submission_determinism] repo_root=$repo_root"
-echo "[ci_submission_determinism] BUNDLE_DIR=$BUNDLE_DIR"
-echo "[ci_submission_determinism] ARTIFACTS_DIR=$ARTIFACTS_DIR"
-
-build_once () {
-  local out_zip="$1"
-  rm -f "$out_zip"
-  # If your command differs, change it here:
-  "$PYTHON" -m mgc.main submission build \
-    --bundle-dir "$BUNDLE_DIR" \
-    --out "$out_zip"
-  test -f "$out_zip"
-}
-
-hash_zip_bytes () {
-  local f="$1"
-  shasum -a 256 "$f" | awk '{print $1}'
-}
-
-echo "[ci_submission_determinism] build run1 -> $zip1"
-build_once "$zip1"
-h1="$(hash_zip_bytes "$zip1")"
-echo "[ci_submission_determinism] run1_sha256=$h1"
-
-echo "[ci_submission_determinism] build run2 -> $zip2"
-build_once "$zip2"
-h2="$(hash_zip_bytes "$zip2")"
-echo "[ci_submission_determinism] run2_sha256=$h2"
-
-if [[ "$h1" != "$h2" ]]; then
-  echo "[ci_submission_determinism] FAIL: submission.zip sha256 mismatch"
-  echo "[ci_submission_determinism] run1=$h1"
-  echo "[ci_submission_determinism] run2=$h2"
-  echo "[ci_submission_determinism] hint: run 'diff -u <(unzip -l $zip1) <(unzip -l $zip2)' to see ordering/timestamp drift"
-  exit 1
+  # Prefer bundle_dir from evidence; fallback to evidence root.
+  BUNDLE_DIR="$(
+    "${PYTHON}" - <<'PY'
+import json, os, sys
+p = os.environ["EVIDENCE_JSON"]
+obj = json.load(open(p, "r", encoding="utf-8"))
+paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
+v = paths.get("bundle_dir") or ""
+print(v)
+PY
+  )"
+  if [[ -z "${BUNDLE_DIR}" ]]; then
+    BUNDLE_DIR="${EVIDENCE_ROOT%/}"
+  fi
 fi
 
-echo "[ci_submission_determinism] OK"
+if [[ -z "${BUNDLE_DIR}" ]]; then
+  echo "scripts/ci_submission_determinism.sh: BUNDLE_DIR: set BUNDLE_DIR to the drop bundle directory" >&2
+  echo "  or set EVIDENCE_ROOT to a run output dir containing drop_evidence.json" >&2
+  exit 2
+fi
+
+BUNDLE_DIR="$(cd "${BUNDLE_DIR}" && pwd)"
+echo "[ci_submission_determinism] bundle_dir=${BUNDLE_DIR}" >&2
+
+# Run submission build twice and compare sha256 of produced submission.zip.
+# We call the CLI so we test the real contract.
+run_once() {
+  local out_json
+  out_json="$("${PYTHON}" -m mgc.main submission build --bundle-dir "${BUNDLE_DIR}" --json)"
+  "${PYTHON}" - <<'PY' <<<"${out_json}"
+import json, sys
+obj = json.loads(sys.stdin.read())
+if not obj.get("ok", False):
+    raise SystemExit(2)
+print(obj["zip_sha256"])
+PY
+}
+
+sha1="$(run_once)"
+sha2="$(run_once)"
+
+echo "[ci_submission_determinism] run1_sha256=${sha1}" >&2
+echo "[ci_submission_determinism] run2_sha256=${sha2}" >&2
+
+if [[ "${sha1}" != "${sha2}" ]]; then
+  echo "[ci_submission_determinism] FAIL: submission.zip sha mismatch" >&2
+  exit 2
+fi
+
+echo "[ci_submission_determinism] OK" >&2
