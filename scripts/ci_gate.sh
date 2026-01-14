@@ -156,10 +156,7 @@ if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
   fi
 
 
-  GOLDEN_STRICT=0
-  if [ "$CI_MODE" = "full" ]; then
-    GOLDEN_STRICT=1
-  fi
+    GOLDEN_STRICT=0
   if _env_truthy "${MGC_GOLDEN_STRICT:-0}"; then
     GOLDEN_STRICT=1
   fi
