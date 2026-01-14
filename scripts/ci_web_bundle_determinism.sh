@@ -2,90 +2,163 @@
 # scripts/ci_web_bundle_determinism.sh
 set -euo pipefail
 
+# Determinism gate: web bundle tree hash
+#
+# Usage:
+#   bash scripts/ci_web_bundle_determinism.sh --evidence-root <dir>
+#
+# Env:
+#   MGC_DB            required (db path)
+#   PYTHON            python executable (default: python)
+#   MGC_FIXED_TIME    optional (used by pipeline for deterministic timestamps)
+#   MGC_DETERMINISTIC optional ("1" recommended)
+#
+# Behavior:
+#   - Builds a deterministic drop twice (focus, seed=1) under evidence-root
+#   - Runs `mgc web build` twice from each drop
+#   - Computes tree hash of resulting web output dirs using mgc.hash_tree
+#   - Fails if hashes differ
+#   - Writes web_bundle_determinism.json in evidence root
+#   - If drop_evidence.json exists under evidence root, records:
+#       artifacts.web_bundle_tree_sha256 = <hash>
+#       paths.web_bundle_dir = <dir>
+
+PYTHON="${PYTHON:-python}"
+
 usage() {
-  cat <<'EOF'
-Usage:
-  bash scripts/ci_web_bundle_determinism.sh --evidence-root <dir>
-
-Reads <evidence-root>/drop_evidence.json, finds:
-  paths.web_bundle_dir
-  artifacts.web_bundle_tree_sha256
-
-Then re-computes a deterministic tree hash and compares.
-
-Exits:
-  0 OK (or web not present)
-  2 mismatch / missing web_dir when hash present
-EOF
+  echo "usage: $0 --evidence-root <dir>" >&2
+  exit 2
 }
 
 EVIDENCE_ROOT=""
-
 while [ $# -gt 0 ]; do
   case "$1" in
-    --evidence-root) EVIDENCE_ROOT="${2:-}"; shift 2;;
-    -h|--help) usage; exit 0;;
-    *) echo "[ci_web_bundle_determinism] unknown arg: $1" >&2; usage; exit 2;;
+    --evidence-root)
+      EVIDENCE_ROOT="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "unknown arg: $1" >&2
+      usage
+      ;;
   esac
 done
 
-if [ -z "$EVIDENCE_ROOT" ]; then
-  echo "[ci_web_bundle_determinism] missing --evidence-root" >&2
-  usage
-  exit 2
+[ -n "$EVIDENCE_ROOT" ] || usage
+: "${MGC_DB:?set MGC_DB}"
+
+mkdir -p "$EVIDENCE_ROOT"
+
+echo "[ci_web_bundle_determinism] evidence_root=$EVIDENCE_ROOT"
+echo "[ci_web_bundle_determinism] MGC_DB=$MGC_DB"
+
+BASE="${EVIDENCE_ROOT%/}/web_bundle_test"
+RUN1_DROP="${BASE}/run1_drop"
+RUN1_WEB="${BASE}/run1_web"
+RUN2_DROP="${BASE}/run2_drop"
+RUN2_WEB="${BASE}/run2_web"
+
+rm -rf "$BASE"
+mkdir -p "$RUN1_DROP" "$RUN1_WEB" "$RUN2_DROP" "$RUN2_WEB"
+
+run_drop_and_web_build() {
+  local drop_dir="$1"
+  local web_dir="$2"
+
+  # Deterministic drop
+  MGC_DETERMINISTIC="${MGC_DETERMINISTIC:-1}" \
+  $PYTHON -m mgc.main --db "$MGC_DB" run drop \
+    --context focus \
+    --seed 1 \
+    --deterministic \
+    --out-dir "$drop_dir" \
+    > "${drop_dir%/}/drop_stdout.json"
+
+  $PYTHON -m json.tool < "${drop_dir%/}/drop_stdout.json" >/dev/null
+
+  test -s "${drop_dir%/}/playlist.json"
+  test -d "${drop_dir%/}/tracks"
+
+  # Web build from inside drop dir (relative paths)
+  pushd "$drop_dir" >/dev/null
+  $PYTHON -m mgc.main web build \
+    --playlist "playlist.json" \
+    --out-dir "$web_dir" \
+    --prefer-mp3 \
+    --clean \
+    --fail-if-empty \
+    --json \
+    | $PYTHON -m json.tool >/dev/null
+  popd >/dev/null
+
+  test "$(find "$web_dir" -maxdepth 6 -type f -name 'index.html' | wc -l | tr -d ' ')" -ge 1
+  test "$(find "$web_dir" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" -ge 1
+}
+
+echo "[ci_web_bundle_determinism] build run1"
+run_drop_and_web_build "$RUN1_DROP" "$RUN1_WEB"
+
+echo "[ci_web_bundle_determinism] build run2"
+run_drop_and_web_build "$RUN2_DROP" "$RUN2_WEB"
+
+# Tree hashes (requires src/mgc/hash_tree.py => module mgc.hash_tree)
+H1="$($PYTHON -m mgc.hash_tree --root "$RUN1_WEB" --print)"
+H2="$($PYTHON -m mgc.hash_tree --root "$RUN2_WEB" --print)"
+
+if [ "$H1" != "$H2" ]; then
+  echo "[ci_web_bundle_determinism] FAIL: web bundle tree hash mismatch"
+  echo "  run1=$H1"
+  echo "  run2=$H2"
+  echo "  run1_web=$RUN1_WEB"
+  echo "  run2_web=$RUN2_WEB"
+  exit 1
 fi
 
-evidence_path="${EVIDENCE_ROOT%/}/drop_evidence.json"
-if [ ! -f "$evidence_path" ]; then
-  echo "[ci_web_bundle_determinism] missing evidence: $evidence_path" >&2
-  exit 2
-fi
+echo "[ci_web_bundle_determinism] OK sha256=$H1"
 
-python - <<PY
-import json, hashlib, pathlib, sys
+OUT_JSON="${EVIDENCE_ROOT%/}/web_bundle_determinism.json"
+$PYTHON - <<PY
+import json
+from pathlib import Path
 
-evidence = pathlib.Path("$evidence_path")
-obj = json.loads(evidence.read_text(encoding="utf-8"))
-paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
-arts  = obj.get("artifacts") if isinstance(obj.get("artifacts"), dict) else {}
-
-web_dir = paths.get("web_bundle_dir")
-want = arts.get("web_bundle_tree_sha256")
-
-# If no web hash was recorded, treat as "web not included" and succeed.
-if not want:
-    print("[ci_web_bundle_determinism] SKIP (no artifacts.web_bundle_tree_sha256 recorded)")
-    raise SystemExit(0)
-
-if not web_dir:
-    print("[ci_web_bundle_determinism] FAIL: hash recorded but paths.web_bundle_dir missing", file=sys.stderr)
-    raise SystemExit(2)
-
-root = pathlib.Path(str(web_dir))
-if not root.exists() or not root.is_dir():
-    print(f"[ci_web_bundle_determinism] FAIL: web_bundle_dir missing: {root}", file=sys.stderr)
-    raise SystemExit(2)
-
-def sha256_file(p: pathlib.Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024*1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-files = sorted([p for p in root.rglob("*") if p.is_file()], key=lambda p: p.relative_to(root).as_posix())
-lines = []
-for p in files:
-    rel = p.relative_to(root).as_posix()
-    lines.append(f"{sha256_file(p)}  {rel}")
-joined = ("\n".join(lines) + "\n").encode("utf-8")
-got = hashlib.sha256(joined).hexdigest()
-
-if got != want:
-    print("[ci_web_bundle_determinism] FAIL tree sha mismatch", file=sys.stderr)
-    print(f"[ci_web_bundle_determinism] expected={want}", file=sys.stderr)
-    print(f"[ci_web_bundle_determinism] got     ={got}", file=sys.stderr)
-    raise SystemExit(2)
-
-print(f"[ci_web_bundle_determinism] OK tree_sha256={got}")
+p = Path(${OUT_JSON!r})
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps({
+  "ok": True,
+  "web_bundle_tree_sha256": ${H1!r},
+  "run1_web": ${RUN1_WEB!r},
+  "run2_web": ${RUN2_WEB!r},
+}, sort_keys=True, indent=2) + "\\n", encoding="utf-8")
 PY
+
+# Best-effort: record into drop_evidence.json if it exists
+EVIDENCE_JSON="${EVIDENCE_ROOT%/}/drop_evidence.json"
+if [ -s "$EVIDENCE_JSON" ]; then
+  $PYTHON - <<'PY'
+import json, os
+from pathlib import Path
+
+evidence_path = Path(os.environ["EVIDENCE_JSON"])
+h = os.environ["WEB_HASH"]
+web_dir = os.environ["WEB_DIR"]
+
+obj = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+artifacts = obj.get("artifacts")
+if not isinstance(artifacts, dict):
+  artifacts = {}
+obj["artifacts"] = artifacts
+artifacts["web_bundle_tree_sha256"] = h
+
+paths = obj.get("paths")
+if not isinstance(paths, dict):
+  paths = {}
+obj["paths"] = paths
+paths["web_bundle_dir"] = web_dir
+
+evidence_path.write_text(json.dumps(obj, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+fi
