@@ -1,135 +1,184 @@
+#!/usr/bin/env python3
+"""
+src/mgc/agents/music_agent.py
+
+Music Agent: generate tracks via the provider registry.
+
+Key rule:
+- This module must NOT directly import or instantiate provider implementations
+  (riffusion/stub/suno/etc). It must ONLY use:
+      from mgc.providers import GenerateRequest, get_provider
+
+Why:
+- Single source of truth for provider selection and configuration
+- Avoid import-time NameError/Module drift
+- CI friendliness (registry can expose only stub; others can be staged)
+"""
+
 from __future__ import annotations
 
 import os
-import uuid
+import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Optional
 
-from mgc.storage import StoragePaths
-from mgc.utils.audio import make_preview_clip
-from mgc.providers.generator_stub import GeneratorStub
-from mgc.providers.riffusion_provider import RiffusionProvider, RiffusionResult
+from mgc.context import build_prompt
+from mgc.providers import GenerateRequest, GenerateResult, MusicProvider, get_provider
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _stable_sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Public agent
+# ---------------------------------------------------------------------------
 
 @dataclass
-class TrackArtifact:
-    track_id: str
-    created_at: str
-    title: str
-    mood: str
-    genre: str
-    bpm: int
-    duration_sec: float
-    full_path: str
-    preview_path: str
-
-
-CONTEXT_PRESETS = {
-    "focus": {
-        "mood": "focus",
-        "genre": "ambient electronic",
-        "bpm": 110,
-        "prompt": "ambient electronic, minimal, steady rhythm, clean pads, focus music",
-    },
-    "workout": {
-        "mood": "workout",
-        "genre": "high-energy electronic",
-        "bpm": 140,
-        "prompt": "energetic electronic, driving kick, pumping bass, crisp percussion, workout music",
-    },
-    "sleep": {
-        "mood": "sleep",
-        "genre": "soft ambient",
-        "bpm": 70,
-        "prompt": "slow soft ambient, gentle drones, warm pads, calm relaxing sleep music",
-    },
-}
-
-def pick_context(iso_date: str) -> str:
-    # stable rotation by day
-    keys = list(CONTEXT_PRESETS.keys())
-    n = sum(ord(c) for c in iso_date) % len(keys)
-    return keys[n]
+class MusicAgentConfig:
+    provider: str = "stub"
+    strict_provider: bool = False  # if True, unknown provider is a hard error
 
 
 class MusicAgent:
-    def __init__(self, storage: StoragePaths):
-        self.storage = storage
+    """
+    Generates a track via the provider registry.
 
-        self.provider = os.getenv("MGC_PROVIDER", "stub").strip().lower()
-        self.riffusion_url = os.getenv("RIFFUSION_URL", "http://127.0.0.1:3013/run_inference").strip()
+    Expected workflow:
+      agent = MusicAgent(provider="stub")
+      res = agent.generate(
+          track_id=...,
+          run_id=...,
+          context="focus",
+          seed="1",
+          deterministic=True,
+          ts="2020-01-01T00:00:00+00:00",
+          out_rel="data/tracks/<id>.wav",
+      )
+    """
 
-        self.stub = GeneratorStub()
-        self.riff = RiffusionProvider(self.riffusion_url)
+    def __init__(self, provider: Optional[str] = None, *, strict_provider: Optional[bool] = None):
+        p = (provider or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+        strict = _env_bool("MGC_STRICT_PROVIDER", False) if strict_provider is None else bool(strict_provider)
+        self.cfg = MusicAgentConfig(provider=p, strict_provider=strict)
 
-    def run_daily(self) -> TrackArtifact:
-        self.storage.ensure()
+    def _resolve_provider(self) -> MusicProvider:
+        """
+        Resolve provider from registry. If provider isn't present:
+          - strict_provider=True => raise
+          - else fallback to stub
+        """
+        try:
+            return get_provider(self.cfg.provider)
+        except Exception as e:
+            if self.cfg.strict_provider:
+                raise
+            # fallback to stub (CI-safe)
+            if self.cfg.provider != "stub":
+                # avoid noisy prints in library code; carry info in exception-friendly way
+                # callers can log this if desired
+                self.cfg.provider = "stub"
+            try:
+                return get_provider("stub")
+            except Exception:
+                # If even stub isn't available, propagate the original error
+                raise e
 
-        now = datetime.now(timezone.utc)
-        created_at = now.isoformat()
-        track_id = str(uuid.uuid4())
+    def generate(
+        self,
+        *,
+        track_id: str,
+        run_id: str,
+        context: str,
+        seed: str,
+        deterministic: bool,
+        ts: str,
+        out_rel: str,
+        prompt: Optional[str] = None,
+    ) -> GenerateResult:
+        """
+        Generate one track via provider registry.
 
-        ctx_key = pick_context(now.strftime('%Y-%m-%d'))
-        ctx = CONTEXT_PRESETS[ctx_key]
-        mood = ctx['mood']
-        genre = ctx['genre']
-        bpm = int(ctx['bpm'])
-        title = f"Daily Drop {now.strftime('%Y-%m-%d')} ({ctx_key.title()})"
+        prompt:
+          - if None, uses mgc.context.build_prompt(context)
+        """
+        provider = self._resolve_provider()
+        prompt_text = prompt if isinstance(prompt, str) and prompt.strip() else build_prompt(context)
 
-        # Context preset (rotates daily)
-
-        safe_base = f"{now.strftime('%Y%m%d')}_{track_id[:8]}"
-
-        if self.provider == "riffusion":
-            full_path = self.storage.tracks_dir / f"{safe_base}.mp3"
-            prompt = "ambient electronic, minimal, steady rhythm, clean pads, focus music"
-            res: RiffusionResult = self.riff.generate(
-                out_mp3=full_path,
-                title=title,
-                mood=mood,
-                genre=genre,
-                bpm=bpm,
-                prompt=prompt,
-            )
-            duration_sec = res.duration_sec
-        else:
-            full_path = self.storage.tracks_dir / f"{safe_base}.wav"
-            res2 = self.stub.generate(
-                out_wav=full_path,
-                title=title,
-                mood=mood,
-                genre=genre,
-                bpm=bpm,
-                duration_sec=60.0,
-            )
-            duration_sec = res2.duration_sec
-
-        preview_path = self.storage.previews_dir / f"{safe_base}_preview.mp3"
-        make_preview_clip(Path(full_path), preview_path, start_sec=5.0, duration_sec=20.0)
-
-        return TrackArtifact(
+        req = GenerateRequest(
             track_id=track_id,
-            created_at=created_at,
-            title=title,
-            mood=mood,
-            genre=genre,
-            bpm=bpm,
-            duration_sec=duration_sec,
-            full_path=str(full_path),
-            preview_path=str(preview_path),
+            run_id=run_id,
+            context=context,
+            seed=str(seed),
+            prompt=prompt_text,
+            deterministic=bool(deterministic),
+            ts=ts,
+            out_rel=out_rel,
         )
+        res = provider.generate(req)
 
-    def to_db_row(self, art: TrackArtifact) -> Dict:
+        # Ensure required fields are present/sane
+        if not isinstance(res, GenerateResult):
+            raise TypeError(f"Provider {getattr(provider, 'name', '?')} returned non-GenerateResult: {type(res)}")
+        if not isinstance(res.artifact_bytes, (bytes, bytearray)):
+            raise TypeError("GenerateResult.artifact_bytes must be bytes")
+        if not isinstance(res.ext, str) or not res.ext.strip():
+            raise ValueError("GenerateResult.ext must be a non-empty string")
+        if not res.ext.startswith("."):
+            res.ext = "." + res.ext
+
+        # Add some helpful meta without changing provider output semantics
+        res.meta = dict(res.meta or {})
+        res.meta.setdefault("run_id", run_id)
+        res.meta.setdefault("track_id", track_id)
+        res.meta.setdefault("context", context)
+        res.meta.setdefault("seed", str(seed))
+        res.meta.setdefault("prompt_hash", _stable_sha256_hex(prompt_text))
+        res.meta.setdefault("deterministic", bool(deterministic))
+
+        return res
+
+    # Backwards-compatible helper: if older code called agent.run(...) or similar,
+    # this provides a stable minimal return shape without importing specific providers.
+    def run(
+        self,
+        *,
+        track_id: str,
+        run_id: str,
+        context: str,
+        seed: str,
+        deterministic: bool,
+        ts: str,
+        out_rel: str,
+        prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convenience wrapper returning a dict (useful for pipelines/tests).
+        """
+        res = self.generate(
+            track_id=track_id,
+            run_id=run_id,
+            context=context,
+            seed=seed,
+            deterministic=deterministic,
+            ts=ts,
+            out_rel=out_rel,
+            prompt=prompt,
+        )
         return {
-            "id": art.track_id,
-            "created_at": art.created_at,
-            "title": art.title,
-            "mood": art.mood,
-            "genre": art.genre,
-            "bpm": art.bpm,
-            "duration_sec": art.duration_sec,
-            "full_path": art.full_path,
-            "preview_path": art.preview_path,
-            "status": "generated",
+            "provider": res.provider,
+            "ext": res.ext,
+            "artifact_bytes_len": len(res.artifact_bytes),
+            "meta": dict(res.meta or {}),
         }
