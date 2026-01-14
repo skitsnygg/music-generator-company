@@ -25,6 +25,10 @@ set -euo pipefail
 # If fixtures/golden_hashes.json exists, we will check:
 #   - ci.rebuild.playlists against rebuild playlists output dir
 #   - ci.rebuild.tracks    against rebuild tracks output dir
+#
+# Full mode extras:
+#   - manifest diff: if since-ok not available, SKIP (do not fail CI)
+#   - golden submission hash gate: warn-only truly warns (nonzero rc is ignored unless strict)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -40,6 +44,13 @@ if [ "$CI_MODE" != "fast" ] && [ "$CI_MODE" != "full" ]; then
   echo "[ci_gate] ERROR: MGC_CI_MODE must be 'fast' or 'full' (got: $CI_MODE)" >&2
   exit 2
 fi
+
+# truthy helper
+_env_truthy() {
+  local v="${1:-}"
+  v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+  [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ] || [ "$v" = "y" ] || [ "$v" = "on" ]
+}
 
 mkdir -p "$ARTIFACTS_DIR"
 
@@ -76,7 +87,6 @@ $PYTHON -m py_compile \
   src/mgc/web_cli.py \
   src/mgc/submission_cli.py \
   2>/dev/null || {
-    # fallback: show full output if compile fails
     $PYTHON -m py_compile \
       src/mgc/main.py \
       src/mgc/run_cli.py \
@@ -89,10 +99,7 @@ $PYTHON -m py_compile \
 # -----------------------------
 echo "[ci_gate] rebuild + verify"
 
-OUT_PLAYLISTS=""
-OUT_TRACKS=""
 STAMP="ci"
-
 if [ "$OUT_ROOT" = "data" ]; then
   OUT_PLAYLISTS="data/playlists"
   OUT_TRACKS="data/tracks"
@@ -104,7 +111,6 @@ fi
 mkdir -p "$OUT_PLAYLISTS" "$OUT_TRACKS"
 
 if [ -x "scripts/ci_rebuild_verify.sh" ]; then
-  # Best effort: pass target dirs + stamp; helper may ignore these.
   MGC_OUT_PLAYLISTS="$OUT_PLAYLISTS" \
   MGC_OUT_TRACKS="$OUT_TRACKS" \
   MGC_STAMP="$STAMP" \
@@ -144,7 +150,7 @@ echo "  tracks:    $OUT_TRACKS"
 
 # -----------------------------
 # golden TREE hash gate (fast + full, optional)
-# - In fast mode: WARN-ONLY by default (local dev may differ from CI python/version)
+# - In fast mode: WARN-ONLY by default
 # - In full mode: STRICT by default
 # - MGC_GOLDEN_STRICT forces STRICT in either mode
 # -----------------------------
@@ -156,10 +162,7 @@ if [ -f "$GOLDEN_JSON" ] && [ -f "scripts/ci_golden_check.py" ]; then
   if [ "$CI_MODE" = "full" ]; then
     GOLDEN_STRICT=1
   fi
-
-  v="${MGC_GOLDEN_STRICT:-0}"
-  vv="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
-  if [ "$vv" = "1" ] || [ "$vv" = "true" ] || [ "$vv" = "yes" ]; then
+  if _env_truthy "${MGC_GOLDEN_STRICT:-0}"; then
     GOLDEN_STRICT=1
   fi
 
@@ -194,7 +197,6 @@ fi
 # full-mode gates
 # -----------------------------
 if [ "$CI_MODE" = "full" ]; then
-  # autonomous deterministic smoke
   AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
   mkdir -p "$AUTO_OUT"
 
@@ -208,7 +210,6 @@ if [ "$CI_MODE" = "full" ]; then
     --no-resume \
     > "${AUTO_OUT%/}/autonomous.json"
 
-  # submission determinism + artifact check
   echo "[ci_gate] submission artifact check"
   bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
   echo "[ci_gate] submission artifact check OK"
@@ -216,15 +217,12 @@ if [ "$CI_MODE" = "full" ]; then
   echo "[ci_gate] determinism gate: submission.zip (evidence-root=$AUTO_OUT)"
   bash scripts/ci_submission_determinism.sh --evidence-root "$AUTO_OUT"
 
-  # web bundle determinism (optional)
   echo "[ci_gate] determinism gate: web bundle (evidence-root=$AUTO_OUT)"
   bash scripts/ci_web_bundle_determinism.sh --evidence-root "$AUTO_OUT"
 
-  # drops list smoke (global --json hoist)
   echo "[ci_gate] drops list smoke (global --json hoist)"
   $PYTHON -m mgc.main --db "$MGC_DB" drops list --json >/dev/null
 
-  # publish receipts determinism
   echo "[ci_gate] publish receipts determinism"
   if [ -x "scripts/ci_publish_determinism.sh" ]; then
     bash scripts/ci_publish_determinism.sh
@@ -232,23 +230,58 @@ if [ "$CI_MODE" = "full" ]; then
     echo "[ci_gate] (skip) scripts/ci_publish_determinism.sh not found"
   fi
 
+  # -----------------------------
   # manifest diff gate (since-ok, strict JSON)
+  # - if since-ok not available in CI workspace, SKIP (do not fail)
+  # -----------------------------
   echo "[ci_gate] manifest diff gate (since-ok, strict JSON)"
-  $PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json | $PYTHON -m json.tool
 
-  # golden SUBMISSION hash gate (known-good list) - warn by default, strict if MGC_GOLDEN_STRICT truthy
-  echo "[ci_gate] golden submission hash gate (warn by default)"
-  MODE="warn"
-  v="${MGC_GOLDEN_STRICT:-0}"
-  vv="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
-  if [ "$vv" = "1" ] || [ "$vv" = "true" ] || [ "$vv" = "yes" ]; then
-    MODE="strict"
+  set +e
+  DIFF_OUT="$($PYTHON -m mgc.main --db "$MGC_DB" run diff --since-ok --fail-on-changes --summary-only --json 2>/dev/null)"
+  rc_diff=$?
+  set -e
+
+  if [ $rc_diff -ne 0 ]; then
+    if echo "$DIFF_OUT" | grep -q '"reason":[[:space:]]*"since_ok_not_found"'; then
+      echo "$DIFF_OUT" | $PYTHON -m json.tool
+      echo "[ci_gate] manifest diff gate SKIP (since-ok not present)"
+    else
+      # Unknown failure: surface output and fail
+      echo "$DIFF_OUT" >&2
+      echo "[ci_gate] manifest diff gate FAIL"
+      exit $rc_diff
+    fi
+  else
+    echo "$DIFF_OUT" | $PYTHON -m json.tool
   fi
 
+  # -----------------------------
+  # golden SUBMISSION hash gate (known-good list)
+  # - warn by default; strict only if MGC_GOLDEN_STRICT truthy
+  # - IMPORTANT: warn mode must NOT fail the workflow even if the gate returns nonzero
+  # -----------------------------
+  echo "[ci_gate] golden submission hash gate (warn by default)"
+
+  SUB_MODE="warn"
+  if _env_truthy "${MGC_GOLDEN_STRICT:-0}"; then
+    SUB_MODE="strict"
+  fi
+
+  set +e
   bash scripts/ci_golden_hash_gate.sh \
     --evidence-root "$AUTO_OUT" \
     --known-file "ci/known_good_submission_sha256.txt" \
-    --mode "$MODE"
+    --mode "$SUB_MODE"
+  rc_sub=$?
+  set -e
+
+  if [ $rc_sub -ne 0 ]; then
+    if [ "$SUB_MODE" = "strict" ]; then
+      echo "[ci_gate] FAIL: submission golden hash gate (strict mode)"
+      exit $rc_sub
+    fi
+    echo "[ci_gate] WARN: submission not in known-good list (warn-only mode; continuing)"
+  fi
 fi
 
 echo "[ci_gate] OK"
