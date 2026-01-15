@@ -6,9 +6,20 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Determinism knobs for everything in this workflow
+      MGC_DETERMINISTIC: "1"
+      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+      PYTHON: python
 
     steps:
       - name: Checkout repo
@@ -20,19 +31,17 @@ jobs:
           set -euxo pipefail
           echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
           echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
-          echo "MGC_DROP_DIR=${RUNNER_TEMP}/mgc_drop_test" >> "$GITHUB_ENV"
           echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
           mkdir -p \
             "${RUNNER_TEMP}/mgc_evidence" \
             "${RUNNER_TEMP}/artifacts/ci" \
-            "${RUNNER_TEMP}/mgc_drop_test" \
             "${RUNNER_TEMP}/mgc_web"
 
-      - name: Prepare temp dirs (always)
+      - name: Prepare temp dirs
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_DROP_DIR}" "${MGC_WEB_DIR}"
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_WEB_DIR}"
           echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
           ls -la "${MGC_ARTIFACTS_DIR}"
           ls -la "${MGC_EVIDENCE_DIR}"
@@ -142,8 +151,9 @@ jobs:
                   "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
               ).fetchall()]
               print("tables:", tables)
-              assert "drops" in tables, "drops table missing"
-              assert "playlists" in tables, "playlists table missing"
+              required = {"tracks", "drops", "events", "marketing_posts", "playlists"}
+              missing = sorted(required - set(tables))
+              assert not missing, f"missing tables: {missing}"
           finally:
               con.close()
           PY
@@ -182,10 +192,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
-          MGC_DETERMINISTIC: "1"
-          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
           MGC_CI_MODE: "fast"
-          PYTHON: python
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
@@ -201,38 +208,30 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
-          MGC_DETERMINISTIC: "1"
-          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
           MGC_CI_MODE: "full"
-          PYTHON: python
         run: |
           set -euxo pipefail
           bash scripts/ci_gate.sh
 
       # -----------------------------
-      # Extra checks: full only
+      # Extra checks: main only
       # -----------------------------
       - name: Run determinism gate (existing)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
-          MGC_DETERMINISTIC: "1"
-          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+          MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
-          MGC_DB: ${{ env.MGC_DB }}
-          PYTHON: python
         run: |
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
-      # Evidence-driven web build: do NOT call `mgc run drop --out-dir`.
-      - name: Web player build (from CI gate evidence)
+      - name: Web player build (from evidence or fail with debug)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           WEB_DIR: ${{ env.MGC_WEB_DIR }}
-          ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
         run: |
           set -euxo pipefail
@@ -242,18 +241,59 @@ jobs:
 
           test -s "${EVIDENCE}"
 
-          # Extract playlist path from evidence
           PLAYLIST_PATH="$(python - <<'PY'
-          import json, os
+          import json, os, sys
           from pathlib import Path
 
-          evidence = Path(os.environ["EVIDENCE"])
-          obj = json.loads(evidence.read_text(encoding="utf-8"))
-          paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
-          print(paths.get("playlist_path", "") or "")
+          evidence_path = Path(os.environ["EVIDENCE"])
+          obj = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+          def dig(d, *keys):
+              cur = d
+              for k in keys:
+                  if not isinstance(cur, dict) or k not in cur:
+                      return None
+                  cur = cur[k]
+              return cur
+
+          candidates = [
+              dig(obj, "paths", "playlist_path"),
+              dig(obj, "paths", "playlist"),
+              dig(obj, "paths", "playlist_json"),
+              dig(obj, "paths", "playlist_file"),
+              dig(obj, "drop", "paths", "playlist_path"),
+              dig(obj, "drop", "paths", "playlist"),
+              obj.get("playlist_path") if isinstance(obj, dict) else None,
+              obj.get("playlist") if isinstance(obj, dict) else None,
+          ]
+
+          for c in candidates:
+              if isinstance(c, str) and c.strip():
+                  print(c.strip())
+                  sys.exit(0)
+
+          print("ERROR: Could not find playlist path in evidence.", file=sys.stderr)
+          if isinstance(obj, dict):
+              print("Top-level keys:", sorted(obj.keys()), file=sys.stderr)
+              paths = obj.get("paths")
+              if isinstance(paths, dict):
+                  print("paths keys:", sorted(paths.keys()), file=sys.stderr)
+              drop = obj.get("drop")
+              if isinstance(drop, dict):
+                  print("drop keys:", sorted(drop.keys()), file=sys.stderr)
+                  dpaths = drop.get("paths")
+                  if isinstance(dpaths, dict):
+                      print("drop.paths keys:", sorted(dpaths.keys()), file=sys.stderr)
+
+          raw = evidence_path.read_text(encoding="utf-8")
+          print("---- drop_evidence.json (first 8000 chars) ----", file=sys.stderr)
+          print(raw[:8000], file=sys.stderr)
+          print("---- end ----", file=sys.stderr)
+          sys.exit(2)
           PY
           )"
 
+          echo "PLAYLIST_PATH=${PLAYLIST_PATH}"
           test -n "${PLAYLIST_PATH}"
           test -s "${PLAYLIST_PATH}"
 
@@ -273,16 +313,12 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
-          MGC_DETERMINISTIC: "1"
-          MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
         run: |
           set -euxo pipefail
 
-          EVIDENCE="${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json"
-          test -s "$EVIDENCE"
+          test -s "${EVIDENCE}"
 
-          export EVIDENCE
           SUB_ZIP="$(python - <<'PY'
           import json, os
           from pathlib import Path
@@ -314,5 +350,4 @@ jobs:
           path: |
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
-            ${{ env.MGC_DROP_DIR }}
             ${{ env.MGC_WEB_DIR }}
