@@ -4,16 +4,28 @@ src/mgc/run_cli.py
 
 Run/pipeline CLI for Music Generator Company (MGC).
 
-Key behavior:
-- Global flags (from mgc.main) like --db and --repo-root should work when placed
-  BEFORE subcommands, e.g.:
-      python -m mgc.main --db fixtures/ci_db.sqlite run status
+Hard requirements for CI:
+- `python -m mgc.main --db ... --repo-root ... --seed 1 --no-resume --json run autonomous ...`
+  must succeed (CI passes global flags before the subcommand).
+- Top-level dispatch must always find a handler; if mgc.main expects args.fn, we provide it.
+- `run autonomous` must produce:
+    out_dir/drop_evidence.json                (CI contract)
+    out_dir/drop_bundle/playlist.json         (portable bundle)
+    out_dir/drop_bundle/tracks/*.wav          (portable bundle)
+    out_dir/drop_bundle/daily_evidence.json   (portable bundle)
 
-- Also allow passing --db AFTER the run subcommand (override), e.g.:
-      python -m mgc.main run status --db fixtures/ci_db.sqlite
+Bundle contract for submission.build (validator expectations):
+- drop_bundle/playlist.json must include:
+    {"schema": "mgc.playlist.v1", ...}
+- each playlist track entry must include:
+    tracks[i].path   (REQUIRED by validator)
+- drop_bundle/daily_evidence.json must include:
+    {"schema": "mgc.daily_evidence.v1", "paths": {...}, "sha256": {...}, ...}
 
-To make both work reliably with argparse, we register run-subcommand --db with
-default=argparse.SUPPRESS so it does not clobber the global value when omitted.
+Determinism contract:
+- In deterministic mode (CI), bundles + submission.zip must be byte-for-byte stable across runs,
+  even when out_dir differs (e.g. /tmp/run1 vs /tmp/run2).
+- Therefore the BUNDLED JSON must not contain absolute paths like out_dir/evidence_dir/tracks_dir.
 """
 
 from __future__ import annotations
@@ -23,15 +35,15 @@ import contextlib
 import hashlib
 import io
 import json
+import math
 import os
 import sqlite3
 import sys
 import uuid
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 # -----------------------------------------------------------------------------
@@ -51,6 +63,10 @@ def _silence_stdout(enabled: bool = True):
         sys.stdout = old
 
 
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
 def _json_dump(obj: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -68,12 +84,20 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def _as_rel_posix(path_like: str) -> str:
+    """
+    Coerce a path string to a RELATIVE, forward-slash path (portable bundle contract).
+    Reject absolute paths and traversal.
+    """
+    s = (path_like or "").replace("\\", "/").strip()
+    s = s.lstrip("./")
+    if not s or s.startswith("/") or s.startswith("..") or "/../" in s or s.endswith("/.."):
+        raise ValueError(f"invalid relative path: {path_like!r}")
+    return s
 
 
 # -----------------------------------------------------------------------------
-# Determinism
+# Determinism helpers
 # -----------------------------------------------------------------------------
 
 def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
@@ -83,16 +107,23 @@ def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
-def fixed_utc_now(args: Optional[argparse.Namespace] = None) -> datetime:
+def stable_uuid(namespace: uuid.UUID, name: str, deterministic: bool) -> uuid.UUID:
+    return uuid.uuid5(namespace, name) if deterministic else uuid.uuid4()
+
+
+def _deterministic_now_utc() -> datetime:
+    """
+    Deterministic clock for CI.
+
+    - If MGC_FIXED_TIME is set, honor it.
+    - Otherwise return a stable epoch (2020-01-01T00:00:00Z) so deterministic runs
+      are reproducible without extra env configuration.
+    """
     fixed = (os.environ.get("MGC_FIXED_TIME") or "").strip()
     if fixed:
         s = fixed.replace("Z", "+00:00")
         return datetime.fromisoformat(s).astimezone(timezone.utc)
-    return datetime.now(timezone.utc)
-
-
-def stable_uuid(namespace: uuid.UUID, name: str, deterministic: bool) -> uuid.UUID:
-    return uuid.uuid5(namespace, name) if deterministic else uuid.uuid4()
+    return datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 
 # -----------------------------------------------------------------------------
@@ -106,10 +137,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    cur = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-        (table,),
-    )
+    cur = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,))
     return cur.fetchone() is not None
 
 
@@ -166,7 +194,6 @@ def _iter_files_for_manifest(repo_root: Path, include_hidden: bool = False) -> I
 
     for root, dirs, files in os.walk(repo_root):
         root_p = Path(root)
-
         dirs[:] = sorted(dirs)
         files = sorted(files)
 
@@ -215,24 +242,46 @@ def diff_manifests(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Submission bundle helper (deterministic zip)
+# Minimal deterministic WAV generation (16-bit PCM mono)
 # -----------------------------------------------------------------------------
 
-def _zip_write_deterministic(zip_path: Path, files: Sequence[Tuple[Path, str]]) -> None:
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    files_sorted = sorted(files, key=lambda t: t[1])
+def _write_wav_sine(path: Path, *, seconds: float = 1.0, freq_hz: float = 440.0, sample_rate: int = 22050) -> None:
+    import struct
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for src, arcname in files_sorted:
-            data = src.read_bytes()
-            zi = zipfile.ZipInfo(arcname)
-            zi.date_time = (1980, 1, 1, 0, 0, 0)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(zi, data)
+    n_samples = max(1, int(sample_rate * seconds))
+    amp = 0.2
+    samples = bytearray()
+
+    for i in range(n_samples):
+        t = i / sample_rate
+        v = int(amp * 32767 * math.sin(2 * math.pi * freq_hz * t))
+        samples += struct.pack("<h", v)
+
+    data_size = len(samples)
+    byte_rate = sample_rate * 1 * 16 // 8
+    block_align = 1 * 16 // 8
+
+    header = bytearray()
+    header += b"RIFF"
+    header += struct.pack("<I", 36 + data_size)
+    header += b"WAVE"
+    header += b"fmt "
+    header += struct.pack("<I", 16)
+    header += struct.pack("<H", 1)           # PCM
+    header += struct.pack("<H", 1)           # mono
+    header += struct.pack("<I", sample_rate)
+    header += struct.pack("<I", byte_rate)
+    header += struct.pack("<H", block_align)
+    header += struct.pack("<H", 16)          # 16-bit
+    header += b"data"
+    header += struct.pack("<I", data_size)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header) + bytes(samples))
 
 
 # -----------------------------------------------------------------------------
-# Core pipeline
+# Core pipeline context
 # -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -248,7 +297,7 @@ class RunContext:
 def _require_db(args: argparse.Namespace) -> Path:
     db = getattr(args, "db", None)
     if not db:
-        raise SystemExit("Missing --db. Use global: mgc --db <path> run ... or local: mgc run ... --db <path>")
+        raise SystemExit("Missing --db. Use: mgc --db <path> run ... or mgc run ... --db <path>")
     return Path(db).resolve()
 
 
@@ -256,16 +305,24 @@ def _build_run_context(args: argparse.Namespace) -> RunContext:
     repo_root = Path(getattr(args, "repo_root", ".")).resolve()
     db_path = _require_db(args)
     out_dir = Path(getattr(args, "out_dir", "artifacts/run")).resolve()
+
     evidence_dir_val = getattr(args, "evidence_dir", None)
     evidence_dir = Path(evidence_dir_val).resolve() if evidence_dir_val else (out_dir / "evidence")
 
     det = is_deterministic(args)
-    now = fixed_utc_now(args) if det else datetime.now(timezone.utc)
+    now = _deterministic_now_utc() if det else datetime.now(timezone.utc)
 
     _ensure_dir(out_dir)
     _ensure_dir(evidence_dir)
 
-    return RunContext(repo_root=repo_root, db_path=db_path, out_dir=out_dir, evidence_dir=evidence_dir, deterministic=det, now=now)
+    return RunContext(
+        repo_root=repo_root,
+        db_path=db_path,
+        out_dir=out_dir,
+        evidence_dir=evidence_dir,
+        deterministic=det,
+        now=now,
+    )
 
 
 def _write_drop_evidence_root(ctx: RunContext, payload: Dict[str, Any]) -> Path:
@@ -274,28 +331,77 @@ def _write_drop_evidence_root(ctx: RunContext, payload: Dict[str, Any]) -> Path:
     return p
 
 
+def _normalize_daily_evidence(obj: Dict[str, Any], *, out_dir: Path, evidence_dir: Path) -> Dict[str, Any]:
+    """
+    Ensure daily_evidence.json matches validator expectations.
+    The validator wants:
+      - daily_evidence.json.paths to be an object
+      - daily_evidence.json.sha256 to be an object
+
+    NOTE: For the BUNDLED daily_evidence.json we overwrite paths/sha256 with portable-only keys.
+    """
+    out = dict(obj) if isinstance(obj, dict) else {"raw": obj}
+    out.setdefault("schema", "mgc.daily_evidence.v1")
+    out.setdefault("version", 1)
+
+    paths = out.get("paths")
+    if not isinstance(paths, dict):
+        paths = {}
+    paths.setdefault("out_dir", str(out_dir))
+    paths.setdefault("evidence_dir", str(evidence_dir))
+    out["paths"] = paths
+
+    sha = out.get("sha256")
+    if not isinstance(sha, dict):
+        sha = {}
+    out["sha256"] = sha
+
+    return out
+
+
 # -----------------------------------------------------------------------------
-# Commands
+# Commands (leaf handlers)
 # -----------------------------------------------------------------------------
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     ctx = _build_run_context(args)
-    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
-    run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{getattr(args, 'context', 'focus')}", ctx.deterministic)
+    context = getattr(args, "context", "focus")
 
-    evidence = {
+    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{context}", ctx.deterministic)
+
+    tracks_dir = ctx.out_dir / "tracks"
+    _ensure_dir(tracks_dir)
+
+    track_id = stable_uuid(ns, f"track:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
+    wav_path = tracks_dir / f"{track_id}.wav"
+    _write_wav_sine(wav_path)
+
+    track_sha = _sha256_file(wav_path)
+
+    ev_raw = {
         "run_id": str(run_id),
         "stage": "daily",
-        "context": getattr(args, "context", "focus"),
+        "context": context,
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
-        "paths": {"out_dir": str(ctx.out_dir), "evidence_dir": str(ctx.evidence_dir)},
-        "note": "daily stage stub executed",
+        "track": {"track_id": str(track_id), "path": str(wav_path)},
+        "paths": {
+            "out_dir": str(ctx.out_dir),
+            "evidence_dir": str(ctx.evidence_dir),
+            "tracks_dir": str(tracks_dir),
+        },
+        "sha256": {
+            "track": track_sha,
+        },
     }
-    _json_dump(evidence, ctx.evidence_dir / "daily_evidence.json")
+    ev = _normalize_daily_evidence(ev_raw, out_dir=ctx.out_dir, evidence_dir=ctx.evidence_dir)
+
+    ev_path = ctx.evidence_dir / "daily_evidence.json"
+    _json_dump(ev, ev_path)
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "run_id": str(run_id), "evidence": str(ctx.evidence_dir / "daily_evidence.json")}))
+        print(json.dumps({"ok": True, "run_id": str(run_id), "track_id": str(track_id), "evidence": str(ev_path)}))
     else:
         print(f"[run.daily] ok run_id={run_id}")
     return 0
@@ -306,45 +412,161 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
     run_id = stable_uuid(ns, f"run:publish_marketing:{ctx.now.isoformat()}", ctx.deterministic)
 
-    evidence = {
+    ev = {
         "run_id": str(run_id),
         "stage": "publish-marketing",
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
-        "note": "publish-marketing stage stub executed",
+        "note": "stub",
     }
-    _json_dump(evidence, ctx.evidence_dir / "publish_marketing_evidence.json")
+    ev_path = ctx.evidence_dir / "publish_marketing_evidence.json"
+    _json_dump(ev, ev_path)
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "run_id": str(run_id), "evidence": str(ctx.evidence_dir / "publish_marketing_evidence.json")}))
+        print(json.dumps({"ok": True, "run_id": str(run_id), "evidence": str(ev_path)}))
     else:
         print(f"[run.publish-marketing] ok run_id={run_id}")
     return 0
 
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
+    """
+    Create a portable bundle that `mgc submission build --bundle-dir <dir>` can package.
+    """
     ctx = _build_run_context(args)
+    context = getattr(args, "context", "focus")
+
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
-    drop_id = stable_uuid(ns, f"drop:{ctx.now.date().isoformat()}:{getattr(args, 'context', 'focus')}", ctx.deterministic)
 
+    # Stable ids (deterministic mode => uuid5; non-deterministic => uuid4)
+    drop_id = stable_uuid(ns, f"drop:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
+    run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{context}", ctx.deterministic)
+    track_id = stable_uuid(ns, f"track:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
+    playlist_id = stable_uuid(ns, f"playlist:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
+
+    # Ensure a deterministic track exists
+    wav_src = ctx.out_dir / "tracks" / f"{track_id}.wav"
+    if not wav_src.exists():
+        _ensure_dir(wav_src.parent)
+        _write_wav_sine(wav_src)
+
+    # Bundle layout
     bundle_dir = ctx.out_dir / "drop_bundle"
-    _ensure_dir(bundle_dir)
+    bundle_tracks = bundle_dir / "tracks"
+    _ensure_dir(bundle_tracks)
 
-    readme = bundle_dir / "README.txt"
-    readme.write_text(
-        "MGC Drop Bundle\n"
+    wav_dst = bundle_tracks / wav_src.name
+    wav_dst.write_bytes(wav_src.read_bytes())
+
+    rel_track_path = _as_rel_posix(f"tracks/{wav_dst.name}")
+    bundle_track_sha = _sha256_file(wav_dst)
+
+    # Write playlist.json (portable). Then force stable ts by rewriting (belt+suspenders).
+    playlist_path = bundle_dir / "playlist.json"
+    playlist = {
+        "schema": "mgc.playlist.v1",
+        "version": 1,
+        "playlist_id": str(playlist_id),
+        "context": context,
+        "ts": ctx.now.isoformat(),
+        "tracks": [
+            {
+                "track_id": str(track_id),
+                "title": f"{context.title()} Track",
+                "path": rel_track_path,           # REQUIRED by validator
+                "artifact_path": rel_track_path,  # back-compat
+                "provider": "stub",
+                "genre": "stub",
+                "mood": context,
+            }
+        ],
+    }
+    _json_dump(playlist, playlist_path)
+
+    # Force stable ts (in case other code paths ever modify ctx.now formatting)
+    try:
+        pl = _read_json(playlist_path)
+        if isinstance(pl, dict):
+            pl["ts"] = ctx.now.isoformat()
+            _json_dump(pl, playlist_path)
+    except Exception:
+        # If anything goes wrong reading/writing, keep the already-written file.
+        pass
+
+    playlist_sha = _sha256_file(playlist_path)
+
+    # Bundle daily evidence (portable-only paths, validator keys present)
+    daily_ev_path = ctx.evidence_dir / "daily_evidence.json"
+    bundle_daily_ev_path = bundle_dir / "daily_evidence.json"
+
+    def _write_bundle_daily_evidence(base_obj: Dict[str, Any]) -> None:
+        norm = _normalize_daily_evidence(base_obj, out_dir=ctx.out_dir, evidence_dir=ctx.evidence_dir)
+
+        # Force stable fields in the bundled artifact
+        norm["schema"] = "mgc.daily_evidence.v1"
+        norm["version"] = int(norm.get("version") or 1)
+        norm["stage"] = "daily"
+        norm["context"] = context
+        norm["deterministic"] = ctx.deterministic
+        norm["run_id"] = str(run_id)
+        norm["ts"] = ctx.now.isoformat()
+
+        # Track object must be portable
+        norm["track"] = {
+            "track_id": str(track_id),
+            "path": rel_track_path,
+        }
+
+        # Paths MUST be portable-only (no absolute dirs)
+        norm["paths"] = {
+            # Validator-required keys:
+            "playlist": "playlist.json",
+            "track": rel_track_path,
+            # Back-compat keys:
+            "bundle_playlist": "playlist.json",
+            "bundle_track": rel_track_path,
+        }
+
+        # Sha256 MUST include validator-required keys
+        norm["sha256"] = {
+            "track": bundle_track_sha,
+            "playlist": playlist_sha,
+            "bundle_track": bundle_track_sha,
+            "bundle_playlist": playlist_sha,
+        }
+
+        _json_dump(norm, bundle_daily_ev_path)
+
+    if daily_ev_path.exists():
+        try:
+            obj = _read_json(daily_ev_path)
+            base = obj if isinstance(obj, dict) else {"raw": obj}
+            _write_bundle_daily_evidence(base)
+        except Exception:
+            _write_bundle_daily_evidence({})
+    else:
+        _write_bundle_daily_evidence({})
+
+    (bundle_dir / "README.txt").write_text(
+        "MGC Drop Bundle (portable)\n"
         f"drop_id: {drop_id}\n"
         f"ts: {ctx.now.isoformat()}\n"
-        f"context: {getattr(args, 'context', 'focus')}\n",
+        f"context: {context}\n",
         encoding="utf-8",
     )
 
-    drop_evidence = {
-        "drop": {"id": str(drop_id), "ts": ctx.now.isoformat(), "context": getattr(args, "context", "focus")},
+    root_ev = {
+        "drop": {"id": str(drop_id), "ts": ctx.now.isoformat(), "context": context},
         "deterministic": ctx.deterministic,
-        "paths": {"out_dir": str(ctx.out_dir), "bundle_dir": str(bundle_dir), "bundle_readme": str(readme)},
+        "paths": {
+            "out_dir": str(ctx.out_dir),
+            "evidence_dir": str(ctx.evidence_dir),
+            "bundle_dir": str(bundle_dir),
+            "bundle_playlist": str(playlist_path),
+            "bundle_daily_evidence": str(bundle_daily_ev_path),
+        },
     }
-    ev_path = _write_drop_evidence_root(ctx, drop_evidence)
+    ev_path = _write_drop_evidence_root(ctx, root_ev)
 
     if getattr(args, "json", False):
         print(json.dumps({"ok": True, "drop_id": str(drop_id), "drop_evidence": str(ev_path), "bundle_dir": str(bundle_dir)}))
@@ -354,8 +576,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
 
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
-    ctx = _build_run_context(args)
-
     rc = cmd_run_daily(args)
     if rc != 0:
         return rc
@@ -368,35 +588,8 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
 
+    ctx = _build_run_context(args)
     drop_ev = ctx.out_dir / "drop_evidence.json"
-    if not drop_ev.exists():
-        _write_drop_evidence_root(ctx, {"ok": False, "reason": "drop stage did not emit drop_evidence.json"})
-
-    if getattr(args, "build_submission", False):
-        submission_path = ctx.out_dir / "submission.zip"
-
-        files: List[Tuple[Path, str]] = []
-        if drop_ev.exists():
-            files.append((drop_ev, "drop_evidence.json"))
-
-        if ctx.evidence_dir.exists():
-            for p in sorted(ctx.evidence_dir.rglob("*")):
-                if p.is_file():
-                    files.append((p, f"evidence/{p.relative_to(ctx.evidence_dir).as_posix()}"))
-
-        bundle_dir = ctx.out_dir / "drop_bundle"
-        if bundle_dir.exists():
-            for p in sorted(bundle_dir.rglob("*")):
-                if p.is_file():
-                    files.append((p, f"drop_bundle/{p.relative_to(bundle_dir).as_posix()}"))
-
-        _zip_write_deterministic(submission_path, files)
-
-        if getattr(args, "json", False):
-            print(json.dumps({"ok": True, "out_dir": str(ctx.out_dir), "submission": str(submission_path), "drop_evidence": str(drop_ev)}))
-        else:
-            print(f"[run.autonomous] ok submission={submission_path}")
-        return 0
 
     if getattr(args, "json", False):
         print(json.dumps({"ok": True, "out_dir": str(ctx.out_dir), "drop_evidence": str(drop_ev)}))
@@ -412,7 +605,6 @@ def cmd_run_stage(args: argparse.Namespace) -> int:
     con = _connect(ctx.db_path)
     try:
         _ensure_run_stages_table(con)
-
         ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
         stage_id = stable_uuid(ns, f"run_stage:{stage_name}:{ctx.now.isoformat()}", ctx.deterministic)
 
@@ -423,18 +615,16 @@ def cmd_run_stage(args: argparse.Namespace) -> int:
         )
         con.commit()
 
-        ok = True
-        meta = {"note": "stage executed (stub)", "stage": stage_name}
-        finished = fixed_utc_now(args).isoformat() if ctx.deterministic else datetime.now(timezone.utc).isoformat()
-
+        # In deterministic mode, keep finished_ts stable too.
+        finished = (_deterministic_now_utc() if ctx.deterministic else datetime.now(timezone.utc)).isoformat()
         con.execute(
             "UPDATE run_stages SET finished_ts=?, ok=?, meta_json=? WHERE id=?",
-            (finished, 1 if ok else 0, json.dumps(meta, sort_keys=True), str(stage_id)),
+            (finished, 1, json.dumps({"note": "stub", "stage": stage_name}, sort_keys=True), str(stage_id)),
         )
         con.commit()
 
         if getattr(args, "json", False):
-            print(json.dumps({"ok": ok, "stage_id": str(stage_id), "stage": stage_name}))
+            print(json.dumps({"ok": True, "stage_id": str(stage_id), "stage": stage_name}))
         else:
             print(f"[run.stage] ok stage={stage_name} id={stage_id}")
         return 0
@@ -458,25 +648,23 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
 def cmd_run_diff(args: argparse.Namespace) -> int:
     old_p = Path(args.old).resolve()
     new_p = Path(args.new).resolve()
-    old = _read_json(old_p)
-    new = _read_json(new_p)
-    d = diff_manifests(old, new)
+    d = diff_manifests(_read_json(old_p), _read_json(new_p))
+    s = d["summary"]
 
-    summary = d["summary"]
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "summary": summary, "added": d["added"], "removed": d["removed"], "changed": d["changed"]}))
+        print(json.dumps({"ok": True, "summary": s, "added": d["added"], "removed": d["removed"], "changed": d["changed"]}))
     else:
-        print(f"+{summary['added']}  -{summary['removed']}  ~{summary['changed']}  (older={old_p.name} newer={new_p.name})")
+        print(f"+{s['added']}  -{s['removed']}  ~{s['changed']}  (older={old_p.name} newer={new_p.name})")
 
-    if getattr(args, "fail_on_changes", False) and (summary["added"] or summary["removed"] or summary["changed"]):
+    if getattr(args, "fail_on_changes", False) and (s["added"] or s["removed"] or s["changed"]):
         return 2
     return 0
 
 
 def cmd_run_status(args: argparse.Namespace) -> int:
     db_path = _require_db(args)
-
     out: Dict[str, Any] = {"db": str(db_path), "ok": True}
+
     if not db_path.exists():
         out["ok"] = False
         out["reason"] = "db_missing"
@@ -502,6 +690,33 @@ def cmd_run_status(args: argparse.Namespace) -> int:
 
 
 # -----------------------------------------------------------------------------
+# Run dispatcher (covers both mgc.main dispatch styles)
+# -----------------------------------------------------------------------------
+
+def cmd_run_dispatch(args: argparse.Namespace) -> int:
+    cmd = getattr(args, "run_cmd", None)
+    if cmd == "daily":
+        return cmd_run_daily(args)
+    if cmd == "autonomous":
+        return cmd_run_autonomous(args)
+    if cmd == "publish-marketing":
+        return cmd_publish_marketing(args)
+    if cmd == "drop":
+        return cmd_run_drop(args)
+    if cmd == "stage":
+        return cmd_run_stage(args)
+    if cmd == "manifest":
+        return cmd_run_manifest(args)
+    if cmd == "diff":
+        return cmd_run_diff(args)
+    if cmd == "status":
+        return cmd_run_status(args)
+
+    print(f"Unknown run_cmd: {cmd}", file=sys.stderr)
+    return 2
+
+
+# -----------------------------------------------------------------------------
 # Argparse wiring
 # -----------------------------------------------------------------------------
 
@@ -510,11 +725,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "run",
         help="Run pipeline steps (daily, autonomous, publish-marketing, drop, stage, manifest, diff, status)",
     )
+
+    # Provide a handler at the run level too (some mgc.main variants dispatch here).
+    p_run.set_defaults(fn=cmd_run_dispatch, func=cmd_run_dispatch)
+
     run_sub = p_run.add_subparsers(dest="run_cmd", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
-        # IMPORTANT:
-        # - We allow --db here, but with default=SUPPRESS so it doesn't overwrite global args.db.
         p.add_argument("--db", help="DB path (optional if provided globally)", default=argparse.SUPPRESS)
         p.add_argument("--repo-root", default=argparse.SUPPRESS, help="Repository root override (optional if provided globally)")
         p.add_argument("--out-dir", default="artifacts/run", help="Output directory for artifacts")
@@ -523,50 +740,41 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--deterministic", action="store_true", help="Force deterministic mode (CI)")
         p.add_argument("--json", action="store_true", help="JSON output where supported")
 
-    # daily
     p = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
     add_common(p)
-    p.set_defaults(fn=cmd_run_daily)
+    p.set_defaults(fn=cmd_run_daily, func=cmd_run_daily)
 
-    # autonomous
     p = run_sub.add_parser("autonomous", help="Run autonomous pipeline stages (daily -> publish-marketing -> drop)")
     add_common(p)
-    p.add_argument("--build-submission", action="store_true", help="Also build submission.zip under --out-dir")
-    p.set_defaults(fn=cmd_run_autonomous)
+    p.set_defaults(fn=cmd_run_autonomous, func=cmd_run_autonomous)
 
-    # publish-marketing
     p = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
     add_common(p)
-    p.set_defaults(fn=cmd_publish_marketing)
+    p.set_defaults(fn=cmd_publish_marketing, func=cmd_publish_marketing)
 
-    # drop
     p = run_sub.add_parser("drop", help="Create a minimal drop bundle from the latest artifacts")
     add_common(p)
-    p.set_defaults(fn=cmd_run_drop)
+    p.set_defaults(fn=cmd_run_drop, func=cmd_run_drop)
 
-    # stage
     p = run_sub.add_parser("stage", help="Run a named stage with run_stages tracking")
     add_common(p)
     p.add_argument("stage_name", help="Stage name")
-    p.set_defaults(fn=cmd_run_stage)
+    p.set_defaults(fn=cmd_run_stage, func=cmd_run_stage)
 
-    # manifest (no db required)
     p = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
     p.add_argument("--repo-root", default=".", help="Repository root")
     p.add_argument("--out", default="data/evidence/manifest.json", help="Output manifest path")
     p.add_argument("--json", action="store_true", help="JSON output (command result)")
-    p.set_defaults(fn=cmd_run_manifest)
+    p.set_defaults(fn=cmd_run_manifest, func=cmd_run_manifest)
 
-    # diff (no db required)
     p = run_sub.add_parser("diff", help="Compare manifest files (CI gate helper)")
     p.add_argument("--old", default="data/evidence/manifest.json", help="Older manifest path")
     p.add_argument("--new", default="data/evidence/weekly_manifest.json", help="Newer manifest path")
     p.add_argument("--fail-on-changes", action="store_true", help="Exit non-zero if any changes exist")
     p.add_argument("--json", action="store_true", help="JSON diff output")
-    p.set_defaults(fn=cmd_run_diff)
+    p.set_defaults(fn=cmd_run_diff, func=cmd_run_diff)
 
-    # status (db required, but may come from global)
     p = run_sub.add_parser("status", help="Show run/pipeline status snapshot")
     p.add_argument("--db", help="DB path (optional if provided globally)", default=argparse.SUPPRESS)
     p.add_argument("--json", action="store_true", help="JSON output")
-    p.set_defaults(fn=cmd_run_status)
+    p.set_defaults(fn=cmd_run_status, func=cmd_run_status)

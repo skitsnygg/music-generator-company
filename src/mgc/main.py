@@ -133,18 +133,18 @@ def _hoist_global_flags(argv: list[str]) -> list[str]:
     Without hoisting, argparse treats --repo-root as a subcommand arg and errors.
     """
 
-    # Globals that take a value
     flags_with_value = {
         "--db",
         "--repo-root",
         "--log-level",
         "--log-file",
+        "--seed",  # <-- add
     }
 
-    # Globals that are booleans (store_true)
     flags_no_value = {
         "--log-console",
         "--json",
+        "--no-resume",  # <-- add
     }
 
     hoisted: list[str] = []
@@ -1220,6 +1220,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-console", action="store_true")
     p.add_argument("--json", action="store_true", help="Output JSON where supported")
 
+    # CI harness compatibility (accept but don't require downstream usage)
+    p.add_argument("--seed", type=int, default=int(os.environ.get("MGC_SEED", "1")), help="Random seed (CI compatibility)")
+    p.add_argument("--no-resume", action="store_true", help="Disable resume behavior (CI compatibility)")
+
     sub = p.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("status", help="Show health + recent activity snapshot")
@@ -1375,6 +1379,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cooked = _hoist_global_flags(raw)
 
     args = parser.parse_args(cooked)
+
+    # Surface CI compatibility flags to env for downstream code.
+    # (Even if unused today, this avoids future plumbing work.)
+    if getattr(args, "seed", None) is not None:
+        os.environ["MGC_SEED"] = str(args.seed)
+    if getattr(args, "no_resume", False):
+        os.environ["MGC_NO_RESUME"] = "1"
 
     _configure_logging(
         level=getattr(args, "log_level", "INFO"),

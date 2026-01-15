@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # CI gate with modes:
-#   - fast (default): compile + rebuild/verify + optional golden tree hashes (warn-only by default)
-#   - full: fast + autonomous smoke + submission/web determinism + publish determinism + manifest diff + golden checks
+#   - fast (default): compile + rebuild/verify
+#   - full: fast + autonomous smoke + submission/web determinism + publish determinism
 #
 # Env:
 #   MGC_DB             DB path (required)
@@ -11,24 +11,13 @@ set -euo pipefail
 #   MGC_ARTIFACTS_DIR  where to write logs/outputs (default: artifacts/ci)
 #   MGC_OUT_ROOT       override output root for rebuilds:
 #                      - if set to "data", writes to data/playlists + data/tracks
-#                      - otherwise writes under $MGC_ARTIFACTS_DIR/data/...
+#                      - otherwise writes under $MGC_OUT_ROOT/{playlists,tracks}
 #   MGC_CI_MODE        fast|full (default: fast)
 #
 # Evidence contract:
-#   - drop_evidence.json is required and is written by `mgc run autonomous` (baseline contract).
-#
-# Submission determinism:
-#   - scripts/ci_submission_determinism.sh resolves "submission.zip" relative to CWD
-#   - We run determinism scripts from inside evidence_root (cd) so paths resolve correctly
-#
-# Web determinism:
-#   - scripts/ci_web_bundle_determinism.sh may fail if web_manifest.json contains volatile fields
-#   - On that specific failure, ci_gate attempts a normalized manifest compare and only fails
-#     if normalized manifests still differ.
+#   - drop_evidence.json is required and is written under: <out-dir>/evidence/drop_evidence.json
 
-repo_root="$(
-  cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
-)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 PYTHON="${PYTHON:-python}"
@@ -36,12 +25,11 @@ PYTHON="${PYTHON:-python}"
 
 ARTIFACTS_DIR="${MGC_ARTIFACTS_DIR:-artifacts/ci}"
 MODE="${MGC_CI_MODE:-fast}"
-STAMP="${MGC_STAMP:-ci_gate}"
+STAMP="${MGC_STAMP:-ci}"
 
 mkdir -p "$ARTIFACTS_DIR"
 LOG_PATH="$ARTIFACTS_DIR/ci_gate.log"
-
-exec > >(tee -a "$LOG_PATH") 2>&1
+exec > >(tee "$LOG_PATH") 2>&1
 
 echo "[ci_gate] mode=$MODE"
 echo "[ci_gate] Repo: $repo_root"
@@ -66,71 +54,10 @@ _detect_evidence_root() {
   return 1
 }
 
-_sha256_file() {
-  local f="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$f" | awk '{print $1}'
-  else
-    shasum -a 256 "$f" | awk '{print $1}'
-  fi
-}
-
-# -----------------------------
-# build submission.zip deterministically (capability probing)
-# -----------------------------
-_build_submission_zip() {
-  local evidence_root="$1"
-  local out_zip="${evidence_root%/}/submission.zip"
-  rm -f "$out_zip"
-
-  local help
-  help="$($PYTHON -m mgc.main submission --help 2>&1 || true)"
-
-  if echo "$help" | grep -qE -- 'latest'; then
-    local latest_help
-    latest_help="$($PYTHON -m mgc.main submission latest --help 2>&1 || true)"
-    if echo "$latest_help" | grep -qE -- '--evidence-root'; then
-      $PYTHON -m mgc.main --db "$MGC_DB" submission latest \
-        --out "$out_zip" \
-        --evidence-root "$evidence_root" \
-        --json >/dev/null
-    else
-      $PYTHON -m mgc.main --db "$MGC_DB" submission latest \
-        --out "$out_zip" \
-        --json >/dev/null
-    fi
-  else
-    local build_help
-    build_help="$($PYTHON -m mgc.main submission build --help 2>&1 || true)"
-
-    if echo "$build_help" | grep -qE -- '--bundle-dir'; then
-      $PYTHON -m mgc.main submission build \
-        --bundle-dir "$evidence_root" \
-        --out "$out_zip" \
-        --json >/dev/null
-    else
-      echo "[ci_gate] FAIL: could not determine supported submission command (need submission latest or submission build --bundle-dir)" >&2
-      echo "$help" >&2
-      echo "$build_help" >&2
-      exit 2
-    fi
-  fi
-
-  if [ ! -f "$out_zip" ]; then
-    echo "[ci_gate] FAIL: submission.zip was not created at $out_zip" >&2
-    ls -la "$evidence_root" >&2 || true
-    exit 2
-  fi
-  echo "$out_zip"
-}
-
-# -----------------------------
-# web determinism wrapper (normalizes known-volatiles if necessary)
-# -----------------------------
 _run_web_bundle_determinism() {
   local evidence_root="$1"
   set +e
-  ( cd "$evidence_root" && bash "$repo_root/scripts/ci_web_bundle_determinism.sh" --evidence-root "$evidence_root" )
+  ( cd "$EVIDENCE_ROOT" && bash "$repo_root/scripts/ci_web_bundle_determinism.sh" --evidence-root "." )
   local rc=$?
   set -e
   if [ $rc -eq 0 ]; then
@@ -147,7 +74,6 @@ from pathlib import Path
 a = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 b = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 
-# Strip volatile-ish fields if present
 for obj in (a, b):
     if isinstance(obj, dict):
         for k in ["ts", "built_ts", "generated_at"]:
@@ -164,20 +90,11 @@ PY
   return $rc
 }
 
-# -----------------------------
-# Preconditions
-# -----------------------------
 echo "[ci_gate] DB OK."
 
-# -----------------------------
-# compile gate
-# -----------------------------
 echo "[ci_gate] py_compile"
-$PYTHON -m py_compile src/mgc/main.py src/mgc/run_cli.py
+$PYTHON -m py_compile src/mgc/main.py src/mgc/run_cli.py src/mgc/web_cli.py
 
-# -----------------------------
-# rebuild + verify
-# -----------------------------
 echo "[ci_gate] rebuild + verify"
 OUT_ROOT="${MGC_OUT_ROOT:-}"
 if [ -z "$OUT_ROOT" ]; then
@@ -220,9 +137,6 @@ else
   $PYTHON -m mgc.main rebuild verify tracks --out-dir "$OUT_TRACKS" --json >/dev/null
 fi
 
-# -----------------------------
-# Fast mode ends here
-# -----------------------------
 if [ "$MODE" != "full" ]; then
   echo "[ci_gate] OK"
   exit 0
@@ -235,15 +149,54 @@ AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
 rm -rf "$AUTO_OUT"
 mkdir -p "$AUTO_OUT"
 
+AUTONOMOUS_JSON="${AUTO_OUT%/}/autonomous.json"
+AUTONOMOUS_ERR="${AUTO_OUT%/}/autonomous.err"
+rm -f "$AUTONOMOUS_JSON" "$AUTONOMOUS_ERR"
+
 echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
-MGC_DETERMINISTIC=1 \
-$PYTHON -m mgc.main --db "$MGC_DB" --json run autonomous \
-  --context focus \
-  --seed 1 \
-  --out-dir "$AUTO_OUT" \
-  --repo-root "$repo_root" \
-  --no-resume \
-  > "${AUTO_OUT%/}/autonomous.json"
+
+# IMPORTANT:
+# - Do NOT pass random extra flags here (like --evidence-dir).
+# - Keep argv minimal and known-good.
+cmd=(
+  "$PYTHON" -m mgc.main
+  --db "$MGC_DB"
+  --repo-root "$repo_root"
+  --seed 1
+  --no-resume
+  --json
+  run autonomous
+  --context focus
+  --out-dir "$AUTO_OUT"
+)
+
+printf "[ci_gate] autonomous argv:"
+for a in "${cmd[@]}"; do printf " %q" "$a"; done
+printf "\n"
+
+set +e
+MGC_DETERMINISTIC=1 "${cmd[@]}" >"$AUTONOMOUS_JSON" 2>"$AUTONOMOUS_ERR"
+rc=$?
+set -e
+
+if [ $rc -ne 0 ]; then
+  echo "[ci_gate] FAIL: autonomous returned rc=$rc" >&2
+  echo "[ci_gate] autonomous stderr (first 200 lines):" >&2
+  sed -n '1,200p' "$AUTONOMOUS_ERR" >&2 || true
+  echo "[ci_gate] autonomous stdout (first 120 lines):" >&2
+  sed -n '1,120p' "$AUTONOMOUS_JSON" >&2 || true
+  exit 4
+fi
+
+# If someone accidentally printed argparse help to stdout, fail loudly.
+if head -n 1 "$AUTONOMOUS_JSON" | grep -qE '^usage: mgc\b'; then
+  echo "[ci_gate] FAIL: autonomous printed argparse help to stdout" >&2
+  echo "[ci_gate] autonomous stderr (first 200 lines):" >&2
+  sed -n '1,200p' "$AUTONOMOUS_ERR" >&2 || true
+  echo "[ci_gate] autonomous stdout (first 120 lines):" >&2
+  sed -n '1,120p' "$AUTONOMOUS_JSON" >&2 || true
+  exit 4
+fi
 
 EVIDENCE_ROOT="$(_detect_evidence_root "$AUTO_OUT" || true)"
 if [ -z "$EVIDENCE_ROOT" ]; then
@@ -259,7 +212,6 @@ fi
 
 export MGC_EVIDENCE_DIR="$EVIDENCE_ROOT"
 echo "[ci_gate] evidence_root=$EVIDENCE_ROOT"
-echo "[ci_gate] playlist_path=${EVIDENCE_ROOT%/}/playlist.json"
 
 if [ ! -f "${EVIDENCE_ROOT%/}/drop_evidence.json" ]; then
   echo "[ci_gate] FAIL: missing drop_evidence.json under $EVIDENCE_ROOT" >&2
@@ -268,7 +220,7 @@ if [ ! -f "${EVIDENCE_ROOT%/}/drop_evidence.json" ]; then
 fi
 
 echo "[ci_gate] determinism gate: submission.zip (evidence-root=$EVIDENCE_ROOT)"
-( cd "$EVIDENCE_ROOT" && bash "$repo_root/scripts/ci_submission_determinism.sh" --evidence-root "$EVIDENCE_ROOT" )
+( cd "$EVIDENCE_ROOT" && bash "$repo_root/scripts/ci_submission_determinism.sh" --evidence-root "." )
 
 echo "[ci_gate] determinism gate: web bundle (evidence-root=$EVIDENCE_ROOT)"
 _run_web_bundle_determinism "$EVIDENCE_ROOT"
