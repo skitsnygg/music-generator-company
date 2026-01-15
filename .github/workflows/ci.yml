@@ -210,7 +210,7 @@ jobs:
           bash scripts/ci_gate.sh
 
       # -----------------------------
-      # Extra checks: full only (keep, but remove mgc run drop --out-dir usage)
+      # Extra checks: full only
       # -----------------------------
       - name: Run determinism gate (existing)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -226,24 +226,20 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
-      # This replaces the old "Web player build (real drop bundle -> playlist -> build)" step.
-      # We now build the drop using the evidence produced by scripts/ci_gate.sh (autonomous smoke),
-      # instead of invoking mgc run drop with unsupported --out-dir.
+      # Evidence-driven web build: do NOT call `mgc run drop --out-dir`.
       - name: Web player build (from CI gate evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           WEB_DIR: ${{ env.MGC_WEB_DIR }}
           ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
         run: |
           set -euxo pipefail
 
           rm -rf "${WEB_DIR}"
           mkdir -p "${WEB_DIR}"
 
-          # Expected from the CI gate / autonomous smoke run:
-          #   ${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json
-          EVIDENCE="${ARTIFACTS_DIR}/auto/drop_evidence.json"
           test -s "${EVIDENCE}"
 
           # Extract playlist path from evidence
@@ -254,15 +250,13 @@ jobs:
           evidence = Path(os.environ["EVIDENCE"])
           obj = json.loads(evidence.read_text(encoding="utf-8"))
           paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
-          p = paths.get("playlist_path") or ""
-          print(p)
+          print(paths.get("playlist_path", "") or "")
           PY
           )"
 
           test -n "${PLAYLIST_PATH}"
           test -s "${PLAYLIST_PATH}"
 
-          # Build web player directly from the playlist path (no need to cd into a drop dir)
           python -m mgc.main web build \
             --playlist "${PLAYLIST_PATH}" \
             --out-dir "${WEB_DIR}" \
@@ -274,9 +268,6 @@ jobs:
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
-
-        env:
-          EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
 
       - name: Submission artifact check (reads drop_evidence.json safely)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
