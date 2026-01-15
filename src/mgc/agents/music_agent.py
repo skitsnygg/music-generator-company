@@ -2,36 +2,28 @@
 """
 src/mgc/agents/music_agent.py
 
-Music Agent: generate tracks via the provider registry.
+Music Agent: generates tracks via the provider registry.
 
-Key rule:
-- This module must NOT directly import or instantiate provider implementations
-  (riffusion/stub/suno/etc). It must ONLY use:
-      from mgc.providers import GenerateRequest, get_provider
+Aligned with the project's current provider contract:
+- mgc.providers.get_provider(name) -> provider
+- provider.generate(...) -> dict with:
+    artifact_path, sha256, track_id, provider, meta, genre, mood, title
 
-Why:
-- Single source of truth for provider selection and configuration
-- Avoid import-time NameError/Module drift
-- CI friendliness (registry can expose only stub; others can be staged)
+Key rules:
+- No direct imports of provider implementations here.
+- Deterministic mode must not depend on wall clock randomness.
 """
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from mgc.context import build_prompt
-from mgc.providers import GenerateRequest, GenerateResult, MusicProvider, get_provider
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def _stable_sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+from mgc.providers import get_provider
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -41,30 +33,54 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-# ---------------------------------------------------------------------------
-# Public agent
-# ---------------------------------------------------------------------------
+def _fixed_now_iso(deterministic: bool) -> str:
+    if deterministic:
+        fixed = (os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z").strip()
+        return fixed.replace("Z", "+00:00")
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@dataclass(frozen=True)
+class TrackArtifact:
+    track_id: str
+    provider: str
+    artifact_path: str
+    sha256: str
+    title: str
+    mood: str
+    genre: str
+    meta: Dict[str, Any]
+    preview_path: str = ""  # optional; can be set later by pipeline/web tools
+
 
 @dataclass
 class MusicAgentConfig:
     provider: str = "stub"
-    strict_provider: bool = False  # if True, unknown provider is a hard error
+    strict_provider: bool = False
 
 
 class MusicAgent:
     """
-    Generates a track via the provider registry.
+    Generates a TrackArtifact via provider registry.
 
     Expected workflow:
       agent = MusicAgent(provider="stub")
-      res = agent.generate(
+      track = agent.generate(
           track_id=...,
-          run_id=...,
           context="focus",
-          seed="1",
+          seed=1,
           deterministic=True,
-          ts="2020-01-01T00:00:00+00:00",
-          out_rel="data/tracks/<id>.wav",
+          schedule="daily",
+          period_key="2020-01-01",
+          out_dir="artifacts/run"
       )
     """
 
@@ -73,112 +89,73 @@ class MusicAgent:
         strict = _env_bool("MGC_STRICT_PROVIDER", False) if strict_provider is None else bool(strict_provider)
         self.cfg = MusicAgentConfig(provider=p, strict_provider=strict)
 
-    def _resolve_provider(self) -> MusicProvider:
-        """
-        Resolve provider from registry. If provider isn't present:
-          - strict_provider=True => raise
-          - else fallback to stub
-        """
+    def _resolve_provider_name(self) -> str:
+        return (self.cfg.provider or "stub").strip().lower()
+
+    def _resolve_provider(self):
+        name = self._resolve_provider_name()
         try:
-            return get_provider(self.cfg.provider)
+            return get_provider(name)
         except Exception as e:
             if self.cfg.strict_provider:
                 raise
-            # fallback to stub (CI-safe)
-            if self.cfg.provider != "stub":
-                # avoid noisy prints in library code; carry info in exception-friendly way
-                # callers can log this if desired
+            if name != "stub":
                 self.cfg.provider = "stub"
-            try:
                 return get_provider("stub")
-            except Exception:
-                # If even stub isn't available, propagate the original error
-                raise e
+            raise e
 
     def generate(
         self,
         *,
         track_id: str,
-        run_id: str,
         context: str,
-        seed: str,
+        seed: int,
         deterministic: bool,
-        ts: str,
-        out_rel: str,
-        prompt: Optional[str] = None,
-    ) -> GenerateResult:
-        """
-        Generate one track via provider registry.
-
-        prompt:
-          - if None, uses mgc.context.build_prompt(context)
-        """
+        schedule: str,
+        period_key: str,
+        out_dir: str | Path,
+        now_iso: Optional[str] = None,
+    ) -> TrackArtifact:
         provider = self._resolve_provider()
-        prompt_text = prompt if isinstance(prompt, str) and prompt.strip() else build_prompt(context)
+        ts = now_iso or _fixed_now_iso(deterministic)
 
-        req = GenerateRequest(
-            track_id=track_id,
-            run_id=run_id,
-            context=context,
-            seed=str(seed),
-            prompt=prompt_text,
+        art = provider.generate(
+            out_dir=out_dir,
+            track_id=str(track_id),
+            context=str(context),
+            seed=int(seed),
             deterministic=bool(deterministic),
-            ts=ts,
-            out_rel=out_rel,
+            now_iso=str(ts),
+            schedule=str(schedule),
+            period_key=str(period_key),
         )
-        res = provider.generate(req)
 
-        # Ensure required fields are present/sane
-        if not isinstance(res, GenerateResult):
-            raise TypeError(f"Provider {getattr(provider, 'name', '?')} returned non-GenerateResult: {type(res)}")
-        if not isinstance(res.artifact_bytes, (bytes, bytearray)):
-            raise TypeError("GenerateResult.artifact_bytes must be bytes")
-        if not isinstance(res.ext, str) or not res.ext.strip():
-            raise ValueError("GenerateResult.ext must be a non-empty string")
-        if not res.ext.startswith("."):
-            res.ext = "." + res.ext
+        if not isinstance(art, dict):
+            raise TypeError(f"Provider returned non-dict artifact: {type(art)}")
 
-        # Add some helpful meta without changing provider output semantics
-        res.meta = dict(res.meta or {})
-        res.meta.setdefault("run_id", run_id)
-        res.meta.setdefault("track_id", track_id)
-        res.meta.setdefault("context", context)
-        res.meta.setdefault("seed", str(seed))
-        res.meta.setdefault("prompt_hash", _stable_sha256_hex(prompt_text))
-        res.meta.setdefault("deterministic", bool(deterministic))
+        artifact_path = str(art.get("artifact_path") or "")
+        if not artifact_path:
+            raise ValueError("Provider artifact missing artifact_path")
 
-        return res
+        sha = str(art.get("sha256") or "")
+        if not sha:
+            sha = _sha256_file(Path(artifact_path))
 
-    # Backwards-compatible helper: if older code called agent.run(...) or similar,
-    # this provides a stable minimal return shape without importing specific providers.
-    def run(
-        self,
-        *,
-        track_id: str,
-        run_id: str,
-        context: str,
-        seed: str,
-        deterministic: bool,
-        ts: str,
-        out_rel: str,
-        prompt: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Convenience wrapper returning a dict (useful for pipelines/tests).
-        """
-        res = self.generate(
-            track_id=track_id,
-            run_id=run_id,
-            context=context,
-            seed=seed,
-            deterministic=deterministic,
-            ts=ts,
-            out_rel=out_rel,
-            prompt=prompt,
+        meta = dict(art.get("meta") or {})
+        meta.setdefault("context", context)
+        meta.setdefault("seed", int(seed))
+        meta.setdefault("schedule", schedule)
+        meta.setdefault("period_key", period_key)
+        meta.setdefault("deterministic", bool(deterministic))
+
+        return TrackArtifact(
+            track_id=str(art.get("track_id") or track_id),
+            provider=str(art.get("provider") or getattr(provider, "name", "unknown")),
+            artifact_path=artifact_path,
+            sha256=sha,
+            title=str(art.get("title") or f"{context.title()} Track"),
+            mood=str(art.get("mood") or context),
+            genre=str(art.get("genre") or "unknown"),
+            meta=meta,
+            preview_path=str(meta.get("preview_path") or ""),
         )
-        return {
-            "provider": res.provider,
-            "ext": res.ext,
-            "artifact_bytes_len": len(res.artifact_bytes),
-            "meta": dict(res.meta or {}),
-        }

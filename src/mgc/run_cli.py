@@ -7,6 +7,7 @@ Run/pipeline CLI for Music Generator Company (MGC).
 CI contracts:
 - In --json mode, each command must emit EXACTLY ONE JSON object to stdout.
 - Human logs must go to stderr.
+- Composite commands (weekly/autonomous) must not leak sub-step logs/JSON.
 
 Determinism:
 - evidence/* must not contain absolute out_dir-dependent paths.
@@ -14,12 +15,17 @@ Determinism:
 
 ci_root_determinism.sh contract:
 - `python -m mgc.main --json run drop ...` output JSON must include paths.manifest_sha256.
+
+Agents:
+- Music generation goes through mgc.agents.music_agent.MusicAgent
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -29,8 +35,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-from mgc.providers import ProviderError, get_provider
 
 
 # -----------------------------------------------------------------------------
@@ -44,6 +48,24 @@ def _log(msg: str) -> None:
 def _emit_json(obj: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
     sys.stdout.flush()
+
+
+@contextlib.contextmanager
+def _silence_stdio(enabled: bool) -> None:
+    """
+    Suppress stdout+stderr for nested sub-steps when parent command is in --json mode.
+    """
+    if not enabled:
+        yield
+        return
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        yield
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
 
 
 # -----------------------------------------------------------------------------
@@ -110,52 +132,6 @@ def _iso_week_period(d: date) -> Tuple[date, date, str]:
     iso_year, iso_week, _ = d.isocalendar()
     label = f"{iso_year}-W{iso_week:02d}"
     return monday, sunday, label
-
-
-# -----------------------------------------------------------------------------
-# Provider artifact normalization
-# -----------------------------------------------------------------------------
-
-def _art_get(art: Any, key: str, default: Any = None) -> Any:
-    if art is None:
-        return default
-    if isinstance(art, dict):
-        return art.get(key, default)
-    return getattr(art, key, default)
-
-
-def _normalize_art(
-    art: Any,
-    *,
-    fallback_track_id: str,
-    fallback_provider: str,
-    fallback_context: str,
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-
-    out["provider"] = _art_get(art, "provider", fallback_provider)
-    out["track_id"] = _art_get(art, "track_id", fallback_track_id)
-    out["artifact_path"] = _art_get(art, "artifact_path")
-    out["sha256"] = _art_get(art, "sha256")
-
-    out["meta"] = _art_get(art, "meta", {}) or {}
-    out["genre"] = _art_get(art, "genre", "") or ""
-    out["mood"] = _art_get(art, "mood", "") or ""
-    out["title"] = _art_get(art, "title", "") or ""
-
-    if not out["title"]:
-        out["title"] = f"{fallback_context.title()} Track"
-    if not out["genre"]:
-        out["genre"] = out["provider"] or "unknown"
-    if not out["mood"]:
-        out["mood"] = fallback_context
-
-    if not out["artifact_path"]:
-        raise SystemExit("Provider returned no artifact_path")
-    if not out["sha256"]:
-        out["sha256"] = _sha256_file(Path(str(out["artifact_path"])))
-
-    return out
 
 
 # -----------------------------------------------------------------------------
@@ -250,7 +226,7 @@ def _build_run_context(args: argparse.Namespace) -> RunContext:
 def _run_daily_no_emit(args: argparse.Namespace) -> Dict[str, Any]:
     """
     Do daily generation + write evidence/daily_evidence.json, but DO NOT print anything.
-    Returns {run_id, track_id, rel_track_path}.
+    Returns {run_id, track_id, rel_track_path, artifact_path, sha256}.
     """
     ctx = _build_run_context(args)
     context = getattr(args, "context", "focus")
@@ -259,21 +235,21 @@ def _run_daily_no_emit(args: argparse.Namespace) -> Dict[str, Any]:
     run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{context}", ctx.deterministic)
     track_id = stable_uuid(ns, f"track:daily:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
 
-    provider = get_provider(ctx.provider)
-    art_raw = provider.generate(
-        out_dir=ctx.out_dir,
+    from mgc.agents.music_agent import MusicAgent
+
+    agent = MusicAgent(provider=ctx.provider)
+    track = agent.generate(
         track_id=str(track_id),
-        context=context,
-        seed=ctx.seed,
-        deterministic=ctx.deterministic,
-        now_iso=ctx.now.isoformat(),
+        context=str(context),
+        seed=int(ctx.seed),
+        deterministic=bool(ctx.deterministic),
         schedule="daily",
         period_key=ctx.now.date().isoformat(),
+        out_dir=str(ctx.out_dir),
+        now_iso=ctx.now.isoformat(),
     )
 
-    art = _normalize_art(art_raw, fallback_track_id=str(track_id), fallback_provider=ctx.provider, fallback_context=context)
-
-    wav_path = Path(str(art["artifact_path"]))
+    wav_path = Path(track.artifact_path)
     rel_track_path = _as_rel_posix(f"tracks/{wav_path.name}")
 
     ev = {
@@ -284,19 +260,34 @@ def _run_daily_no_emit(args: argparse.Namespace) -> Dict[str, Any]:
         "context": context,
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
-        "provider": art["provider"],
-        "track": {"track_id": art["track_id"], "path": rel_track_path},
-        "sha256": {"track": str(art["sha256"])},
-        "meta": art.get("meta") or {},
+        "provider": track.provider,
+        "track": {"track_id": track.track_id, "path": rel_track_path},
+        "sha256": {"track": str(track.sha256)},
+        "meta": track.meta or {},
     }
     _json_dump(ev, ctx.evidence_dir / "daily_evidence.json")
-    return {"run_id": str(run_id), "track_id": art["track_id"], "rel_track_path": rel_track_path}
+
+    return {
+        "run_id": str(run_id),
+        "track_id": track.track_id,
+        "rel_track_path": rel_track_path,
+        "artifact_path": track.artifact_path,
+        "sha256": track.sha256,
+    }
 
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     info = _run_daily_no_emit(args)
     if getattr(args, "json", False):
-        _emit_json({"ok": True, "stage": "daily", "run_id": info["run_id"], "track_id": info["track_id"], "paths": {"daily_evidence": "evidence/daily_evidence.json"}})
+        _emit_json(
+            {
+                "ok": True,
+                "stage": "daily",
+                "run_id": info["run_id"],
+                "track_id": info["track_id"],
+                "paths": {"daily_evidence": "evidence/daily_evidence.json"},
+            }
+        )
     else:
         _log(f"[run.daily] ok run_id={info['run_id']}")
     return 0
@@ -343,23 +334,23 @@ def _write_drop_bundle(*, ctx: RunContext, context: str, schedule: str) -> Tuple
 
     drop_id = stable_uuid(ns, f"drop:{schedule}:{period_key}:{context}", ctx.deterministic)
     run_id = stable_uuid(ns, f"run:{schedule}:{ctx.now.isoformat()}:{context}", ctx.deterministic)
-    track_id = stable_uuid(ns, f"track:{schedule}:{period_key}:{context}", ctx.deterministic)
+    bundle_track_id = stable_uuid(ns, f"track:{schedule}:{period_key}:{context}", ctx.deterministic)
     playlist_id = stable_uuid(ns, f"playlist:{schedule}:{period_key}:{context}", ctx.deterministic)
 
-    provider = get_provider(ctx.provider)
-    art_raw = provider.generate(
-        out_dir=ctx.out_dir,
-        track_id=str(track_id),
-        context=context,
-        seed=ctx.seed,
-        deterministic=ctx.deterministic,
+    from mgc.agents.music_agent import MusicAgent
+    agent = MusicAgent(provider=ctx.provider)
+    track = agent.generate(
+        track_id=str(bundle_track_id),
+        context=str(context),
+        seed=int(ctx.seed),
+        deterministic=bool(ctx.deterministic),
+        schedule=str(schedule),
+        period_key=str(period_key),
+        out_dir=str(ctx.out_dir),
         now_iso=ctx.now.isoformat(),
-        schedule=schedule,
-        period_key=period_key,
     )
-    art = _normalize_art(art_raw, fallback_track_id=str(track_id), fallback_provider=ctx.provider, fallback_context=context)
 
-    src_path = Path(str(art["artifact_path"]))
+    src_path = Path(track.artifact_path)
 
     bundle_dir = ctx.out_dir / "drop_bundle"
     bundle_tracks = bundle_dir / "tracks"
@@ -381,13 +372,13 @@ def _write_drop_bundle(*, ctx: RunContext, context: str, schedule: str) -> Tuple
         "period": {"key": period_key, "label": period_label, "start_date": period_start.isoformat(), "end_date": period_end.isoformat()},
         "ts": ctx.now.isoformat(),
         "tracks": [{
-            "track_id": art["track_id"],
-            "title": art["title"],
+            "track_id": track.track_id,
+            "title": track.title,
             "path": rel_track_path,
             "artifact_path": rel_track_path,
-            "provider": art["provider"],
-            "genre": art["genre"],
-            "mood": art["mood"],
+            "provider": track.provider,
+            "genre": track.genre,
+            "mood": track.mood,
         }],
     }
     _json_dump(playlist, playlist_path)
@@ -404,9 +395,9 @@ def _write_drop_bundle(*, ctx: RunContext, context: str, schedule: str) -> Tuple
         "ts": ctx.now.isoformat(),
         "schedule": schedule,
         "period": {"key": period_key, "label": period_label, "start_date": period_start.isoformat(), "end_date": period_end.isoformat()},
-        "track": {"track_id": art["track_id"], "path": rel_track_path},
+        "track": {"track_id": track.track_id, "path": rel_track_path},
         "sha256": {"track": bundle_track_sha, "playlist": playlist_sha},
-        "meta": art.get("meta") or {},
+        "meta": track.meta or {},
     }
     _json_dump(bundle_daily, bundle_daily_ev_path)
 
@@ -479,7 +470,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
-    # DO daily work without emitting anything (so run drop outputs ONE JSON object).
     _run_daily_no_emit(args)
 
     ctx = _build_run_context(args)
@@ -519,40 +509,36 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
 
 def cmd_run_weekly(args: argparse.Namespace) -> int:
-    # daily + publish without extra JSON emissions
-    _run_daily_no_emit(args)
-    # publish-marketing should not emit JSON as part of weekly JSON output; keep it quiet:
-    # Temporarily force args.json false for publish if we're in json mode.
     json_mode = bool(getattr(args, "json", False))
-    if json_mode:
-        setattr(args, "json", False)
-    cmd_publish_marketing(args)
-    if json_mode:
-        setattr(args, "json", True)
+
+    _run_daily_no_emit(args)
+
+    # In JSON mode, silence the nested marketing step entirely.
+    with _silence_stdio(json_mode):
+        cmd_publish_marketing(args)
 
     ctx = _build_run_context(args)
     context = getattr(args, "context", "focus")
-    drop_id, produced = _write_drop_bundle(ctx=ctx, context=context, schedule="weekly")
+    drop_id, _produced = _write_drop_bundle(ctx=ctx, context=context, schedule="weekly")
 
     if getattr(args, "json", False):
         _emit_json({"ok": True, "stage": "weekly", "drop_id": str(drop_id), "paths": {"drop_evidence": "drop_evidence.json", "bundle_dir": "drop_bundle"}})
     else:
-        _log(f"[run.weekly] ok drop_id={drop_id} evidence={produced['drop_evidence']}")
+        _log(f"[run.weekly] ok drop_id={drop_id}")
     return 0
 
 
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
-    # In JSON mode autonomous should output ONE JSON object; keep sub-steps quiet.
     json_mode = bool(getattr(args, "json", False))
-    if json_mode:
-        setattr(args, "json", False)
 
     _run_daily_no_emit(args)
-    cmd_publish_marketing(args)
-    cmd_run_drop(args)
 
-    if json_mode:
-        setattr(args, "json", True)
+    # Silence nested sub-steps if parent is JSON.
+    with _silence_stdio(json_mode):
+        cmd_publish_marketing(args)
+        cmd_run_drop(args)
+
+    if getattr(args, "json", False):
         _emit_json({"ok": True, "stage": "autonomous", "paths": {"drop_evidence": "drop_evidence.json", "bundle_dir": "drop_bundle"}})
     else:
         ctx = _build_run_context(args)
@@ -628,7 +614,6 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--provider", default=os.environ.get("MGC_PROVIDER", "stub"))
         p.add_argument("--seed", type=int, default=int(os.environ.get("MGC_SEED", "1")))
         p.add_argument("--deterministic", action="store_true")
-        # compatibility flags used by CI scripts
         p.add_argument("--limit", type=int, default=int(os.environ.get("MGC_PUBLISH_LIMIT", "200")))
         p.add_argument("--dry-run", dest="dry_run", action="store_true")
 
