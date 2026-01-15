@@ -227,7 +227,7 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
-      - name: Web player build (from evidence or fail with debug)
+      - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
@@ -241,11 +241,15 @@ jobs:
 
           test -s "${EVIDENCE}"
 
+          # Resolve playlist path:
+          # - If evidence gives an absolute path, use it.
+          # - If evidence gives a relative path (e.g., "playlist.json"),
+          #   resolve it relative to the evidence file directory.
           PLAYLIST_PATH="$(python - <<'PY'
           import json, os, sys
           from pathlib import Path
 
-          evidence_path = Path(os.environ["EVIDENCE"])
+          evidence_path = Path(os.environ["EVIDENCE"]).resolve()
           obj = json.loads(evidence_path.read_text(encoding="utf-8"))
 
           def dig(d, *keys):
@@ -267,29 +271,21 @@ jobs:
               obj.get("playlist") if isinstance(obj, dict) else None,
           ]
 
+          raw = None
           for c in candidates:
               if isinstance(c, str) and c.strip():
-                  print(c.strip())
-                  sys.exit(0)
+                  raw = c.strip()
+                  break
 
-          print("ERROR: Could not find playlist path in evidence.", file=sys.stderr)
-          if isinstance(obj, dict):
-              print("Top-level keys:", sorted(obj.keys()), file=sys.stderr)
-              paths = obj.get("paths")
-              if isinstance(paths, dict):
-                  print("paths keys:", sorted(paths.keys()), file=sys.stderr)
-              drop = obj.get("drop")
-              if isinstance(drop, dict):
-                  print("drop keys:", sorted(drop.keys()), file=sys.stderr)
-                  dpaths = drop.get("paths")
-                  if isinstance(dpaths, dict):
-                      print("drop.paths keys:", sorted(dpaths.keys()), file=sys.stderr)
+          if not raw:
+              print("ERROR: Could not find playlist path in evidence.", file=sys.stderr)
+              sys.exit(2)
 
-          raw = evidence_path.read_text(encoding="utf-8")
-          print("---- drop_evidence.json (first 8000 chars) ----", file=sys.stderr)
-          print(raw[:8000], file=sys.stderr)
-          print("---- end ----", file=sys.stderr)
-          sys.exit(2)
+          p = Path(raw)
+          if not p.is_absolute():
+              p = (evidence_path.parent / p).resolve()
+
+          print(str(p))
           PY
           )"
 
@@ -308,6 +304,7 @@ jobs:
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
+      
 
       - name: Submission artifact check (reads drop_evidence.json safely)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
