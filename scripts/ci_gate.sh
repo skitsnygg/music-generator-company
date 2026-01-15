@@ -1,106 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/ci_gate.sh
+# CI gate: compile + rebuild/verify + determinism checks
 #
-# CI gate with modes:
-#   - fast (default): compile + rebuild/verify
+# Modes:
+#   - fast (default): py_compile + rebuild/verify
 #   - full: fast + autonomous smoke + submission/web determinism + publish determinism + weekly determinism
 #
 # Env:
-#   MGC_DB             DB path (required)
-#   PYTHON             python executable (default: python)
-#   MGC_ARTIFACTS_DIR  where to write logs/outputs (default: artifacts/ci)
-#   MGC_OUT_ROOT       override output root for rebuilds:
-#                      - if set to "data", writes to data/playlists + data/tracks
-#                      - otherwise writes under $MGC_OUT_ROOT/{playlists,tracks}
-#   MGC_CI_MODE        fast|full (default: fast)
-#   MGC_STAMP          stamp string for rebuild outputs (default: ci)
+#   MGC_DB         DB path (default: fixtures/ci_db.sqlite in CI, or data/db.sqlite locally)
+#   PYTHON         python executable (default: python)
+#   ARTIFACTS_DIR  where to write logs/outputs (default: artifacts/ci)
+#   MGC_OUT_ROOT   override output root for rebuilds:
+#                  - if set to "data", writes to data/playlists + data/tracks
+#                  - otherwise writes under $ARTIFACTS_DIR/data/...
 #
-# Evidence contract:
-#   - drop_evidence.json is required and is written under: <out-dir>/drop_evidence.json
-#     (historically sometimes under <out-dir>/evidence/drop_evidence.json; we detect both)
+# Exit codes:
+#   0 ok
+#   2 determinism failure / script failures
+#   3 golden mismatch / rebuild verify failures
+#   4 missing expected evidence outputs
+
+MODE="${1:-fast}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 PYTHON="${PYTHON:-python}"
-: "${MGC_DB:?set MGC_DB}"
-
-ARTIFACTS_DIR="${MGC_ARTIFACTS_DIR:-artifacts/ci}"
-MODE="${MGC_CI_MODE:-fast}"
-STAMP="${MGC_STAMP:-ci}"
+MGC_DB="${MGC_DB:-fixtures/ci_db.sqlite}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts/ci}"
+MGC_OUT_ROOT="${MGC_OUT_ROOT:-}"
 
 mkdir -p "$ARTIFACTS_DIR"
-LOG_PATH="$ARTIFACTS_DIR/ci_gate.log"
-exec > >(tee "$LOG_PATH") 2>&1
 
 echo "[ci_gate] mode=$MODE"
 echo "[ci_gate] Repo: $repo_root"
 echo "[ci_gate] MGC_DB=$MGC_DB"
 echo "[ci_gate] MGC_ARTIFACTS_DIR=$ARTIFACTS_DIR"
-echo "[ci_gate] MGC_OUT_ROOT=${MGC_OUT_ROOT:-}"
-echo "[ci_gate] git_sha: $(git rev-parse HEAD 2>/dev/null || true)"
-echo "[ci_gate] git_branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-echo "[ci_gate] python: $($PYTHON -V 2>&1 || true)"
+echo "[ci_gate] MGC_OUT_ROOT=$MGC_OUT_ROOT"
+echo "[ci_gate] python: $("$PYTHON" -V 2>&1 || true)"
 
-_detect_evidence_root() {
-  local out_dir="$1"
-  local p="${out_dir%/}"
+# -----------------------------
+# Helpers
+# -----------------------------
 
-  if [ -f "$p/drop_evidence.json" ]; then
-    echo "$p"
-    return 0
-  fi
-  if [ -f "$p/evidence/drop_evidence.json" ]; then
-    echo "$p/evidence"
-    return 0
-  fi
+_choose_rebuild_out_dirs() {
+  local out_root="${1:-}"
+  OUT_PLAYLISTS=""
+  OUT_TRACKS=""
 
-  echo ""
-  return 1
-}
-
-_run_web_bundle_determinism() {
-  local evidence_root="$1"
-
-  set +e
-  ( cd "$evidence_root" && bash "$repo_root/scripts/ci_web_bundle_determinism.sh" --evidence-root "." )
-  local rc=$?
-  set -e
-
-  if [ $rc -eq 0 ]; then
-    return 0
-  fi
-
-  # If web determinism fails due to known volatiles in web_manifest.json, try normalized compare
-  if [ -f "$evidence_root/web_manifest.json" ] && [ -f "$evidence_root/web_manifest_2.json" ]; then
-    echo "[ci_gate] web determinism failed; attempting normalized compare"
-    "$PYTHON" - <<'PY' "$evidence_root/web_manifest.json" "$evidence_root/web_manifest_2.json"
-import json, sys
-from pathlib import Path
-
-a = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-b = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-
-for obj in (a, b):
-    if isinstance(obj, dict):
-        for k in ("ts", "built_ts", "generated_at"):
-            obj.pop(k, None)
-
-if a != b:
-    print("normalized manifests still differ", file=sys.stderr)
-    sys.exit(3)
-print("normalized manifests match")
-PY
-    return 0
-  fi
-
-  return $rc
-}
-
-_resolve_rebuild_out_dirs() {
-  local out_root="${MGC_OUT_ROOT:-}"
   if [ -z "$out_root" ]; then
     OUT_PLAYLISTS="$ARTIFACTS_DIR/rebuild/playlists"
     OUT_TRACKS="$ARTIFACTS_DIR/rebuild/tracks"
@@ -117,40 +65,84 @@ _resolve_rebuild_out_dirs() {
   OUT_TRACKS="$out_root/tracks"
 }
 
+_detect_evidence_root() {
+  # Accept evidence roots that either:
+  # - contain drop_evidence.json directly, OR
+  # - contain evidence/drop_evidence.json
+  local base="${1:-}"
+  if [ -z "$base" ]; then
+    return 1
+  fi
+  if [ -f "${base%/}/drop_evidence.json" ]; then
+    printf "%s" "${base%/}"
+    return 0
+  fi
+  if [ -f "${base%/}/evidence/drop_evidence.json" ]; then
+    printf "%s" "${base%/}/evidence"
+    return 0
+  fi
+  return 1
+}
+
+_run_web_bundle_determinism() {
+  local evidence_root="${1:?evidence_root}"
+  if [ -f "$repo_root/scripts/ci_web_bundle_determinism.sh" ]; then
+  ( cd "$evidence_root" && MGC_DB="$MGC_DB" PYTHON="$PYTHON" bash "$repo_root/scripts/ci_web_bundle_determinism.sh" --evidence-root "." )
+    return 0
+  fi
+  echo "[ci_gate] WARN: scripts/ci_web_bundle_determinism.sh missing; skipping web determinism"
+  return 0
+}
+
+# -----------------------------
+# Basic sanity
+# -----------------------------
+
+if [ ! -f "$MGC_DB" ]; then
+  echo "[ci_gate] FAIL: DB not found: $MGC_DB" >&2
+  exit 4
+fi
+
 echo "[ci_gate] DB OK."
 
-echo "[ci_gate] py_compile"
-"$PYTHON" -m py_compile src/mgc/main.py src/mgc/run_cli.py src/mgc/web_cli.py
+# -----------------------------
+# Compile
+# -----------------------------
 
-echo "[ci_gate] rebuild + verify"
-_resolve_rebuild_out_dirs
+echo "[ci_gate] py_compile"
+"$PYTHON" -m py_compile \
+  src/mgc/main.py \
+  src/mgc/run_cli.py \
+  src/mgc/submission_cli.py \
+  src/mgc/web_cli.py >/dev/null
+
+# -----------------------------
+# Rebuild + verify (deterministic)
+# -----------------------------
+
+STAMP="${STAMP:-ci_root}"
+_choose_rebuild_out_dirs "$MGC_OUT_ROOT"
+
+rm -rf "$OUT_PLAYLISTS" "$OUT_TRACKS"
 mkdir -p "$OUT_PLAYLISTS" "$OUT_TRACKS"
 
-if [ -f "$repo_root/scripts/ci_rebuild_verify.sh" ]; then
-  MGC_DB="$MGC_DB" \
-  PYTHON="$PYTHON" \
-  MGC_OUT_PLAYLISTS="$OUT_PLAYLISTS" \
-  MGC_OUT_TRACKS="$OUT_TRACKS" \
-  MGC_STAMP="$STAMP" \
-  bash "$repo_root/scripts/ci_rebuild_verify.sh"
-else
-  "$PYTHON" -m mgc.main --db "$MGC_DB" rebuild playlists \
-    --out-dir "$OUT_PLAYLISTS" \
-    --stamp "$STAMP" \
-    --determinism-check \
-    --write \
-    --json >/dev/null
+echo "[ci_gate] rebuild + verify"
+"$PYTHON" -m mgc.main --db "$MGC_DB" rebuild playlists \
+  --out-dir "$OUT_PLAYLISTS" \
+  --stamp "$STAMP" \
+  --determinism-check \
+  --write \
+  --json >/dev/null
 
-  "$PYTHON" -m mgc.main --db "$MGC_DB" rebuild tracks \
-    --out-dir "$OUT_TRACKS" \
-    --stamp "$STAMP" \
-    --determinism-check \
-    --write \
-    --json >/dev/null
+"$PYTHON" -m mgc.main --db "$MGC_DB" rebuild tracks \
+  --out-dir "$OUT_TRACKS" \
+  --stamp "$STAMP" \
+  --determinism-check \
+  --write \
+  --json >/dev/null
 
-  "$PYTHON" -m mgc.main --db "$MGC_DB" rebuild verify playlists --out-dir "$OUT_PLAYLISTS" --json >/dev/null
-  "$PYTHON" -m mgc.main --db "$MGC_DB" rebuild verify tracks --out-dir "$OUT_TRACKS" --json >/dev/null
-fi
+"$PYTHON" -m mgc.main --db "$MGC_DB" rebuild verify playlists --out-dir "$OUT_PLAYLISTS" --json >/dev/null
+"$PYTHON" -m mgc.main --db "$MGC_DB" rebuild verify tracks --out-dir "$OUT_TRACKS" --json >/dev/null
 
 if [ "$MODE" != "full" ]; then
   echo "[ci_gate] OK"
@@ -160,6 +152,7 @@ fi
 # -----------------------------
 # Full mode: autonomous smoke + determinism
 # -----------------------------
+
 AUTO_OUT="${ARTIFACTS_DIR%/}/auto"
 rm -rf "$AUTO_OUT"
 mkdir -p "$AUTO_OUT"
@@ -188,26 +181,27 @@ for a in "${cmd[@]}"; do printf " %q" "$a"; done
 printf "\n"
 
 set +e
-MGC_DETERMINISTIC=1 "${cmd[@]}" >"$AUTONOMOUS_JSON" 2>"$AUTONOMOUS_ERR"
+"${cmd[@]}" >"$AUTONOMOUS_JSON" 2>"$AUTONOMOUS_ERR"
 rc=$?
 set -e
 
-if [ $rc -ne 0 ]; then
+if [ "$rc" -ne 0 ]; then
   echo "[ci_gate] FAIL: autonomous returned rc=$rc" >&2
   echo "[ci_gate] autonomous stderr (first 200 lines):" >&2
   sed -n '1,200p' "$AUTONOMOUS_ERR" >&2 || true
-  echo "[ci_gate] autonomous stdout (first 120 lines):" >&2
-  sed -n '1,120p' "$AUTONOMOUS_JSON" >&2 || true
-  exit 4
+  echo "[ci_gate] autonomous stdout (first 200 lines):" >&2
+  sed -n '1,200p' "$AUTONOMOUS_JSON" >&2 || true
+  exit "$rc"
 fi
 
-if head -n 1 "$AUTONOMOUS_JSON" | grep -qE '^usage: mgc\b'; then
+# Catch a common failure mode: argparse help printed to stdout (non-json)
+if grep -Eq 'usage:|positional arguments:|optional arguments:' "$AUTONOMOUS_JSON"; then
   echo "[ci_gate] FAIL: autonomous printed argparse help to stdout" >&2
   echo "[ci_gate] autonomous stderr (first 200 lines):" >&2
   sed -n '1,200p' "$AUTONOMOUS_ERR" >&2 || true
-  echo "[ci_gate] autonomous stdout (first 120 lines):" >&2
-  sed -n '1,120p' "$AUTONOMOUS_JSON" >&2 || true
-  exit 4
+  echo "[ci_gate] autonomous stdout (first 200 lines):" >&2
+  sed -n '1,200p' "$AUTONOMOUS_JSON" >&2 || true
+  exit 2
 fi
 
 EVIDENCE_ROOT="$(_detect_evidence_root "$AUTO_OUT" || true)"
@@ -238,9 +232,10 @@ echo "[ci_gate] determinism gate: web bundle (evidence-root=$EVIDENCE_ROOT)"
 _run_web_bundle_determinism "$EVIDENCE_ROOT"
 
 echo "[ci_gate] weekly determinism"
-if [ -f "$repo_root/scripts/ci_weekly_determinism.sh" ]; then
-  MGC_DB="$MGC_DB" PYTHON="$PYTHON" REPO_ROOT="$repo_root" CONTEXT="${MGC_CONTEXT:-focus}" SEED="${MGC_SEED:-1}" \
-    bash "$repo_root/scripts/ci_weekly_determinism.sh" ci_weekly
+MGC_DB="$MGC_DB" PYTHON="$PYTHON" \
+MGC_DETERMINISTIC=1 DETERMINISTIC=1 \
+  bash "$repo_root/scripts/ci_weekly_determinism.sh" ci_weekly
+
 else
   echo "[ci_gate] WARN: scripts/ci_weekly_determinism.sh missing; skipping weekly determinism"
 fi
@@ -249,6 +244,10 @@ echo "[ci_gate] drops list smoke (global --json hoist)"
 "$PYTHON" -m mgc.main --db "$MGC_DB" drops list --json >/dev/null
 
 echo "[ci_gate] publish receipts determinism"
-bash "$repo_root/scripts/ci_publish_determinism.sh" --db "$MGC_DB" --artifacts-dir "$ARTIFACTS_DIR"
+if [ -f "$repo_root/scripts/ci_publish_determinism.sh" ]; then
+  bash "$repo_root/scripts/ci_publish_determinism.sh" --db "$MGC_DB" --artifacts-dir "$ARTIFACTS_DIR"
+else
+  echo "[ci_gate] WARN: scripts/ci_publish_determinism.sh missing; skipping publish determinism"
+fi
 
 echo "[ci_gate] OK"

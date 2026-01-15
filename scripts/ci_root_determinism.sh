@@ -19,8 +19,10 @@ hash_once() {
 
   local out_json="$ARTIFACTS_DIR/root_${STAMP}_out.json"
 
+  # IMPORTANT:
+  # --json is a GLOBAL mgc option, so it must come immediately after "-m mgc.main"
   MGC_DETERMINISTIC=1 MGC_FIXED_TIME="2020-01-01T00:00:00Z" MGC_DB="${MGC_DB}" \
-    "$PYTHON" -m mgc.main run drop \
+    "$PYTHON" -m mgc.main --json run drop \
       --db "${MGC_DB}" \
       --context "${CONTEXT}" \
       --seed "${SEED}" \
@@ -31,7 +33,16 @@ hash_once() {
   "$PYTHON" - <<PY
 import json, pathlib, sys
 p = pathlib.Path("${out_json}")
-obj = json.loads(p.read_text(encoding="utf-8"))
+raw = p.read_text(encoding="utf-8").strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    print("[ci_root_determinism] ERROR: output is not valid JSON", file=sys.stderr)
+    print("----- begin raw -----", file=sys.stderr)
+    print(raw[:2000], file=sys.stderr)
+    print("----- end raw -----", file=sys.stderr)
+    sys.exit(2)
+
 h = (obj.get("paths") or {}).get("manifest_sha256") or ""
 if not h:
     print("missing paths.manifest_sha256", file=sys.stderr)

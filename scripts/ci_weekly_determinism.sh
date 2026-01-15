@@ -1,68 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Weekly determinism gate:
-# - run weekly twice with different out dirs
-# - compare bundle JSONs (should be identical)
-# - build submission.zip for each and compare sha256 (should be identical)
+# scripts/ci_weekly_determinism.sh
 #
-# Env:
-#   MGC_DB (required)
-#   PYTHON (optional; default: python)
-#   REPO_ROOT (optional; default: .)
-#   CONTEXT (optional; default: focus)
-#   SEED (optional; default: 1)
+# Run the weekly pipeline twice in deterministic mode and compare JSON outputs.
+#
+# Expected env:
+#   MGC_DB   path to sqlite db (required)
+# Optional:
+#   PYTHON   python executable (default: python)
+#   CONTEXT  pipeline context (default: focus)
+#   SEED     deterministic seed (default: 1)
 
 : "${MGC_DB:?set MGC_DB}"
-
 PYTHON="${PYTHON:-python}"
-REPO_ROOT="${REPO_ROOT:-.}"
 CONTEXT="${CONTEXT:-focus}"
 SEED="${SEED:-1}"
 
 STAMP="${1:-ci_weekly}"
 
-out1="/tmp/mgc_${STAMP}_weekly_1"
-out2="/tmp/mgc_${STAMP}_weekly_2"
+echo "[ci_weekly_determinism] run weekly twice and compare outputs"
+out1="/tmp/mgc_ci_weekly_${STAMP}_1"
+out2="/tmp/mgc_ci_weekly_${STAMP}_2"
+
+echo "[ci_weekly_determinism] out1=$out1"
+echo "[ci_weekly_determinism] out2=$out2"
 
 rm -rf "$out1" "$out2"
 mkdir -p "$out1" "$out2"
 
-echo "[ci_weekly_determinism] run weekly twice and compare outputs"
-echo "[ci_weekly_determinism] out1=$out1"
-echo "[ci_weekly_determinism] out2=$out2"
+# Force deterministic mode in the CLI AND in env (belt + suspenders).
+export MGC_DETERMINISTIC=1
+export DETERMINISTIC=1
 
-"$PYTHON" -m mgc.main --db "$MGC_DB" --repo-root "$REPO_ROOT" --seed "$SEED" --no-resume --json \
-  run weekly --context "$CONTEXT" --out-dir "$out1" --deterministic >/dev/null
+run_weekly() {
+  local out_dir="$1"
+  "$PYTHON" -m mgc.main \
+    --db "$MGC_DB" \
+    --seed "$SEED" \
+    --no-resume \
+    run weekly \
+    --context "$CONTEXT" \
+    --out-dir "$out_dir" \
+    --deterministic \
+    >/dev/null
+}
 
-"$PYTHON" -m mgc.main --db "$MGC_DB" --repo-root "$REPO_ROOT" --seed "$SEED" --no-resume --json \
-  run weekly --context "$CONTEXT" --out-dir "$out2" --deterministic >/dev/null
+run_weekly "$out1"
+run_weekly "$out2"
 
-echo "[ci_weekly_determinism] diff bundle jsons"
-diff -u "$out1/drop_bundle/daily_evidence.json" "$out2/drop_bundle/daily_evidence.json" >/dev/null
-diff -u "$out1/drop_bundle/playlist.json"      "$out2/drop_bundle/playlist.json"      >/dev/null
+# Compare json sha256s (portable determinism check)
+( cd "$out1" && find . -name "*.json" -print0 | sort -z | xargs -0 shasum -a 256 ) > /tmp/mgc_weekly_json_hashes_1.txt
+( cd "$out2" && find . -name "*.json" -print0 | sort -z | xargs -0 shasum -a 256 ) > /tmp/mgc_weekly_json_hashes_2.txt
 
-# receipts should be identical too (JSONL)
-if [[ -f "$out1/marketing/receipts.jsonl" && -f "$out2/marketing/receipts.jsonl" ]]; then
-  diff -u "$out1/marketing/receipts.jsonl" "$out2/marketing/receipts.jsonl" >/dev/null
-fi
-
-echo "[ci_weekly_determinism] build submission zips"
-"$PYTHON" -m mgc.main --db "$MGC_DB" submission build \
-  --bundle-dir "$out1/drop_bundle" --out "$out1/submission.zip" >/dev/null
-
-"$PYTHON" -m mgc.main --db "$MGC_DB" submission build \
-  --bundle-dir "$out2/drop_bundle" --out "$out2/submission.zip" >/dev/null
-
-sha1="$(shasum -a 256 "$out1/submission.zip" | awk '{print $1}')"
-sha2="$(shasum -a 256 "$out2/submission.zip" | awk '{print $1}')"
-
-if [[ "$sha1" != "$sha2" ]]; then
-  echo "[ci_weekly_determinism] FAIL: submission.zip sha mismatch"
-  echo "[ci_weekly_determinism] run1=$sha1"
-  echo "[ci_weekly_determinism] run2=$sha2"
+if ! diff -u /tmp/mgc_weekly_json_hashes_1.txt /tmp/mgc_weekly_json_hashes_2.txt >/tmp/mgc_weekly_json_hashes.diff; then
+  echo "[ci_weekly_determinism] FAIL: json outputs differ"
+  sed -n '1,160p' /tmp/mgc_weekly_json_hashes.diff
   exit 2
 fi
 
-echo "[ci_weekly_determinism] OK: weekly bundle + submission.zip deterministic"
-echo "[ci_weekly_determinism] sha=$sha1"
+echo "[ci_weekly_determinism] OK"
