@@ -1,10 +1,10 @@
-from .base import GenerateRequest, GenerateResult, MusicProvider
-from .registry import get_provider, build_provider_registry
+from .base import TrackArtifact, Provider, ProviderError
+from .registry import get_provider, list_providers
 
 __all__ = [
-    "GenerateRequest",
-    "GenerateResult",
-    "MusicProvider",
+    "TrackArtifact",
+    "Provider",
+    "ProviderError",
     "get_provider",
-    "build_provider_registry",
+    "list_providers",
 ]

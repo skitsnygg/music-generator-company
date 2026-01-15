@@ -1,75 +1,46 @@
 from __future__ import annotations
 
-import io
-import math
-import struct
-import wave
-from typing import Any, Dict, Optional
+from pathlib import Path
 
-from .base import GenerateRequest, GenerateResult
+from .base import Provider, TrackArtifact
+from .util import sha256_file, write_wav_sine
 
 
-def _stub_wav_bytes(seed: int, duration_s: float = 1.5, sample_rate: int = 44100) -> bytes:
-    """
-    Deterministic mono PCM16 WAV, generated fully in-memory.
-
-    Determinism:
-      - frequency derived from seed
-      - fixed duration/sample rate
-    """
-    # Pleasant deterministic range
-    freq = 220.0 + float(seed % 220)  # 220..439 Hz
-    nframes = int(duration_s * sample_rate)
-    amp = 0.25
-    two_pi_f = 2.0 * math.pi * freq
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(sample_rate)
-
-        for i in range(nframes):
-            t = i / sample_rate
-            sample = amp * math.sin(two_pi_f * t)
-            pcm = int(max(-1.0, min(1.0, sample)) * 32767.0)
-            wf.writeframes(struct.pack("<h", pcm))
-
-    return buf.getvalue()
-
-
-class StubProvider:
-    """
-    Deterministic local stub provider.
-
-    Always returns a small WAV file so the pipeline can be exercised end-to-end:
-      generation -> storage -> playlist -> web build.
-    """
-
+class StubProvider(Provider):
     name = "stub"
 
-    def generate(self, req: GenerateRequest) -> GenerateResult:
-        seed_int = 1
-        try:
-            seed_int = int(str(req.seed))
-        except Exception:
-            seed_int = 1
+    def generate(
+        self,
+        *,
+        out_dir: Path,
+        track_id: str,
+        context: str,
+        seed: int,
+        deterministic: bool,
+        now_iso: str,
+        schedule: str,
+        period_key: str,
+    ) -> TrackArtifact:
+        tracks_dir = out_dir / "tracks"
+        wav_path = tracks_dir / f"{track_id}.wav"
 
-        wav = _stub_wav_bytes(seed_int, duration_s=1.5, sample_rate=44100)
+        # stable mapping but varies across context/period/seed
+        base = (hash(f"{context}|{schedule}|{period_key}|{seed}") % 200) + 220  # 220..419
+        freq_hz = float(base)
 
-        meta: Dict[str, Any] = {
-            "genre": "stub",
-            "note": "deterministic sine wave",
-            "sample_rate": 44100,
-            "duration_s": 1.5,
-            "seed_int": seed_int,
-            "freq_hz": 220 + (seed_int % 220),
-        }
+        dur, sr = write_wav_sine(wav_path, seconds=2.0, freq_hz=freq_hz, sample_rate=22050)
+        h = sha256_file(wav_path)
 
-        return GenerateResult(
+        title = f"{context.title()} Track"
+        return TrackArtifact(
+            track_id=track_id,
+            artifact_path=str(wav_path),
+            sha256=h,
             provider=self.name,
-            ext=".wav",
-            mime="audio/wav",
-            artifact_bytes=wav,
-            meta=meta,
+            title=title,
+            mood=context,
+            genre="stub",
+            duration_seconds=dur,
+            sample_rate_hz=sr,
+            meta={"freq_hz": freq_hz, "schedule": schedule, "period_key": period_key},
         )

@@ -16,6 +16,7 @@ Other commands:
 - playlists: list, history, reveal, export
 - tracks: list, show, stats
 - marketing: posts list + receipts list (file-based publish audit trail)
+- providers: list/check provider configuration (env-driven)
 - analytics: delegated to mgc.analytics_cli if available
 - run: autonomous pipeline entrypoint (daily/weekly)
 - web: static web player build/serve
@@ -299,6 +300,140 @@ def _configure_logging(
         handlers=handlers,
         force=True,
     )
+
+
+# ----------------------------
+# Providers (env-driven; run_cli owns actual selection)
+# ----------------------------
+
+_SUPPORTED_PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "stub": {
+        "desc": "Deterministic built-in stub generator (CI friendly).",
+        "env": [],
+    },
+    "filesystem": {
+        "desc": "Pick an audio file from a directory pool and copy it into out_dir/tracks/<track_id>.wav.",
+        "env": ["MGC_FS_PROVIDER_DIR"],
+        "notes": [
+            "Pool is scanned recursively.",
+            "Prefer .wav if any exist; otherwise uses any supported audio file.",
+        ],
+    },
+}
+
+_AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff")
+
+
+def _provider_from_env() -> str:
+    return (os.environ.get("MGC_PROVIDER") or "stub").strip().lower() or "stub"
+
+
+def _scan_audio_files(root: Path) -> List[Path]:
+    if not root.exists() or not root.is_dir():
+        return []
+    out: List[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in _AUDIO_SUFFIXES:
+            out.append(p)
+    return sorted(out)
+
+
+def cmd_providers_list(args: argparse.Namespace) -> int:
+    cur = _provider_from_env()
+    items = []
+    for name in sorted(_SUPPORTED_PROVIDERS.keys()):
+        meta = dict(_SUPPORTED_PROVIDERS[name])
+        meta["name"] = name
+        meta["selected"] = (name == cur)
+        items.append(meta)
+
+    if args.json:
+        print(json.dumps({"selected": cur, "providers": items}, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    print(f"selected: {cur}")
+    for it in items:
+        mark = "*" if it.get("selected") else " "
+        print(f"{mark} {it['name']}: {it.get('desc','')}")
+        env = it.get("env") or []
+        if env:
+            print(f"    env: {', '.join(env)}")
+        notes = it.get("notes") or []
+        for n in notes:
+            print(f"    note: {n}")
+    return 0
+
+
+def cmd_providers_check(args: argparse.Namespace) -> int:
+    """
+    Validate env config for the currently selected provider (via MGC_PROVIDER).
+    This does NOT run the pipeline; it just checks that the provider can be instantiated/configured.
+    """
+    sel = _provider_from_env()
+    info = _SUPPORTED_PROVIDERS.get(sel)
+
+    out: Dict[str, Any] = {
+        "selected": sel,
+        "ok": True,
+        "problems": [],
+        "env": {
+            "MGC_PROVIDER": os.environ.get("MGC_PROVIDER"),
+            "MGC_FS_PROVIDER_DIR": os.environ.get("MGC_FS_PROVIDER_DIR"),
+        },
+    }
+
+    if info is None:
+        out["ok"] = False
+        out["problems"].append(f"unknown_provider:{sel}")
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"FAIL: unknown provider: {sel}")
+            print("known:", ", ".join(sorted(_SUPPORTED_PROVIDERS.keys())))
+        return 2
+
+    if sel == "filesystem":
+        d = (os.environ.get("MGC_FS_PROVIDER_DIR") or "").strip()
+        if not d:
+            out["ok"] = False
+            out["problems"].append("missing_env:MGC_FS_PROVIDER_DIR")
+        else:
+            root = Path(d).expanduser().resolve()
+            out["filesystem"] = {"root_dir": str(root), "exists": root.exists(), "is_dir": root.is_dir()}
+            files = _scan_audio_files(root) if (root.exists() and root.is_dir()) else []
+            out["filesystem"]["file_count"] = len(files)
+            if files:
+                # show a couple examples for sanity
+                out["filesystem"]["examples"] = [str(p) for p in files[:3]]
+            if not (root.exists() and root.is_dir()):
+                out["ok"] = False
+                out["problems"].append("invalid_dir:MGC_FS_PROVIDER_DIR")
+            elif not files:
+                out["ok"] = False
+                out["problems"].append("no_audio_files_found")
+
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        if out["ok"]:
+            print(f"OK: provider={sel}")
+            if sel == "filesystem":
+                fs = out.get("filesystem", {})
+                print(f"  root_dir: {fs.get('root_dir')}")
+                print(f"  files: {fs.get('file_count')}")
+                for ex in (fs.get("examples") or []):
+                    print(f"    ex: {ex}")
+        else:
+            print(f"FAIL: provider={sel}")
+            for p in out["problems"]:
+                print(f"  - {p}")
+            if sel == "filesystem":
+                print('hint: export MGC_FS_PROVIDER_DIR=/Users/admin/music-generator-company/data/tracks')
+                print("hint: ensure the directory contains .wav/.mp3/.m4a/etc files")
+
+    return 0 if out["ok"] else 2
 
 
 # ----------------------------
@@ -930,6 +1065,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "MGC_PROVIDER": os.environ.get("MGC_PROVIDER"),
             "MGC_DETERMINISTIC": os.environ.get("MGC_DETERMINISTIC") or os.environ.get("DETERMINISTIC"),
             "MGC_ARTIFACTS_DIR": os.environ.get("MGC_ARTIFACTS_DIR"),
+            "MGC_FS_PROVIDER_DIR": os.environ.get("MGC_FS_PROVIDER_DIR"),
         },
         "tables": {},
         "latest": {},
@@ -1005,7 +1141,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     env_items = out["env"]
     env_show = []
-    for k in ("MGC_CONTEXT", "MGC_SEED", "MGC_PROVIDER", "MGC_DETERMINISTIC", "MGC_ARTIFACTS_DIR"):
+    for k in ("MGC_CONTEXT", "MGC_SEED", "MGC_PROVIDER", "MGC_DETERMINISTIC", "MGC_ARTIFACTS_DIR", "MGC_FS_PROVIDER_DIR"):
         v = env_items.get(k)
         if v:
             env_show.append(f"{k}={v}")
@@ -1310,6 +1446,16 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="Show health + recent activity snapshot")
     st.set_defaults(func=cmd_status)
 
+    # providers
+    prov = sub.add_parser("providers", help="Provider tools (list/check env configuration)")
+    provs = prov.add_subparsers(dest="providers_cmd", required=True)
+
+    prov_list = provs.add_parser("list", help="List supported providers and required env vars")
+    prov_list.set_defaults(func=cmd_providers_list)
+
+    prov_check = provs.add_parser("check", help="Validate env for selected provider (MGC_PROVIDER)")
+    prov_check.set_defaults(func=cmd_providers_check)
+
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
 
@@ -1396,7 +1542,7 @@ def build_parser() -> argparse.ArgumentParser:
     mpl.add_argument("--limit", type=int, default=20)
     mpl.set_defaults(func=cmd_marketing_posts_list)
 
-    # NEW: receipts (file-based)
+    # receipts (file-based)
     mreceipts = ms.add_parser("receipts", help="Publish receipts (file-based audit trail)")
     mrs = mreceipts.add_subparsers(dest="receipts_cmd", required=True)
 

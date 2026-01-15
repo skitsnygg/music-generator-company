@@ -1,31 +1,56 @@
 from __future__ import annotations
 
+import abc
 from dataclasses import dataclass
-from typing import Any, Dict, Protocol
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+
+class ProviderError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
-class GenerateRequest:
+class TrackArtifact:
+    """
+    Contract returned by providers.
+
+    - artifact_path must be a real file on disk (wav/mp3/etc).
+    - sha256 must be computed over artifact_path bytes.
+    - meta is provider-specific extras (JSON-serializable).
+    """
     track_id: str
-    run_id: str
-    context: str
-    seed: str
-    prompt: str
-    deterministic: bool
-    ts: str
-    out_rel: str  # intended artifact path (string)
-
-
-@dataclass(frozen=True)
-class GenerateResult:
+    artifact_path: str
+    sha256: str
     provider: str
-    artifact_bytes: bytes
-    mime: str
-    ext: str
-    meta: Dict[str, Any]
+    title: str
+    mood: str
+    genre: str
+    duration_seconds: Optional[float] = None
+    sample_rate_hz: Optional[int] = None
+    meta: Optional[Dict[str, Any]] = None
 
 
-class MusicProvider(Protocol):
+class Provider(abc.ABC):
+    """
+    Providers generate or fetch audio for a given context.
+
+    Determinism:
+    - If deterministic=True, provider MUST produce the same bytes for same inputs.
+    """
     name: str
 
-    def generate(self, req: GenerateRequest) -> GenerateResult: ...
+    @abc.abstractmethod
+    def generate(
+        self,
+        *,
+        out_dir: Path,
+        track_id: str,
+        context: str,
+        seed: int,
+        deterministic: bool,
+        now_iso: str,
+        schedule: str,
+        period_key: str,
+    ) -> TrackArtifact:
+        raise NotImplementedError

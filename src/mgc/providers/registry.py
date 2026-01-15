@@ -1,20 +1,28 @@
 from __future__ import annotations
 
-from typing import Dict
+import os
+from pathlib import Path
+from typing import Dict, List
 
-from .base import MusicProvider
-from .stub_provider import StubProvider
-
-
-def build_provider_registry() -> Dict[str, MusicProvider]:
-    # Minimal registry: just stub for now.
-    p = StubProvider()
-    return {p.name: p}
+from .base import Provider, ProviderError
+from .stub import StubProvider
+from .filesystem import FilesystemProvider
 
 
-def get_provider(name: str) -> MusicProvider:
-    reg = build_provider_registry()
-    n = (name or "").strip().lower() or "stub"
-    if n not in reg:
-        raise KeyError(f"unknown provider: {n} (known: {', '.join(sorted(reg.keys()))})")
-    return reg[n]
+def list_providers() -> List[str]:
+    return ["stub", "filesystem"]
+
+
+def get_provider(name: str | None) -> Provider:
+    n = (name or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+
+    if n == "stub":
+        return StubProvider()
+
+    if n == "filesystem":
+        src = (os.environ.get("MGC_FS_PROVIDER_DIR") or "").strip()
+        if not src:
+            raise ProviderError("MGC_FS_PROVIDER_DIR is required for filesystem provider")
+        return FilesystemProvider(Path(src).expanduser().resolve())
+
+    raise ProviderError(f"Unknown provider: {n}. Available: {', '.join(list_providers())}")

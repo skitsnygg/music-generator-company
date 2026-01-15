@@ -4,38 +4,13 @@ src/mgc/run_cli.py
 
 Run/pipeline CLI for Music Generator Company (MGC).
 
-Hard requirements for CI:
-- `python -m mgc.main --db ... --repo-root ... --seed 1 --no-resume --json run autonomous ...`
-  must succeed (CI passes global flags before the subcommand).
-- Top-level dispatch must always find a handler; if mgc.main expects args.fn, we provide it.
-- `run autonomous` must produce:
-    out_dir/drop_evidence.json                (CI contract)
-    out_dir/drop_bundle/playlist.json         (portable bundle)
-    out_dir/drop_bundle/tracks/*.wav          (portable bundle)
-    out_dir/drop_bundle/daily_evidence.json   (portable bundle)
+CI requirements:
+- `python -m mgc.main --db ... --repo-root ... --seed 1 --no-resume --json run autonomous ...` must succeed.
+- Deterministic mode must produce byte-for-byte stable bundles + submission.zip across runs.
 
-Bundle contract for submission.build (validator expectations):
-- drop_bundle/playlist.json must include:
-    {"schema": "mgc.playlist.v1", ...}
-- each playlist track entry must include:
-    tracks[i].path   (REQUIRED by validator)
-- drop_bundle/daily_evidence.json must include:
-    {"schema": "mgc.daily_evidence.v1", "paths": {...}, "sha256": {...}, ...}
-
-Determinism contract:
-- In deterministic mode (CI), bundles + submission.zip must be byte-for-byte stable across runs,
-  even when out_dir differs (e.g. /tmp/run1 vs /tmp/run2).
-- Therefore the BUNDLED JSON must not contain absolute paths like out_dir/evidence_dir/tracks_dir.
-
-NEW:
-- `mgc run weekly`:
-    Runs the same pipeline (daily -> publish-marketing -> drop) but produces a drop bundle whose
-    IDs + metadata are keyed by ISO week period, so weekly drops are distinct from daily drops.
-
-Publish receipts (NEW):
-- publish-marketing writes an append-only JSONL file:
-    out_dir/marketing/receipts.jsonl
-  and includes its sha256 in publish_marketing_evidence.json.
+Bundle contract (submission validator):
+- drop_bundle/playlist.json: schema=mgc.playlist.v1 and tracks[*].path present
+- drop_bundle/daily_evidence.json: schema=mgc.daily_evidence.v1 with portable-only paths + sha256 keys
 """
 
 from __future__ import annotations
@@ -45,7 +20,6 @@ import contextlib
 import hashlib
 import io
 import json
-import math
 import os
 import sqlite3
 import sys
@@ -55,9 +29,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from mgc.providers import ProviderError, get_provider
+
 
 # -----------------------------------------------------------------------------
-# Small I/O helpers
+# small I/O helpers
 # -----------------------------------------------------------------------------
 
 @contextlib.contextmanager
@@ -94,11 +70,14 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(obj, sort_keys=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 def _as_rel_posix(path_like: str) -> str:
-    """
-    Coerce a path string to a RELATIVE, forward-slash path (portable bundle contract).
-    Reject absolute paths and traversal.
-    """
     s = (path_like or "").replace("\\", "/").strip()
     s = s.lstrip("./")
     if not s or s.startswith("/") or s.startswith("..") or "/../" in s or s.endswith("/.."):
@@ -106,19 +85,8 @@ def _as_rel_posix(path_like: str) -> str:
     return s
 
 
-def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    """
-    Append one JSON object as a single line to a JSONL file.
-    Uses sorted keys for stable field ordering (helpful for diffs).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    with path.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
 # -----------------------------------------------------------------------------
-# Determinism helpers
+# determinism helpers
 # -----------------------------------------------------------------------------
 
 def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
@@ -133,13 +101,6 @@ def stable_uuid(namespace: uuid.UUID, name: str, deterministic: bool) -> uuid.UU
 
 
 def _deterministic_now_utc() -> datetime:
-    """
-    Deterministic clock for CI.
-
-    - If MGC_FIXED_TIME is set, honor it.
-    - Otherwise return a stable epoch (2020-01-01T00:00:00Z) so deterministic runs
-      are reproducible without extra env configuration.
-    """
     fixed = (os.environ.get("MGC_FIXED_TIME") or "").strip()
     if fixed:
         s = fixed.replace("Z", "+00:00")
@@ -148,15 +109,67 @@ def _deterministic_now_utc() -> datetime:
 
 
 def _iso_week_period(d: date) -> Tuple[date, date, str]:
-    """
-    Return (monday, sunday, label) for ISO week period containing date d.
-    Label format: YYYY-Www (ISO week year + week number).
-    """
-    monday = d - timedelta(days=d.weekday())  # Monday=0
+    monday = d - timedelta(days=d.weekday())
     sunday = monday + timedelta(days=6)
     iso_year, iso_week, _ = d.isocalendar()
     label = f"{iso_year}-W{iso_week:02d}"
     return monday, sunday, label
+
+
+# -----------------------------------------------------------------------------
+# Provider artifact normalization
+# -----------------------------------------------------------------------------
+
+def _art_get(art: Any, key: str, default: Any = None) -> Any:
+    """Support both dict-returning providers and object/dataclass providers."""
+    if art is None:
+        return default
+    if isinstance(art, dict):
+        return art.get(key, default)
+    return getattr(art, key, default)
+
+
+def _normalize_art(
+    art: Any,
+    *,
+    fallback_track_id: str,
+    fallback_provider: str,
+    fallback_context: str,
+) -> Dict[str, Any]:
+    """Return a stable dict with the fields run_cli expects."""
+    out: Dict[str, Any] = {}
+
+    out["provider"] = _art_get(art, "provider", fallback_provider)
+    out["track_id"] = _art_get(art, "track_id", fallback_track_id)
+    out["artifact_path"] = _art_get(art, "artifact_path")
+    out["sha256"] = _art_get(art, "sha256")
+
+    # Optional metadata (some providers don't supply these)
+    out["meta"] = _art_get(art, "meta", {}) or {}
+    out["genre"] = _art_get(art, "genre", "") or ""
+    out["mood"] = _art_get(art, "mood", "") or ""
+    out["title"] = _art_get(art, "title", "") or ""
+
+    if not out["title"]:
+        out["title"] = f"{fallback_context.title()} Track"
+
+    if not out["genre"]:
+        # Keep it non-empty for downstream JSON; harmless default.
+        out["genre"] = out["provider"] or "unknown"
+
+    if not out["mood"]:
+        out["mood"] = fallback_context
+
+    if not out["artifact_path"]:
+        raise SystemExit("Provider returned no artifact_path")
+    if not out["sha256"]:
+        # If provider doesn't return sha256, compute it here.
+        try:
+            out["sha256"] = _sha256_file(Path(str(out["artifact_path"])))
+        except Exception as e:
+            raise SystemExit(f"Provider returned no sha256 and hashing failed: {e}") from e
+
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -193,128 +206,7 @@ def _ensure_run_stages_table(con: sqlite3.Connection) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Manifest + diff (deterministic repo hashing)
-# -----------------------------------------------------------------------------
-
-DEFAULT_MANIFEST_ALLOW_EXT: Tuple[str, ...] = (
-    ".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini",
-    ".sh", ".bash", ".zsh", ".sql", ".html", ".css", ".js",
-)
-
-
-def _iter_files_for_manifest(repo_root: Path, include_hidden: bool = False) -> Iterable[Path]:
-    skip_dirs = {
-        ".git",
-        ".venv",
-        "__pycache__",
-        "artifacts",
-        "data/tracks",
-        "data/playlists",
-        "node_modules",
-        "dist",
-        "build",
-    }
-
-    def should_skip_dir(p: Path) -> bool:
-        try:
-            rel = p.relative_to(repo_root).as_posix()
-        except Exception:
-            return True
-        for d in skip_dirs:
-            if rel == d or rel.startswith(d + "/"):
-                return True
-        return False
-
-    for root, dirs, files in os.walk(repo_root):
-        root_p = Path(root)
-        dirs[:] = sorted(dirs)
-        files = sorted(files)
-
-        if should_skip_dir(root_p):
-            dirs[:] = []
-            continue
-
-        for fn in files:
-            if not include_hidden and fn.startswith("."):
-                continue
-            p = root_p / fn
-            if p.suffix.lower() in DEFAULT_MANIFEST_ALLOW_EXT:
-                yield p
-
-
-def compute_repo_manifest(repo_root: Path) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = []
-    for p in _iter_files_for_manifest(repo_root):
-        rel = p.relative_to(repo_root).as_posix()
-        items.append({"path": rel, "sha256": _sha256_file(p), "bytes": p.stat().st_size})
-
-    h = hashlib.sha256()
-    for it in items:
-        h.update(it["path"].encode("utf-8"))
-        h.update(b"\0")
-        h.update(it["sha256"].encode("utf-8"))
-        h.update(b"\n")
-
-    return {"version": 1, "root_sha256": h.hexdigest(), "file_count": len(items), "items": items}
-
-
-def diff_manifests(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
-    old_map = {it["path"]: it["sha256"] for it in old.get("items", [])}
-    new_map = {it["path"]: it["sha256"] for it in new.get("items", [])}
-
-    added = sorted([p for p in new_map if p not in old_map])
-    removed = sorted([p for p in old_map if p not in new_map])
-    changed = sorted([p for p in new_map if p in old_map and new_map[p] != old_map[p]])
-
-    return {
-        "added": added,
-        "removed": removed,
-        "changed": changed,
-        "summary": {"added": len(added), "removed": len(removed), "changed": len(changed)},
-    }
-
-
-# -----------------------------------------------------------------------------
-# Minimal deterministic WAV generation (16-bit PCM mono)
-# -----------------------------------------------------------------------------
-
-def _write_wav_sine(path: Path, *, seconds: float = 1.0, freq_hz: float = 440.0, sample_rate: int = 22050) -> None:
-    import struct
-
-    n_samples = max(1, int(sample_rate * seconds))
-    amp = 0.2
-    samples = bytearray()
-
-    for i in range(n_samples):
-        t = i / sample_rate
-        v = int(amp * 32767 * math.sin(2 * math.pi * freq_hz * t))
-        samples += struct.pack("<h", v)
-
-    data_size = len(samples)
-    byte_rate = sample_rate * 1 * 16 // 8
-    block_align = 1 * 16 // 8
-
-    header = bytearray()
-    header += b"RIFF"
-    header += struct.pack("<I", 36 + data_size)
-    header += b"WAVE"
-    header += b"fmt "
-    header += struct.pack("<I", 16)
-    header += struct.pack("<H", 1)           # PCM
-    header += struct.pack("<H", 1)           # mono
-    header += struct.pack("<I", sample_rate)
-    header += struct.pack("<I", byte_rate)
-    header += struct.pack("<H", block_align)
-    header += struct.pack("<H", 16)          # 16-bit
-    header += b"data"
-    header += struct.pack("<I", data_size)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + bytes(samples))
-
-
-# -----------------------------------------------------------------------------
-# Core pipeline context
+# core run context
 # -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -325,6 +217,7 @@ class RunContext:
     evidence_dir: Path
     deterministic: bool
     now: datetime
+    seed: int
 
 
 def _require_db(args: argparse.Namespace) -> Path:
@@ -345,6 +238,8 @@ def _build_run_context(args: argparse.Namespace) -> RunContext:
     det = is_deterministic(args)
     now = _deterministic_now_utc() if det else datetime.now(timezone.utc)
 
+    seed = int(getattr(args, "seed", 1) or 1)
+
     _ensure_dir(out_dir)
     _ensure_dir(evidence_dir)
 
@@ -355,6 +250,7 @@ def _build_run_context(args: argparse.Namespace) -> RunContext:
         evidence_dir=evidence_dir,
         deterministic=det,
         now=now,
+        seed=seed,
     )
 
 
@@ -365,14 +261,6 @@ def _write_drop_evidence_root(ctx: RunContext, payload: Dict[str, Any]) -> Path:
 
 
 def _normalize_daily_evidence(obj: Dict[str, Any], *, out_dir: Path, evidence_dir: Path) -> Dict[str, Any]:
-    """
-    Ensure daily_evidence.json matches validator expectations.
-    The validator wants:
-      - daily_evidence.json.paths to be an object
-      - daily_evidence.json.sha256 to be an object
-
-    NOTE: For the BUNDLED daily_evidence.json we overwrite paths/sha256 with portable-only keys.
-    """
     out = dict(obj) if isinstance(obj, dict) else {"raw": obj}
     out.setdefault("schema", "mgc.daily_evidence.v1")
     out.setdefault("version", 1)
@@ -393,24 +281,51 @@ def _normalize_daily_evidence(obj: Dict[str, Any], *, out_dir: Path, evidence_di
 
 
 # -----------------------------------------------------------------------------
-# Commands (leaf handlers)
+# commands
 # -----------------------------------------------------------------------------
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
+    """
+    Daily stage:
+    - calls provider to generate a track artifact under out_dir/tracks/
+    - writes evidence/daily_evidence.json (this file may contain absolute paths; bundle version must not)
+    """
     ctx = _build_run_context(args)
     context = getattr(args, "context", "focus")
+    provider_name = (getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
 
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
     run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{context}", ctx.deterministic)
 
-    tracks_dir = ctx.out_dir / "tracks"
-    _ensure_dir(tracks_dir)
+    # Daily track_id uses date (not ISO week) so day-to-day differs in non-fixed-time mode.
+    # In deterministic CI (fixed epoch), still stable.
+    track_id = stable_uuid(ns, f"track:daily:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
 
-    track_id = stable_uuid(ns, f"track:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
-    wav_path = tracks_dir / f"{track_id}.wav"
-    _write_wav_sine(wav_path)
+    # Provider generates artifact into out_dir/tracks/
+    try:
+        provider = get_provider(provider_name)
+        art_raw = provider.generate(
+            out_dir=ctx.out_dir,
+            track_id=str(track_id),
+            context=context,
+            seed=ctx.seed,
+            deterministic=ctx.deterministic,
+            now_iso=ctx.now.isoformat(),
+            schedule="daily",
+            period_key=ctx.now.date().isoformat(),
+        )
+    except ProviderError as e:
+        raise SystemExit(f"[run.daily] provider error: {e}") from e
 
-    track_sha = _sha256_file(wav_path)
+    art = _normalize_art(
+        art_raw,
+        fallback_track_id=str(track_id),
+        fallback_provider=provider_name,
+        fallback_context=context,
+    )
+
+    wav_path = Path(str(art["artifact_path"]))
+    track_sha = str(art["sha256"])
 
     ev_raw = {
         "run_id": str(run_id),
@@ -418,15 +333,17 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "context": context,
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
-        "track": {"track_id": str(track_id), "path": str(wav_path)},
+        "provider": art["provider"],
+        "track": {"track_id": art["track_id"], "path": str(wav_path)},
         "paths": {
             "out_dir": str(ctx.out_dir),
             "evidence_dir": str(ctx.evidence_dir),
-            "tracks_dir": str(tracks_dir),
+            "tracks_dir": str((ctx.out_dir / "tracks").resolve()),
         },
         "sha256": {
             "track": track_sha,
         },
+        "meta": art.get("meta") or {},
     }
     ev = _normalize_daily_evidence(ev_raw, out_dir=ctx.out_dir, evidence_dir=ctx.evidence_dir)
 
@@ -434,7 +351,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     _json_dump(ev, ev_path)
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "run_id": str(run_id), "track_id": str(track_id), "evidence": str(ev_path)}))
+        print(json.dumps({"ok": True, "run_id": str(run_id), "track_id": art["track_id"], "evidence": str(ev_path)}))
     else:
         print(f"[run.daily] ok run_id={run_id}")
     return 0
@@ -445,10 +362,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     Stub publisher:
     - writes publish_marketing_evidence.json
     - appends one receipt record to out_dir/marketing/receipts.jsonl
-
-    Determinism contract:
-    - In deterministic mode, evidence MUST NOT embed absolute out_dir paths
-      (because /tmp/run1 vs /tmp/run2 would differ).
     """
     ctx = _build_run_context(args)
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -457,10 +370,6 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     marketing_dir = ctx.out_dir / "marketing"
     receipts_path = marketing_dir / "receipts.jsonl"
 
-    # Stable, portable path used inside receipts + publish evidence
-    receipts_rel = "marketing/receipts.jsonl"
-
-    # Deterministic post id for the stub “publish”
     post_id = stable_uuid(ns, f"marketing_post:stub:{ctx.now.isoformat()}", ctx.deterministic)
 
     receipt = {
@@ -472,27 +381,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "platform": "stub",
         "status": "published",
         "post_id": str(post_id),
-        # Portable: never absolute
-        "artifact": {
-            "kind": "marketing_receipt",
-            "path": receipts_rel,
-        },
+        "artifact": {"kind": "marketing_receipt", "path": "marketing/receipts.jsonl"},
     }
 
     _append_jsonl(receipts_path, receipt)
     receipts_sha = _sha256_file(receipts_path)
-
-    receipts_obj: Dict[str, Any] = {
-        # Portable + deterministic
-        "path": receipts_rel,
-        "sha256": receipts_sha,
-        "appended": 1,
-        "last_post_id": str(post_id),
-    }
-
-    # Optional debug info for humans; keep it out of deterministic runs
-    if not ctx.deterministic:
-        receipts_obj["abs_path"] = str(receipts_path)
 
     ev = {
         "run_id": str(run_id),
@@ -500,40 +393,24 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
         "note": "stub",
-        "receipts": receipts_obj,
+        "receipts": {
+            "path": "marketing/receipts.jsonl",   # PORTABLE (no abs path)
+            "sha256": receipts_sha,
+            "appended": 1,
+            "last_post_id": str(post_id),
+        },
     }
-
     ev_path = ctx.evidence_dir / "publish_marketing_evidence.json"
     _json_dump(ev, ev_path)
 
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "run_id": str(run_id),
-                    "evidence": str(ev_path),
-                    "receipts_path": str(receipts_path),
-                    "receipts_sha256": receipts_sha,
-                    "post_id": str(post_id),
-                }
-            )
-        )
+        print(json.dumps({"ok": True, "run_id": str(run_id), "evidence": str(ev_path), "receipts_sha256": receipts_sha}))
     else:
         print(f"[run.publish-marketing] ok run_id={run_id}")
     return 0
 
 
-def _write_drop_bundle(
-    *,
-    ctx: RunContext,
-    context: str,
-    schedule: str,
-) -> Tuple[uuid.UUID, Path]:
-    """
-    Create a portable bundle (drop_bundle/) that `mgc submission build --bundle-dir <dir>` can package.
-    Returns (drop_id, evidence_path).
-    """
+def _write_drop_bundle(*, ctx: RunContext, context: str, schedule: str) -> Tuple[uuid.UUID, Path]:
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
     if schedule == "weekly":
@@ -545,30 +422,48 @@ def _write_drop_bundle(
         period_label = ctx.now.date().isoformat()
         period_key = ctx.now.date().isoformat()
 
-    # Stable ids: include schedule + period_key so weekly drops are distinct from daily drops.
     drop_id = stable_uuid(ns, f"drop:{schedule}:{period_key}:{context}", ctx.deterministic)
     run_id = stable_uuid(ns, f"run:{schedule}:{ctx.now.isoformat()}:{context}", ctx.deterministic)
     track_id = stable_uuid(ns, f"track:{schedule}:{period_key}:{context}", ctx.deterministic)
     playlist_id = stable_uuid(ns, f"playlist:{schedule}:{period_key}:{context}", ctx.deterministic)
 
-    # Ensure a deterministic track exists (source is out_dir/tracks/)
-    wav_src = ctx.out_dir / "tracks" / f"{track_id}.wav"
-    if not wav_src.exists():
-        _ensure_dir(wav_src.parent)
-        _write_wav_sine(wav_src)
+    # Ensure a track exists for this schedule/period (provider handles deterministic bytes)
+    provider_name = (getattr(args_global := ctx, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    # Provider generation is keyed by schedule+period so weekly and daily are distinct.
+    try:
+        provider = get_provider(provider_name)
+        art_raw = provider.generate(
+            out_dir=ctx.out_dir,
+            track_id=str(track_id),
+            context=context,
+            seed=ctx.seed,
+            deterministic=ctx.deterministic,
+            now_iso=ctx.now.isoformat(),
+            schedule=schedule,
+            period_key=period_key,
+        )
+    except ProviderError as e:
+        raise SystemExit(f"[run.{schedule}] provider error: {e}") from e
 
-    # Bundle layout
+    art = _normalize_art(
+        art_raw,
+        fallback_track_id=str(track_id),
+        fallback_provider=provider_name,
+        fallback_context=context,
+    )
+
+    src_path = Path(str(art["artifact_path"]))
+
     bundle_dir = ctx.out_dir / "drop_bundle"
     bundle_tracks = bundle_dir / "tracks"
     _ensure_dir(bundle_tracks)
 
-    wav_dst = bundle_tracks / wav_src.name
-    wav_dst.write_bytes(wav_src.read_bytes())
+    dst_path = bundle_tracks / src_path.name
+    dst_path.write_bytes(src_path.read_bytes())
 
-    rel_track_path = _as_rel_posix(f"tracks/{wav_dst.name}")
-    bundle_track_sha = _sha256_file(wav_dst)
+    rel_track_path = _as_rel_posix(f"tracks/{dst_path.name}")
+    bundle_track_sha = _sha256_file(dst_path)
 
-    # Playlist (portable)
     playlist_path = bundle_dir / "playlist.json"
     playlist = {
         "schema": "mgc.playlist.v1",
@@ -585,30 +480,20 @@ def _write_drop_bundle(
         "ts": ctx.now.isoformat(),
         "tracks": [
             {
-                "track_id": str(track_id),
-                "title": f"{context.title()} Track",
-                "path": rel_track_path,           # REQUIRED by validator
-                "artifact_path": rel_track_path,  # back-compat
-                "provider": "stub",
-                "genre": "stub",
-                "mood": context,
+                "track_id": art["track_id"],
+                "title": art["title"],
+                "path": rel_track_path,          # REQUIRED by validator
+                "artifact_path": rel_track_path, # back-compat
+                "provider": art["provider"],
+                "genre": art["genre"],
+                "mood": art["mood"],
             }
         ],
     }
     _json_dump(playlist, playlist_path)
-
-    # Force stable ts formatting (belt+suspenders)
-    try:
-        pl = _read_json(playlist_path)
-        if isinstance(pl, dict):
-            pl["ts"] = ctx.now.isoformat()
-            _json_dump(pl, playlist_path)
-    except Exception:
-        pass
-
     playlist_sha = _sha256_file(playlist_path)
 
-    # Bundle daily evidence (portable-only paths, validator keys present)
+    # Bundle daily evidence (portable only)
     daily_ev_path = ctx.evidence_dir / "daily_evidence.json"
     bundle_daily_ev_path = bundle_dir / "daily_evidence.json"
 
@@ -630,12 +515,8 @@ def _write_drop_bundle(
             "end_date": period_end.isoformat(),
         }
 
-        norm["track"] = {
-            "track_id": str(track_id),
-            "path": rel_track_path,
-        }
+        norm["track"] = {"track_id": art["track_id"], "path": rel_track_path}
 
-        # PORTABLE ONLY (no absolute /tmp paths)
         norm["paths"] = {
             "playlist": "playlist.json",
             "track": rel_track_path,
@@ -699,77 +580,43 @@ def _write_drop_bundle(
 
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
-    """
-    Create a daily drop bundle.
-    """
     ctx = _build_run_context(args)
     context = getattr(args, "context", "focus")
-
     drop_id, ev_path = _write_drop_bundle(ctx=ctx, context=context, schedule="daily")
 
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "drop_id": str(drop_id),
-                    "drop_evidence": str(ev_path),
-                    "bundle_dir": str(ctx.out_dir / "drop_bundle"),
-                }
-            )
-        )
+        print(json.dumps({"ok": True, "drop_id": str(drop_id), "drop_evidence": str(ev_path), "bundle_dir": str(ctx.out_dir / "drop_bundle")}))
     else:
         print(f"[run.drop] ok drop_id={drop_id} evidence={ev_path}")
     return 0
 
 
 def cmd_run_weekly(args: argparse.Namespace) -> int:
-    """
-    Weekly pipeline: daily -> publish-marketing -> weekly drop bundle.
-    Uses the same artifacts but keys the drop by ISO week period.
-    """
     rc = cmd_run_daily(args)
     if rc != 0:
         return rc
-
     rc = cmd_publish_marketing(args)
     if rc != 0:
         return rc
 
     ctx = _build_run_context(args)
     context = getattr(args, "context", "focus")
-
     drop_id, ev_path = _write_drop_bundle(ctx=ctx, context=context, schedule="weekly")
 
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "schedule": "weekly",
-                    "drop_id": str(drop_id),
-                    "drop_evidence": str(ev_path),
-                    "bundle_dir": str(ctx.out_dir / "drop_bundle"),
-                }
-            )
-        )
+        print(json.dumps({"ok": True, "schedule": "weekly", "drop_id": str(drop_id), "drop_evidence": str(ev_path), "bundle_dir": str(ctx.out_dir / "drop_bundle")}))
     else:
         print(f"[run.weekly] ok drop_id={drop_id} evidence={ev_path}")
     return 0
 
 
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
-    """
-    Daily pipeline: daily -> publish-marketing -> drop (daily bundle).
-    """
     rc = cmd_run_daily(args)
     if rc != 0:
         return rc
-
     rc = cmd_publish_marketing(args)
     if rc != 0:
         return rc
-
     rc = cmd_run_drop(args)
     if rc != 0:
         return rc
@@ -817,74 +664,8 @@ def cmd_run_stage(args: argparse.Namespace) -> int:
         con.close()
 
 
-def cmd_run_manifest(args: argparse.Namespace) -> int:
-    repo_root = Path(getattr(args, "repo_root", ".")).resolve()
-    out_path = Path(args.out).resolve()
-    manifest = compute_repo_manifest(repo_root)
-    _json_dump(manifest, out_path)
-
-    if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "out": str(out_path),
-                    "root_sha256": manifest["root_sha256"],
-                    "file_count": manifest["file_count"],
-                }
-            )
-        )
-    else:
-        print(f"[run.manifest] ok out={out_path} root_sha256={manifest['root_sha256']} files={manifest['file_count']}")
-    return 0
-
-
-def cmd_run_diff(args: argparse.Namespace) -> int:
-    old_p = Path(args.old).resolve()
-    new_p = Path(args.new).resolve()
-    d = diff_manifests(_read_json(old_p), _read_json(new_p))
-    s = d["summary"]
-
-    if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "summary": s, "added": d["added"], "removed": d["removed"], "changed": d["changed"]}))
-    else:
-        print(f"+{s['added']}  -{s['removed']}  ~{s['changed']}  (older={old_p.name} newer={new_p.name})")
-
-    if getattr(args, "fail_on_changes", False) and (s["added"] or s["removed"] or s["changed"]):
-        return 2
-    return 0
-
-
-def cmd_run_status(args: argparse.Namespace) -> int:
-    db_path = _require_db(args)
-    out: Dict[str, Any] = {"db": str(db_path), "ok": True}
-
-    if not db_path.exists():
-        out["ok"] = False
-        out["reason"] = "db_missing"
-        if getattr(args, "json", False):
-            print(json.dumps(out))
-        else:
-            print(f"[run.status] FAIL db missing: {db_path}")
-        return 2
-
-    con = _connect(db_path)
-    try:
-        tables = ["tracks", "playlists", "marketing_posts", "drops", "run_stages"]
-        out["tables"] = {t: _table_exists(con, t) for t in tables}
-    finally:
-        con.close()
-
-    if getattr(args, "json", False):
-        print(json.dumps(out))
-    else:
-        tbls = ", ".join([f"{k}={'yes' if v else 'no'}" for k, v in out.get("tables", {}).items()])
-        print(f"[run.status] ok db={db_path} {tbls}")
-    return 0
-
-
 # -----------------------------------------------------------------------------
-# Run dispatcher (covers both mgc.main dispatch styles)
+# argparse wiring
 # -----------------------------------------------------------------------------
 
 def cmd_run_dispatch(args: argparse.Namespace) -> int:
@@ -901,30 +682,17 @@ def cmd_run_dispatch(args: argparse.Namespace) -> int:
         return cmd_run_drop(args)
     if cmd == "stage":
         return cmd_run_stage(args)
-    if cmd == "manifest":
-        return cmd_run_manifest(args)
-    if cmd == "diff":
-        return cmd_run_diff(args)
-    if cmd == "status":
-        return cmd_run_status(args)
 
     print(f"Unknown run_cmd: {cmd}", file=sys.stderr)
     return 2
 
 
-# -----------------------------------------------------------------------------
-# Argparse wiring
-# -----------------------------------------------------------------------------
-
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p_run = subparsers.add_parser(
         "run",
-        help="Run pipeline steps (daily, weekly, autonomous, publish-marketing, drop, stage, manifest, diff, status)",
+        help="Run pipeline steps (daily, weekly, autonomous, publish-marketing, drop, stage)",
     )
-
-    # Provide a handler at the run level too (some mgc.main variants dispatch here).
     p_run.set_defaults(fn=cmd_run_dispatch, func=cmd_run_dispatch)
-
     run_sub = p_run.add_subparsers(dest="run_cmd", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
@@ -933,26 +701,28 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--out-dir", default="artifacts/run", help="Output directory for artifacts")
         p.add_argument("--evidence-dir", default=None, help="Evidence directory (default: <out-dir>/evidence)")
         p.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Generation context")
+        p.add_argument("--provider", default=os.environ.get("MGC_PROVIDER", "stub"), help="Audio provider (stub|filesystem|...)")
+        p.add_argument("--seed", type=int, default=int(os.environ.get("MGC_SEED", "1")), help="Seed")
         p.add_argument("--deterministic", action="store_true", help="Force deterministic mode (CI)")
         p.add_argument("--json", action="store_true", help="JSON output where supported")
 
-    p = run_sub.add_parser("daily", help="Run the daily pipeline (deterministic capable)")
+    p = run_sub.add_parser("daily", help="Generate one track + daily evidence")
     add_common(p)
     p.set_defaults(fn=cmd_run_daily, func=cmd_run_daily)
 
-    p = run_sub.add_parser("weekly", help="Run the weekly pipeline (daily -> publish-marketing -> weekly drop bundle)")
+    p = run_sub.add_parser("weekly", help="Weekly pipeline (daily -> publish-marketing -> weekly drop)")
     add_common(p)
     p.set_defaults(fn=cmd_run_weekly, func=cmd_run_weekly)
 
-    p = run_sub.add_parser("autonomous", help="Run autonomous pipeline stages (daily -> publish-marketing -> drop)")
+    p = run_sub.add_parser("autonomous", help="Daily pipeline (daily -> publish-marketing -> drop)")
     add_common(p)
     p.set_defaults(fn=cmd_run_autonomous, func=cmd_run_autonomous)
 
-    p = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
+    p = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (stub)")
     add_common(p)
     p.set_defaults(fn=cmd_publish_marketing, func=cmd_publish_marketing)
 
-    p = run_sub.add_parser("drop", help="Create a daily drop bundle from the latest artifacts")
+    p = run_sub.add_parser("drop", help="Create a daily drop bundle from latest artifacts")
     add_common(p)
     p.set_defaults(fn=cmd_run_drop, func=cmd_run_drop)
 
@@ -960,21 +730,3 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     add_common(p)
     p.add_argument("stage_name", help="Stage name")
     p.set_defaults(fn=cmd_run_stage, func=cmd_run_stage)
-
-    p = run_sub.add_parser("manifest", help="Compute deterministic repo manifest (stable file hashing)")
-    p.add_argument("--repo-root", default=".", help="Repository root")
-    p.add_argument("--out", default="data/evidence/manifest.json", help="Output manifest path")
-    p.add_argument("--json", action="store_true", help="JSON output (command result)")
-    p.set_defaults(fn=cmd_run_manifest, func=cmd_run_manifest)
-
-    p = run_sub.add_parser("diff", help="Compare manifest files (CI gate helper)")
-    p.add_argument("--old", default="data/evidence/manifest.json", help="Older manifest path")
-    p.add_argument("--new", default="data/evidence/weekly_manifest.json", help="Newer manifest path")
-    p.add_argument("--fail-on-changes", action="store_true", help="Exit non-zero if any changes exist")
-    p.add_argument("--json", action="store_true", help="JSON diff output")
-    p.set_defaults(fn=cmd_run_diff, func=cmd_run_diff)
-
-    p = run_sub.add_parser("status", help="Show run/pipeline status snapshot")
-    p.add_argument("--db", help="DB path (optional if provided globally)", default=argparse.SUPPRESS)
-    p.add_argument("--json", action="store_true", help="JSON output")
-    p.set_defaults(fn=cmd_run_status, func=cmd_run_status)
