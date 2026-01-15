@@ -18,6 +18,7 @@ ci_root_determinism.sh contract:
 
 Agents:
 - Music generation goes through mgc.agents.music_agent.MusicAgent
+- Marketing planning goes through mgc.agents.marketing_agent.MarketingAgent
 """
 
 from __future__ import annotations
@@ -28,9 +29,11 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import uuid
+from mgc.playlist import build_playlist
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -81,6 +84,10 @@ def _json_dump(obj: Any, path: Path) -> None:
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _json_load(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -93,6 +100,13 @@ def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+
+def _write_jsonl_overwrite(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
 
 
 def _as_rel_posix(path_like: str) -> str:
@@ -420,54 +434,188 @@ def _write_drop_bundle(*, ctx: RunContext, context: str, schedule: str) -> Tuple
 
 
 # -----------------------------------------------------------------------------
+# Marketing wiring
+# -----------------------------------------------------------------------------
+
+def _load_daily_track_as_artifact(ctx: RunContext) -> Optional[Any]:
+    """
+    Load the latest daily evidence in the current out_dir and build a TrackArtifact.
+    Returns TrackArtifact or None if daily evidence doesn't exist yet.
+    """
+    ev_path = ctx.evidence_dir / "daily_evidence.json"
+    if not ev_path.exists():
+        return None
+
+    ev = _json_load(ev_path)
+    track_info = (ev.get("track") or {})
+    sha_info = (ev.get("sha256") or {})
+    meta = dict(ev.get("meta") or {})
+    provider = str(ev.get("provider") or meta.get("provider") or ctx.provider)
+
+    rel = str(track_info.get("path") or "")
+    if not rel:
+        return None
+    rel = _as_rel_posix(rel)
+    abs_path = ctx.out_dir / rel
+
+    from mgc.agents.music_agent import TrackArtifact
+
+    track_id = str(track_info.get("track_id") or meta.get("track_id") or "")
+    if not track_id:
+        return None
+
+    title = str(meta.get("title") or f"{(ev.get('context') or 'focus').title()} Track")
+    mood = str(meta.get("mood") or ev.get("context") or "focus")
+    genre = str(meta.get("genre") or "unknown")
+    sha = str(sha_info.get("track") or (abs_path.exists() and _sha256_file(abs_path)) or "")
+
+    return TrackArtifact(
+        track_id=track_id,
+        provider=provider,
+        artifact_path=str(abs_path),
+        sha256=sha,
+        title=title,
+        mood=mood,
+        genre=genre,
+        meta=meta,
+        preview_path="",
+    )
+
+
+def _make_preview(ctx: RunContext, track: Any) -> str:
+    """
+    Create a deterministic preview asset.
+
+    For now this is a WAV copy:
+      marketing/previews/<track_id>.wav
+
+    Returns relative preview path.
+    """
+    src = Path(track.artifact_path)
+    previews_dir = ctx.out_dir / "marketing" / "previews"
+    _ensure_dir(previews_dir)
+
+    dst = previews_dir / f"{track.track_id}.wav"
+    dst.write_bytes(src.read_bytes())
+
+    return _as_rel_posix(f"marketing/previews/{dst.name}")
+
+
+# -----------------------------------------------------------------------------
 # Commands
 # -----------------------------------------------------------------------------
+
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     ctx = _build_run_context(args)
     dry_run = bool(getattr(args, "dry_run", False))
 
+    # Weekly/autonomous may pass a fixed timestamp to force determinism.
+    fixed_now = (getattr(args, "fixed_now", None) or "").strip()
+    now_iso = fixed_now or ctx.now.isoformat()
+
+    # Build track artifact from daily evidence (produced by run daily or by weekly/autonomous).
+    track = _load_daily_track_as_artifact(ctx)
+    planned_posts: List[Dict[str, Any]] = []
+
+    receipts_path = ctx.out_dir / "marketing" / "receipts.jsonl"
+    receipts_sha_before = _sha256_file(receipts_path) if receipts_path.exists() else ""
+
+    if track is not None:
+        # Attach preview
+        preview_rel = _make_preview(ctx, track)
+        # TrackArtifact is frozen, but we can stash preview path in meta + pass separately to agent inputs.
+        meta2 = dict(track.meta or {})
+        meta2["preview_path"] = preview_rel
+
+        from mgc.agents.music_agent import TrackArtifact
+        track2 = TrackArtifact(
+            track_id=track.track_id,
+            provider=track.provider,
+            artifact_path=track.artifact_path,
+            sha256=track.sha256,
+            title=track.title,
+            mood=track.mood,
+            genre=track.genre,
+            meta=meta2,
+            preview_path=preview_rel,
+        )
+
+        # Plan posts
+        from mgc.agents.marketing_agent import MarketingAgent, StoragePaths
+
+        storage = StoragePaths(root=str(ctx.out_dir))
+        agent = MarketingAgent(storage=storage)
+
+        # created_at must be stable for determinism (weekly passes fixed_now)
+        planned_posts = agent.plan_posts(track2, deterministic=True, created_at=now_iso)
+
+    # Turn planned posts into receipts
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
-    run_id = stable_uuid(ns, f"run:publish_marketing:{ctx.now.isoformat()}", ctx.deterministic)
+    # Stable run_id when fixed_now is provided; otherwise stable per (now, track)
+    track_id_for_id = ""
+    if track is not None:
+        track_id_for_id = str(getattr(track, "track_id", ""))
+    run_id = stable_uuid(ns, f"run:publish_marketing:{now_iso}:{track_id_for_id}", True)
 
-    marketing_dir = ctx.out_dir / "marketing"
-    receipts_path = marketing_dir / "receipts.jsonl"
-    post_id = stable_uuid(ns, f"marketing_post:stub:{ctx.now.isoformat()}", ctx.deterministic)
+    receipts: List[Dict[str, Any]] = []
+    for p in planned_posts:
+        receipts.append(
+            {
+                "schema": "mgc.marketing_receipt.v1",
+                "version": 1,
+                "run_id": str(run_id),
+                "deterministic": True,
+                "ts": now_iso,
+                "platform": p.get("platform", "unknown"),
+                "status": "published" if not dry_run else "planned",
+                "post_id": str(p.get("id") or ""),
+                "track_id": str(p.get("track_id") or ""),
+            }
+        )
 
-    receipt = {
-        "schema": "mgc.marketing_receipt.v1",
-        "version": 1,
-        "run_id": str(run_id),
-        "deterministic": ctx.deterministic,
-        "ts": ctx.now.isoformat(),
-        "platform": "stub",
-        "status": "published",
-        "post_id": str(post_id),
-    }
+    # Stable ordering
+    receipts.sort(key=lambda r: (r.get("platform") or "", r.get("post_id") or ""))
 
-    appended = 0
     if not dry_run:
-        _append_jsonl(receipts_path, receipt)
-        appended = 1
+        # Determinism gate: overwrite receipts each run.
+        _write_jsonl_overwrite(receipts_path, receipts)
 
-    receipts_sha = _sha256_file(receipts_path) if receipts_path.exists() else ""
+    receipts_sha_after = _sha256_file(receipts_path) if receipts_path.exists() else ""
 
     ev = {
         "run_id": str(run_id),
         "stage": "publish-marketing",
-        "deterministic": ctx.deterministic,
-        "ts": ctx.now.isoformat(),
+        "deterministic": True,
+        "ts": now_iso,
         "dry_run": dry_run,
-        "receipts": {"path": "marketing/receipts.jsonl", "sha256": receipts_sha, "appended": appended},
+        "inputs": {"daily_evidence": "evidence/daily_evidence.json" if (ctx.evidence_dir / "daily_evidence.json").exists() else ""},
+        "outputs": {
+            "posts_dir": "marketing/posts",
+            "preview_dir": "marketing/previews",
+            "receipts_path": "marketing/receipts.jsonl",
+        },
+        "counts": {"planned_posts": len(planned_posts), "receipts": len(receipts)},
+        "sha256": {
+            "receipts_before": receipts_sha_before,
+            "receipts_after": receipts_sha_after,
+        },
     }
     _json_dump(ev, ctx.evidence_dir / "publish_marketing_evidence.json")
 
     if getattr(args, "json", False):
-        _emit_json({"ok": True, "stage": "publish-marketing", "run_id": str(run_id), "paths": {"publish_marketing_evidence": "evidence/publish_marketing_evidence.json"}})
+        _emit_json(
+            {
+                "ok": True,
+                "stage": "publish-marketing",
+                "run_id": str(run_id),
+                "counts": {"planned_posts": len(planned_posts), "receipts": len(receipts)},
+                "paths": {"publish_marketing_evidence": "evidence/publish_marketing_evidence.json"},
+            }
+        )
     else:
-        _log(f"[run.publish-marketing] ok run_id={run_id}")
+        _log(f"[run.publish-marketing] ok run_id={run_id} planned_posts={len(planned_posts)} receipts={len(receipts)}")
     return 0
-
 
 def cmd_run_drop(args: argparse.Namespace) -> int:
     _run_daily_no_emit(args)
@@ -486,6 +634,10 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     daily_ev = ctx.evidence_dir / "daily_evidence.json"
     if daily_ev.exists():
         files.append(("evidence/daily_evidence.json", daily_ev))
+
+    pm_ev = ctx.evidence_dir / "publish_marketing_evidence.json"
+    if pm_ev.exists():
+        files.append(("evidence/publish_marketing_evidence.json", pm_ev))
 
     _manifest_path, manifest_sha = _write_manifest(ctx, files)
 
@@ -508,25 +660,241 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     return 0
 
 
+
 def cmd_run_weekly(args: argparse.Namespace) -> int:
+    """Weekly pipeline step (playlist-driven, deterministic).
+
+    Produces:
+      - drop_bundle/playlist.json (multi-track)
+      - drop_bundle/daily_evidence.json
+      - drop_bundle/tracks/<track_id>.wav (copied)
+      - evidence/daily_evidence.json (lead track; for publish-marketing)
+      - evidence/publish_marketing_evidence.json + marketing/* (lead track)
+      - drop_evidence.json
+
+    Key points:
+      - No audio generation.
+      - Stable IDs + stable timestamps.
+      - publish-marketing is run deterministically with a frozen timestamp.
+    """
+    ctx = _build_run_context(args)
     json_mode = bool(getattr(args, "json", False))
 
-    _run_daily_no_emit(args)
+    context = getattr(args, "context", "focus")
 
-    # In JSON mode, silence the nested marketing step entirely.
+    # Weekly period
+    period_start, period_end, period_label = _iso_week_period(ctx.now.date())
+    period_key = period_label  # e.g. "2026-W03"
+
+    # Stable timestamp for determinism: week start at 00:00:00Z
+    stable_ts = f"{period_start.isoformat()}T00:00:00+00:00"
+
+    # Optional knobs
+    target_minutes = getattr(args, "target_minutes", None)
+    if target_minutes is None:
+        target_minutes = 20
+    lookback_playlists = getattr(args, "lookback_playlists", None)
+    if lookback_playlists is None:
+        lookback_playlists = 0
+
+    out_dir = Path(getattr(args, "out_dir", ctx.out_dir)).resolve()
+    bundle_dir = out_dir / "drop_bundle"
+    bundle_tracks_dir = bundle_dir / "tracks"
+    out_tracks_dir = out_dir / "tracks"
+    evidence_dir = out_dir / "evidence"
+
+    _ensure_dir(out_dir)
+    _ensure_dir(bundle_dir)
+    _ensure_dir(bundle_tracks_dir)
+    _ensure_dir(out_tracks_dir)
+    _ensure_dir(evidence_dir)
+
+    # Build deterministic playlist
+    pl = build_playlist(
+        db_path=ctx.db_path,
+        context=context,
+        period_key=period_key,
+        base_seed=int(ctx.seed),
+        target_minutes=int(target_minutes),
+        lookback_playlists=int(lookback_playlists),
+    )
+
+    if not isinstance(pl, dict) or "tracks" not in pl:
+        raise SystemExit("[run.weekly] build_playlist must return dict with 'tracks'")
+
+    tracks = list(pl.get("tracks") or [])
+    if not tracks:
+        raise SystemExit(f"[run.weekly] build_playlist returned 0 tracks (context={context!r}, period_key={period_key!r})")
+
+    lead = tracks[0]
+    lead_track_id = getattr(lead, "id", None) or getattr(lead, "track_id", None)
+    if not lead_track_id:
+        raise SystemExit("[run.weekly] lead track missing id/track_id")
+    lead_track_id = str(lead_track_id)
+
+    # Stable IDs (force deterministic regardless of CLI flags)
+    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    playlist_id = stable_uuid(ns, f"playlist:weekly:{period_key}:{context}", True)
+    run_id = stable_uuid(ns, f"run:weekly:{period_key}:{context}:{ctx.seed}", True)
+    drop_id = stable_uuid(ns, f"drop:weekly:{period_key}:{context}", True)
+
+    def _resolve_src(p: str) -> Path:
+        pp = Path(p)
+        if pp.is_absolute():
+            return pp
+        return (Path(ctx.repo_root) / pp).resolve()
+
+    playlist_tracks_json: List[Dict[str, Any]] = []
+    lead_out_path: Optional[Path] = None
+    lead_bundle_path: Optional[Path] = None
+
+    for t in tracks:
+        tid = getattr(t, "id", None) or getattr(t, "track_id", None)
+        if not tid:
+            raise SystemExit(f"[run.weekly] playlist track missing id: {t!r}")
+        tid = str(tid)
+
+        src_raw = getattr(t, "full_path", None) or getattr(t, "path", None) or getattr(t, "artifact_path", None)
+        if not src_raw:
+            raise SystemExit(f"[run.weekly] playlist track missing source path: {t!r}")
+
+        src = _resolve_src(str(src_raw))
+        if not src.exists():
+            raise SystemExit(f"[run.weekly] missing source track file: {src}")
+
+        suffix = src.suffix.lower() or ".wav"
+
+        bundle_dst = bundle_tracks_dir / f"{tid}{suffix}"
+        if not bundle_dst.exists():
+            shutil.copy2(src, bundle_dst)
+
+        if tid == lead_track_id:
+            out_dst = out_tracks_dir / f"{tid}{suffix}"
+            if not out_dst.exists():
+                shutil.copy2(src, out_dst)
+            lead_out_path = out_dst
+            lead_bundle_path = bundle_dst
+
+        playlist_tracks_json.append(
+            {
+                "track_id": tid,
+                "title": getattr(t, "title", None),
+                "mood": getattr(t, "mood", None),
+                "genre": getattr(t, "genre", None),
+                "bpm": getattr(t, "bpm", None),
+                "duration_sec": getattr(t, "duration_sec", None),
+                "path": f"tracks/{bundle_dst.name}",
+            }
+        )
+
+    if lead_out_path is None or lead_bundle_path is None:
+        raise SystemExit("[run.weekly] internal error: lead track was not copied")
+
+    # Write playlist.json (bundle-local paths)
+    playlist_doc: Dict[str, Any] = {
+        "schema": "mgc.playlist.v1",
+        "version": 1,
+        "playlist_id": str(playlist_id),
+        "context": context,
+        "schedule": "weekly",
+        "period": {
+            "key": period_key,
+            "label": period_label,
+            "start_date": period_start.isoformat(),
+            "end_date": period_end.isoformat(),
+        },
+        "ts": stable_ts,
+        "deterministic": True,
+        "lead_track_id": lead_track_id,
+        "tracks": playlist_tracks_json,
+    }
+
+    # Carry through additional playlist metadata (but never override core keys)
+    for k, v in (pl.items() if isinstance(pl, dict) else []):
+        if k in ("tracks", "items"):
+            continue
+        if k not in playlist_doc:
+            playlist_doc[k] = v
+
+    bundle_playlist_path = bundle_dir / "playlist.json"
+    _json_dump(playlist_doc, bundle_playlist_path)
+    playlist_sha = _sha256_file(bundle_playlist_path)
+
+    # Evidence for publish-marketing expects evidence/daily_evidence.json and track under out_dir/tracks/
+    lead_rel_out = _as_rel_posix(f"tracks/{Path(lead_out_path).name}")
+    lead_sha_out = _sha256_file(Path(lead_out_path))
+
+    evidence_daily = {
+        "schema": "mgc.daily_evidence.v1",
+        "version": 1,
+        "run_id": str(run_id),
+        "stage": "daily",
+        "context": context,
+        "deterministic": True,
+        "ts": stable_ts,
+        "provider": str(getattr(ctx, "provider", "stub")),
+        "schedule": "weekly",
+        "period": {
+            "key": period_key,
+            "label": period_label,
+            "start_date": period_start.isoformat(),
+            "end_date": period_end.isoformat(),
+        },
+        "track": {"track_id": lead_track_id, "path": lead_rel_out},
+        "sha256": {"track": str(lead_sha_out), "playlist": str(playlist_sha)},
+        "meta": {
+            "target_minutes": int(target_minutes),
+            "lookback_playlists": int(lookback_playlists),
+            "playlist_track_count": len(tracks),
+            "lead_track_id": lead_track_id,
+        },
+    }
+    _json_dump(evidence_daily, evidence_dir / "daily_evidence.json")
+
+    # Bundle-local daily evidence
+    lead_rel_bundle = _as_rel_posix(f"tracks/{Path(lead_bundle_path).name}")
+    lead_sha_bundle = _sha256_file(Path(lead_bundle_path))
+
+    bundle_daily = dict(evidence_daily)
+    bundle_daily["track"] = {"track_id": lead_track_id, "path": lead_rel_bundle}
+    bundle_daily["sha256"] = {"track": str(lead_sha_bundle), "playlist": str(playlist_sha)}
+    _json_dump(bundle_daily, bundle_dir / "daily_evidence.json")
+
+    # Write drop_evidence.json (top-level summary, stable)
+    drop_ev = {
+        "ok": True,
+        "drop_id": str(drop_id),
+        "context": context,
+        "schedule": "weekly",
+        "period_key": period_key,
+        "lead_track_id": lead_track_id,
+        "playlist_tracks": len(tracks),
+        "paths": {
+            "bundle_dir": "drop_bundle",
+            "bundle_playlist": "drop_bundle/playlist.json",
+            "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
+            "daily_evidence": "evidence/daily_evidence.json",
+            "drop_evidence": "drop_evidence.json",
+        },
+    }
+    _json_dump(drop_ev, out_dir / "drop_evidence.json")
+
+    # Run publish-marketing deterministically for the lead track.
+    # publish-marketing reads evidence/daily_evidence.json (out_dir/evidence/...).
+    setattr(args, "out_dir", str(out_dir))
+    setattr(args, "evidence_dir", str(evidence_dir))
+    setattr(args, "fixed_now", stable_ts)
+    setattr(args, "deterministic", True)
+
     with _silence_stdio(json_mode):
         cmd_publish_marketing(args)
 
-    ctx = _build_run_context(args)
-    context = getattr(args, "context", "focus")
-    drop_id, _produced = _write_drop_bundle(ctx=ctx, context=context, schedule="weekly")
-
     if getattr(args, "json", False):
-        _emit_json({"ok": True, "stage": "weekly", "drop_id": str(drop_id), "paths": {"drop_evidence": "drop_evidence.json", "bundle_dir": "drop_bundle"}})
+        _emit_json(drop_ev)
     else:
-        _log(f"[run.weekly] ok drop_id={drop_id}")
-    return 0
+        _log(f"[run.weekly] ok drop_id={drop_id} period_key={period_key} lead_track_id={lead_track_id} playlist_tracks={len(tracks)}")
 
+    return 0
 
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
