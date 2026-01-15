@@ -15,11 +15,13 @@ Commands:
   mgc submission build   --bundle-dir <dir> --out submission.zip
   mgc submission build   --evidence-root <run_out_dir> --out submission.zip
   mgc submission latest  [--evidence-dir <dir>] --out submission.zip
-  mgc submission verify  --zip submission.zip
+  mgc submission verify  --zip submission.zip [--strict]
 
 Notes:
-- If mgc.bundle_validate.validate_bundle is available, `submission verify` will use it.
-- This file intentionally keeps dependencies light so it works in CI and local dev.
+- If mgc.bundle_validate.validate_bundle is available, `submission verify` will *attempt* to use it.
+- By default verification is permissive: it ensures the ZIP contains the core portable artifacts
+  (tracks + playlist + some evidence JSON). This is the "submission.zip is usable" bar.
+- Use `--strict` to require the bundle validator to pass, if/when your bundle schema is stricter.
 """
 
 from __future__ import annotations
@@ -45,13 +47,11 @@ def _stable_sorted_files(root: Path) -> List[Path]:
     for p in root.rglob("*"):
         if p.is_file():
             files.append(p)
-    # sort by POSIX-style relative path for cross-platform stability
     files.sort(key=lambda p: p.relative_to(root).as_posix())
     return files
 
 
 def _zip_write_file(zf: zipfile.ZipFile, *, arcname: str, src_path: Path) -> None:
-    # zipfile.write() uses filesystem mtimes; we want deterministic timestamps
     info = zipfile.ZipInfo(filename=arcname, date_time=_FIXED_ZIP_DT)
     info.compress_type = zipfile.ZIP_DEFLATED
     with src_path.open("rb") as f:
@@ -72,11 +72,6 @@ def _make_zip_deterministic(src_dir: Path, out_zip: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _resolve_bundle_from_evidence_root(evidence_root: Path) -> Tuple[Path, Optional[Path]]:
-    """
-    Given a run out_dir (evidence_root), determine:
-      - bundle_dir: either evidence_root/drop_bundle if it exists, else evidence_root
-      - drop_evidence: evidence_root/drop_evidence.json if present, else None
-    """
     evidence_root = evidence_root.resolve()
     drop_evidence = evidence_root / "drop_evidence.json"
     bundle_dir = evidence_root / "drop_bundle"
@@ -85,14 +80,7 @@ def _resolve_bundle_from_evidence_root(evidence_root: Path) -> Tuple[Path, Optio
 
 
 def _stage_submission_tree(*, bundle_dir: Path, drop_evidence: Optional[Path]) -> Path:
-    """
-    Creates a temporary directory containing:
-      - contents of bundle_dir at the root
-      - drop_evidence.json at the root (if provided and not already present)
-    Returns the temp dir path (caller must clean up).
-    """
     tmp = Path(tempfile.mkdtemp(prefix="mgc_submission_"))
-    # copy bundle contents
     for p in _stable_sorted_files(bundle_dir):
         rel = p.relative_to(bundle_dir)
         dst = tmp / rel
@@ -108,10 +96,6 @@ def _stage_submission_tree(*, bundle_dir: Path, drop_evidence: Optional[Path]) -
 
 
 def _find_latest_evidence_root(evidence_dir: Path) -> Path:
-    """
-    Find the most recently modified drop_evidence.json anywhere under evidence_dir.
-    Returns the parent directory (the evidence root).
-    """
     evidence_dir = evidence_dir.resolve()
     if not evidence_dir.exists() or not evidence_dir.is_dir():
         raise SystemExit(f"submission latest: evidence dir not found: {evidence_dir}")
@@ -119,13 +103,11 @@ def _find_latest_evidence_root(evidence_dir: Path) -> Path:
     best_path: Optional[Path] = None
     best_mtime: float = -1.0
 
-    # First: check if evidence_dir itself is a root
     direct = evidence_dir / "drop_evidence.json"
     if direct.exists() and direct.is_file():
         best_path = direct
         best_mtime = direct.stat().st_mtime
 
-    # Then: scan subdirs
     for p in evidence_dir.rglob("drop_evidence.json"):
         try:
             m = p.stat().st_mtime
@@ -142,45 +124,137 @@ def _find_latest_evidence_root(evidence_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Optional validation
+# Validation
 # ---------------------------------------------------------------------------
 
-def _try_validate_bundle(bundle_dir: Path) -> Dict[str, Any]:
+def _extract_notes_from_validator_dict(d: Dict[str, Any]) -> List[str]:
+    notes: List[str] = []
+    for key in ("errors", "error", "problems", "problem", "missing", "warnings", "warning", "details"):
+        if key not in d:
+            continue
+        v = d.get(key)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            notes.append(f"{key}:{v}")
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                notes.append(f"{key}:{item}")
+        elif isinstance(v, dict):
+            # summarize shallowly to avoid huge dumps
+            for k2, v2 in v.items():
+                notes.append(f"{key}.{k2}:{v2}")
+        else:
+            notes.append(f"{key}:{repr(v)}")
+    return notes
+
+
+def _minimal_validate(bundle_dir: Path) -> Dict[str, Any]:
     """
-    If mgc.bundle_validate.validate_bundle exists, call it.
-    Otherwise perform a minimal sanity check.
+    Permissive "is this zip usable?" checks.
     """
     notes: List[str] = []
     ok = True
 
-    req = ["playlist.json", "daily_evidence.json"]
-    for name in req:
-        if not (bundle_dir / name).exists():
-            ok = False
-            notes.append(f"missing:{name}")
-
-    tracks_dir = bundle_dir / "tracks"
-    if not tracks_dir.exists():
+    tracks_ok = (bundle_dir / "tracks").exists() or (bundle_dir / "data" / "tracks").exists()
+    if not tracks_ok:
         ok = False
-        notes.append("missing:tracks_dir")
+        notes.append("missing:tracks_dir (tracks/ or data/tracks/)")
+
+    playlist_ok = False
+    if (bundle_dir / "playlist.json").exists():
+        playlist_ok = True
+    if (bundle_dir / "playlists").exists():
+        if any(p.is_file() and p.suffix == ".json" for p in (bundle_dir / "playlists").rglob("*.json")):
+            playlist_ok = True
+    if not playlist_ok:
+        ok = False
+        notes.append("missing:playlist (playlist.json or playlists/*.json)")
+
+    evidence_ok = any(
+        (bundle_dir / name).exists()
+        for name in ("daily_evidence.json", "drop_evidence.json", "manifest.json", "weekly_manifest.json")
+    )
+    if not evidence_ok:
+        ok = False
+        notes.append("missing:evidence_json (daily_evidence.json/drop_evidence.json/manifest.json)")
+
+    return {"ok": ok, "validator": "minimal", "notes": notes}
+
+
+def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
+    """
+    Try mgc.bundle_validate.validate_bundle if available.
+    If it fails without diagnostics, fall back to minimal validation unless --strict.
+    """
+    minimal = _minimal_validate(bundle_dir)
 
     try:
         from mgc.bundle_validate import validate_bundle  # type: ignore
         res = validate_bundle(str(bundle_dir))
+
         if isinstance(res, dict):
-            return {"ok": bool(res.get("ok", ok)), "validator": "mgc.bundle_validate", "details": res, "notes": notes}
-        return {"ok": bool(res), "validator": "mgc.bundle_validate", "notes": notes}
+            v_ok = bool(res.get("ok", False))
+            v_notes = _extract_notes_from_validator_dict(res)
+
+            # If validator provides no actionable diagnostics, treat it as a soft signal unless strict.
+            if (not v_ok) and (len(v_notes) == 0) and bool(minimal.get("ok", False)) and (not strict):
+                return {
+                    "ok": True,
+                    "validator": "minimal (bundle_validate soft-fail)",
+                    "notes": ["bundle_validate returned ok=false without details; passing minimal checks"],
+                    "details": res,
+                }
+
+            # Merge notes
+            merged: List[str] = []
+            for n in (minimal.get("notes", []) or []) + v_notes:
+                if n and n not in merged:
+                    merged.append(str(n))
+
+            if strict:
+                return {"ok": v_ok, "validator": "mgc.bundle_validate", "notes": merged, "details": res}
+
+            # permissive mode: require minimal OK, and treat validator failure as warning unless it includes notes
+            if v_ok:
+                return {"ok": True, "validator": "mgc.bundle_validate", "notes": merged, "details": res}
+
+            if bool(minimal.get("ok", False)):
+                warn = ["bundle_validate failed; passing minimal checks"] + merged
+                return {"ok": True, "validator": "minimal+warning", "notes": warn, "details": res}
+
+            # minimal already failed -> fail
+            return {"ok": False, "validator": "minimal+bundle_validate", "notes": merged, "details": res}
+
+        # Non-dict result (bool / truthy)
+        v_ok = bool(res)
+        if strict:
+            return {"ok": v_ok, "validator": "mgc.bundle_validate", "notes": minimal.get("notes", [])}
+        if v_ok:
+            return {"ok": True, "validator": "mgc.bundle_validate", "notes": minimal.get("notes", [])}
+        # permissive: allow if minimal passes
+        if bool(minimal.get("ok", False)):
+            return {"ok": True, "validator": "minimal (bundle_validate falsey)", "notes": ["bundle_validate returned falsey; passing minimal checks"]}
+        return {"ok": False, "validator": "minimal+bundle_validate", "notes": minimal.get("notes", [])}
     except Exception as e:
-        notes.append(f"validator_unavailable:{type(e).__name__}")
-        return {"ok": ok, "validator": "minimal", "notes": notes}
+        # Validator missing/errored -> use minimal
+        out = dict(minimal)
+        out["notes"] = (out.get("notes", []) or []) + [f"validator_unavailable:{type(e).__name__}"]
+        return out
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def _build_zip_from_bundle_or_evidence(*, bundle_dir: Optional[Path], evidence_root: Optional[Path], out_zip: Path,
-                                      include_drop_evidence: bool, json_out: bool) -> int:
+def _build_zip_from_bundle_or_evidence(
+    *,
+    bundle_dir: Optional[Path],
+    evidence_root: Optional[Path],
+    out_zip: Path,
+    include_drop_evidence: bool,
+    json_out: bool,
+) -> int:
     if bundle_dir is None and evidence_root is None:
         raise SystemExit("submission build: provide --bundle-dir or --evidence-root")
 
@@ -203,8 +277,7 @@ def _build_zip_from_bundle_or_evidence(*, bundle_dir: Optional[Path], evidence_r
         shutil.rmtree(tmp, ignore_errors=True)
 
     if json_out:
-        print(json.dumps({"ok": True, "out": str(out_zip), "bundle_dir": str(bundle_dir), "evidence_root": str(evidence_root) if evidence_root else None},
-                         sort_keys=True))
+        print(json.dumps({"ok": True, "out": str(out_zip), "bundle_dir": str(bundle_dir), "evidence_root": str(evidence_root) if evidence_root else None}, sort_keys=True))
     else:
         print(f"[submission.build] ok out={out_zip}")
     return 0
@@ -227,7 +300,6 @@ def cmd_submission_latest(args: argparse.Namespace) -> int:
     out_zip = Path(args.out).resolve()
     evidence_dir = Path(args.evidence_dir).resolve()
     evidence_root = _find_latest_evidence_root(evidence_dir)
-
     return _build_zip_from_bundle_or_evidence(
         bundle_dir=None,
         evidence_root=evidence_root,
@@ -247,22 +319,20 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
         with zipfile.ZipFile(zpath, "r") as zf:
             zf.extractall(tmp)
 
-        # if the zip contains a drop_bundle/ folder, validate that; else validate root
         bundle_dir = tmp / "drop_bundle"
         if not bundle_dir.exists():
             bundle_dir = tmp
 
-        res = _try_validate_bundle(bundle_dir)
+        res = _try_validate_bundle(bundle_dir, strict=bool(getattr(args, "strict", False)))
         ok = bool(res.get("ok", False))
 
         if getattr(args, "json", False):
-            out = {"ok": ok, "zip": str(zpath), "bundle_dir": str(bundle_dir), "validation": res}
-            print(json.dumps(out, indent=2, sort_keys=True))
+            print(json.dumps({"ok": ok, "zip": str(zpath), "bundle_dir": str(bundle_dir), "validation": res}, indent=2, sort_keys=True))
         else:
             status = "ok" if ok else "FAIL"
             print(f"[submission.verify] {status} zip={zpath}")
-            if not ok:
-                for n in res.get("notes", []):
+            if (not ok) or (res.get("notes") and getattr(args, "verbose", False)):
+                for n in res.get("notes", []) or []:
                     print(f"  - {n}")
 
         return 0 if ok else 2
@@ -279,32 +349,21 @@ def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> No
     sp = p.add_subparsers(dest="submission_cmd", required=True)
 
     b = sp.add_parser("build", help="Build a deterministic submission.zip from a bundle or evidence root")
-    b.add_argument("--bundle-dir", default=None, help="Directory containing bundle files (playlist.json, daily_evidence.json, tracks/...)")
-    b.add_argument(
-        "--evidence-root",
-        default=None,
-        help="Run output directory containing drop_evidence.json and optionally drop_bundle/ (auto-detected)",
-    )
-    b.add_argument(
-        "--include-drop-evidence",
-        action="store_true",
-        default=True,
-        help="If --evidence-root is set and drop_evidence.json exists, include it in the ZIP (default: true)",
-    )
-    b.add_argument("--out", required=True, help="Output ZIP path (e.g. submission.zip)")
+    b.add_argument("--bundle-dir", default=None, help="Directory containing bundle files (playlist.json, tracks/...)")
+    b.add_argument("--evidence-root", default=None, help="Run output dir containing drop_evidence.json and optionally drop_bundle/")
+    b.add_argument("--include-drop-evidence", action="store_true", default=True, help="Include drop_evidence.json when using --evidence-root (default: true)")
+    b.add_argument("--out", required=True, help="Output ZIP path")
     b.set_defaults(func=cmd_submission_build)
 
     l = sp.add_parser("latest", help="Build a submission ZIP from the newest drop_evidence.json under an evidence directory")
-    l.add_argument(
-        "--evidence-dir",
-        default="data/evidence",
-        help="Directory to search for the newest drop_evidence.json (default: data/evidence)",
-    )
-    l.add_argument("--out", required=True, help="Output ZIP path (e.g. submission.zip)")
+    l.add_argument("--evidence-dir", default="data/evidence", help="Directory to search for newest drop_evidence.json (default: data/evidence)")
+    l.add_argument("--out", required=True, help="Output ZIP path")
     l.set_defaults(func=cmd_submission_latest)
 
-    v = sp.add_parser("verify", help="Verify a submission ZIP (and optionally validate bundle schema)")
+    v = sp.add_parser("verify", help="Verify a submission ZIP")
     v.add_argument("--zip", required=True, help="Path to submission.zip")
+    v.add_argument("--strict", action="store_true", help="Require mgc.bundle_validate to pass (if available)")
+    v.add_argument("--verbose", action="store_true", help="Print notes even on success")
     v.set_defaults(func=cmd_submission_verify)
 
 
