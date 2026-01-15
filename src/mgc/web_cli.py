@@ -7,7 +7,6 @@ import os
 import shutil
 import sqlite3
 import sys
-from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,7 +52,6 @@ def _looks_like_audio_path(s: str) -> bool:
 
 
 def _prefer_mp3_path(p: Path) -> Path:
-    # If a WAV is referenced but an MP3 sibling exists, prefer it.
     if p.suffix.lower() == ".wav":
         mp3 = p.with_suffix(".mp3")
         if mp3.exists():
@@ -62,7 +60,6 @@ def _prefer_mp3_path(p: Path) -> Path:
 
 
 def _walk_collect_strings(obj: Any, out: List[str], limit: int = 20000) -> None:
-    """Collect all strings in a nested JSON-ish structure (best-effort)."""
     if len(out) >= limit:
         return
     if obj is None:
@@ -81,12 +78,6 @@ def _walk_collect_strings(obj: Any, out: List[str], limit: int = 20000) -> None:
 
 
 def _extract_track_paths(playlist_obj: Any) -> List[str]:
-    """
-    Extract audio file paths from many possible playlist shapes.
-    Strategy:
-      1) Check common keys first (tracks/items/playlist.items).
-      2) Fall back to recursive string scan for anything ending with audio ext.
-    """
     candidates: List[Any] = []
 
     if isinstance(playlist_obj, dict):
@@ -120,7 +111,6 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
                         add_path(it.get(k))
                         break
 
-    # fallback: recursive scan
     if not out:
         all_strs: List[str] = []
         _walk_collect_strings(playlist_obj, all_strs)
@@ -128,7 +118,6 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
             if _looks_like_audio_path(s):
                 out.append(s)
 
-    # De-dupe preserving order
     seen: set[str] = set()
     uniq: List[str] = []
     for p in out:
@@ -139,13 +128,6 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
 
 
 def _extract_track_ids(playlist_obj: Any) -> List[str]:
-    """
-    If playlist doesn't include file paths, it may include track IDs.
-    We look for:
-      - top-level "track_ids": [...]
-      - items containing {"track_id": "..."} or {"id": "..."}
-      - a recursive scan for UUID-like strings is intentionally NOT done (too risky).
-    """
     ids: List[str] = []
 
     def add_id(v: Any) -> None:
@@ -185,7 +167,6 @@ def _extract_track_ids(playlist_obj: Any) -> List[str]:
             elif isinstance(it, str) and not _looks_like_audio_path(it):
                 add_id(it)
 
-    # De-dupe preserving order
     seen: set[str] = set()
     uniq: List[str] = []
     for t in ids:
@@ -288,13 +269,6 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
 
 
 def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
-    """
-    Resolve a raw track reference into a filesystem Path.
-
-    Key behavior:
-    - Relative paths are resolved relative to the playlist file directory (NOT cwd).
-    - Absolute paths are used as-is.
-    """
     rp = Path(str(raw).strip())
     if rp.is_absolute():
         return rp.resolve()
@@ -302,20 +276,14 @@ def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
 
 
 def _display_path_strip(p: Path, *, base_dir: Path) -> str:
-    """
-    Make a stable, portable display path for JSON outputs that will be written to disk
-    (playlist.json, web_manifest.json), avoiding temp dirs/absolute paths when possible.
-    """
     try:
         rp = p.resolve()
     except Exception:
         rp = p
     try:
-        # If under base_dir, make it relative.
         rel = rp.relative_to(base_dir.resolve())
         return _as_posix(rel)
     except Exception:
-        # Otherwise, fall back to basename only (portable; avoids temp paths).
         return rp.name
 
 
@@ -384,26 +352,21 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
 
-    copied = 0
-    missing = 0
-    bundled: List[Dict[str, Any]] = []
-
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
 
-    # Determinism fix:
-    # If we're in deterministic mode, force strip_paths so files written to disk
-    # do NOT embed absolute temp paths (which differ between run1/run2 in CI).
     strip_paths_flag = bool(getattr(args, "strip_paths", False))
     strip_paths = strip_paths_flag or _env_truthy("MGC_DETERMINISTIC")
 
-    # For deterministic outputs written to disk, never embed absolute temp paths:
     playlist_display = (
         _display_path_strip(playlist_path, base_dir=playlist_dir) if strip_paths else str(playlist_path)
     )
 
+    copied = 0
+    missing = 0
+    bundled: List[Dict[str, Any]] = []
+
     for i, raw in enumerate(raw_paths):
         rp = _resolve_input_path(raw, playlist_dir=playlist_dir)
-
         if prefer_mp3:
             rp = _prefer_mp3_path(rp)
 
@@ -423,9 +386,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
         dest = tracks_dir / rp.name
         if dest.exists():
-            # Collision resolution is deterministic given:
-            # - clean output dir
-            # - stable raw_paths order
             stem = dest.stem
             suf = dest.suffix
             n = 1
@@ -479,7 +439,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
 
-    # Files written to disk must be stable across runs (esp. when built under temp dirs).
     web_playlist = {
         "version": 1,
         "source_playlist": playlist_display,
@@ -545,11 +504,13 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 """
     index_path.write_text(index_html, encoding="utf-8", newline="\n")
 
+    # IMPORTANT determinism rule:
+    # The manifest written to disk must NOT include run-specific absolute paths.
+    # So out_dir is always "." in the file, and playlist path is portable when strip_paths.
     manifest_obj: Dict[str, Any] = {
         "ok": True,
-        "playlist": playlist_display,
-        # For portability/determinism, never embed temp out_dir paths in files on disk.
-        "out_dir": ("." if strip_paths else str(out_dir)),
+        "playlist": playlist_display if strip_paths else _as_posix(Path("playlist.json")),
+        "out_dir": ".",  # <-- determinism fix (run1_web vs run2_web)
         "track_count": len(raw_paths),
         "copied_count": copied,
         "missing_count": missing,
@@ -563,7 +524,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     }
     _write_json(manifest_path, manifest_obj)
 
-    # CLI JSON output can remain absolute (debugging), but keep it stable JSON.
     out_obj: Dict[str, Any] = {
         "ok": True,
         "playlist": str(playlist_path),
@@ -620,16 +580,8 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     build.add_argument("--prefer-mp3", action="store_true", help="Prefer .mp3 when a .wav sibling exists")
     build.add_argument("--clean", action="store_true", help="Delete out-dir contents before writing")
     build.add_argument("--fail-if-empty", action="store_true", help="Exit nonzero if playlist has zero tracks")
-    build.add_argument(
-        "--fail-on-missing",
-        action="store_true",
-        help="Exit nonzero if any referenced track path cannot be found",
-    )
-    build.add_argument(
-        "--fail-if-none-copied",
-        action="store_true",
-        help="Exit nonzero if zero audio files were copied into the bundle",
-    )
+    build.add_argument("--fail-on-missing", action="store_true", help="Exit nonzero if any referenced track cannot be found")
+    build.add_argument("--fail-if-none-copied", action="store_true", help="Exit nonzero if zero audio files were copied")
     build.add_argument(
         "--require-bundled-tracks",
         dest="require_bundled_tracks",
