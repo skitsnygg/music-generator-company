@@ -15,7 +15,7 @@ Other commands:
 - status: quick health + recent activity summary
 - playlists: list, history, reveal, export
 - tracks: list, show, stats
-- marketing: posts list
+- marketing: posts list + receipts list (file-based publish audit trail)
 - analytics: delegated to mgc.analytics_cli if available
 - run: autonomous pipeline entrypoint (daily/weekly)
 - web: static web player build/serve
@@ -31,6 +31,7 @@ Logging:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 from mgc.submission_cli import register_submission_subcommand
 
@@ -98,6 +99,37 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    """
+    Read a JSONL file safely. Skips blank lines.
+    Returns dict objects; non-dict JSON lines are wrapped as {"value": ...}.
+    """
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    yield obj
+                else:
+                    yield {"value": obj}
+            except Exception:
+                # Keep it resilient: surface raw line
+                yield {"raw": s}
+
+
 # ----------------------------
 # argv preprocessing (make global flags work anywhere)
 # ----------------------------
@@ -138,13 +170,13 @@ def _hoist_global_flags(argv: list[str]) -> list[str]:
         "--repo-root",
         "--log-level",
         "--log-file",
-        "--seed",  # <-- add
+        "--seed",
     }
 
     flags_no_value = {
         "--log-console",
         "--json",
-        "--no-resume",  # <-- add
+        "--no-resume",
     }
 
     hoisted: list[str] = []
@@ -187,6 +219,7 @@ def _hoist_global_flags(argv: list[str]) -> list[str]:
         i += 1
 
     return hoisted + rest
+
 
 # ----------------------------
 # logging (deterministic, no duplicates)
@@ -781,6 +814,53 @@ def cmd_marketing_posts_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_marketing_receipts_list(args: argparse.Namespace) -> int:
+    """
+    List publish receipts from a JSONL file written by the publish step.
+
+    This is intentionally file-based (not DB-based) so it stays:
+      - portable
+      - deterministic-friendly
+      - easy to audit
+    """
+    log = logging.getLogger("mgc.marketing.receipts.list")
+    path = Path(args.path)
+
+    if not path.exists():
+        if args.json:
+            print(json.dumps({"path": str(path), "exists": False, "receipts": []}, indent=2, ensure_ascii=False, sort_keys=True))
+        else:
+            log.info("receipts file missing: %s", path)
+        return 0
+
+    rows = list(_iter_jsonl(path))
+    # newest last (append-only), so take from the end
+    lim = int(args.limit)
+    picked = rows[-lim:] if lim > 0 else rows
+
+    if args.json:
+        out = {
+            "path": str(path),
+            "exists": True,
+            "sha256": _sha256_file(path),
+            "count": len(rows),
+            "shown": len(picked),
+            "receipts": picked,
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    print(f"receipts: {path}  (count={len(rows)} sha256={_sha256_file(path)})")
+    for r in picked:
+        platform = r.get("platform") or r.get("channel") or ""
+        post_id = r.get("post_id") or r.get("id") or ""
+        status = r.get("status") or ""
+        ts = r.get("published_ts") or r.get("ts") or ""
+        drop_id = r.get("drop_id") or ""
+        print(f"  {ts}  {platform}  {status}  post_id={post_id}  drop_id={drop_id}".rstrip())
+    return 0
+
+
 # ----------------------------
 # status command
 # ----------------------------
@@ -862,6 +942,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     out["paths"]["tracks_export"] = _path_info(DEFAULT_TRACKS_EXPORT)
     out["paths"]["evidence_dir"] = _path_info(Path("data/evidence"))
 
+    # File-based publish receipts (default location used by run_cli)
+    out["paths"]["marketing_receipts"] = _path_info(Path("artifacts/run/marketing/receipts.jsonl"))
+
     if not db_path.exists():
         out["notes"].append("db_missing")
         if args.json:
@@ -940,7 +1023,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"    {t}: {'present' if exists else 'missing'}  count={cnt_s}")
 
     print("  paths:")
-    for key in ("playlists_dir", "tracks_dir", "tracks_export", "evidence_dir"):
+    for key in ("playlists_dir", "tracks_dir", "tracks_export", "evidence_dir", "marketing_receipts"):
         p = out["paths"].get(key, {})
         status = "OK" if p.get("exists") else "MISSING"
         extra = ""
@@ -1163,8 +1246,6 @@ def cmd_rebuild_verify_tracks(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
             else:
-                # FIX: do not emit JSON in human mode
-                # (and keep stdout human-friendly)
                 print("tracks table missing")
             return 0
 
@@ -1315,6 +1396,15 @@ def build_parser() -> argparse.ArgumentParser:
     mpl.add_argument("--limit", type=int, default=20)
     mpl.set_defaults(func=cmd_marketing_posts_list)
 
+    # NEW: receipts (file-based)
+    mreceipts = ms.add_parser("receipts", help="Publish receipts (file-based audit trail)")
+    mrs = mreceipts.add_subparsers(dest="receipts_cmd", required=True)
+
+    mrl = mrs.add_parser("list", help="List receipts from a JSONL file")
+    mrl.add_argument("--path", default="artifacts/run/marketing/receipts.jsonl", help="Path to receipts.jsonl")
+    mrl.add_argument("--limit", type=int, default=20, help="Number of receipts to show (newest last)")
+    mrl.set_defaults(func=cmd_marketing_receipts_list)
+
     try:
         from mgc.drops_cli import register_drops_subcommand  # type: ignore
     except Exception:
@@ -1372,6 +1462,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     return p
 
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
 
@@ -1381,7 +1472,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(cooked)
 
     # Surface CI compatibility flags to env for downstream code.
-    # (Even if unused today, this avoids future plumbing work.)
     if getattr(args, "seed", None) is not None:
         os.environ["MGC_SEED"] = str(args.seed)
     if getattr(args, "no_resume", False):

@@ -26,6 +26,16 @@ Determinism contract:
 - In deterministic mode (CI), bundles + submission.zip must be byte-for-byte stable across runs,
   even when out_dir differs (e.g. /tmp/run1 vs /tmp/run2).
 - Therefore the BUNDLED JSON must not contain absolute paths like out_dir/evidence_dir/tracks_dir.
+
+NEW:
+- `mgc run weekly`:
+    Runs the same pipeline (daily -> publish-marketing -> drop) but produces a drop bundle whose
+    IDs + metadata are keyed by ISO week period, so weekly drops are distinct from daily drops.
+
+Publish receipts (NEW):
+- publish-marketing writes an append-only JSONL file:
+    out_dir/marketing/receipts.jsonl
+  and includes its sha256 in publish_marketing_evidence.json.
 """
 
 from __future__ import annotations
@@ -41,7 +51,7 @@ import sqlite3
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -96,6 +106,17 @@ def _as_rel_posix(path_like: str) -> str:
     return s
 
 
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    """
+    Append one JSON object as a single line to a JSONL file.
+    Uses sorted keys for stable field ordering (helpful for diffs).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 # -----------------------------------------------------------------------------
 # Determinism helpers
 # -----------------------------------------------------------------------------
@@ -124,6 +145,18 @@ def _deterministic_now_utc() -> datetime:
         s = fixed.replace("Z", "+00:00")
         return datetime.fromisoformat(s).astimezone(timezone.utc)
     return datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _iso_week_period(d: date) -> Tuple[date, date, str]:
+    """
+    Return (monday, sunday, label) for ISO week period containing date d.
+    Label format: YYYY-Www (ISO week year + week number).
+    """
+    monday = d - timedelta(days=d.weekday())  # Monday=0
+    sunday = monday + timedelta(days=6)
+    iso_year, iso_week, _ = d.isocalendar()
+    label = f"{iso_year}-W{iso_week:02d}"
+    return monday, sunday, label
 
 
 # -----------------------------------------------------------------------------
@@ -408,9 +441,58 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
+    """
+    Stub publisher:
+    - writes publish_marketing_evidence.json
+    - appends one receipt record to out_dir/marketing/receipts.jsonl
+
+    Determinism contract:
+    - In deterministic mode, evidence MUST NOT embed absolute out_dir paths
+      (because /tmp/run1 vs /tmp/run2 would differ).
+    """
     ctx = _build_run_context(args)
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
     run_id = stable_uuid(ns, f"run:publish_marketing:{ctx.now.isoformat()}", ctx.deterministic)
+
+    marketing_dir = ctx.out_dir / "marketing"
+    receipts_path = marketing_dir / "receipts.jsonl"
+
+    # Stable, portable path used inside receipts + publish evidence
+    receipts_rel = "marketing/receipts.jsonl"
+
+    # Deterministic post id for the stub “publish”
+    post_id = stable_uuid(ns, f"marketing_post:stub:{ctx.now.isoformat()}", ctx.deterministic)
+
+    receipt = {
+        "schema": "mgc.marketing_receipt.v1",
+        "version": 1,
+        "run_id": str(run_id),
+        "deterministic": ctx.deterministic,
+        "ts": ctx.now.isoformat(),
+        "platform": "stub",
+        "status": "published",
+        "post_id": str(post_id),
+        # Portable: never absolute
+        "artifact": {
+            "kind": "marketing_receipt",
+            "path": receipts_rel,
+        },
+    }
+
+    _append_jsonl(receipts_path, receipt)
+    receipts_sha = _sha256_file(receipts_path)
+
+    receipts_obj: Dict[str, Any] = {
+        # Portable + deterministic
+        "path": receipts_rel,
+        "sha256": receipts_sha,
+        "appended": 1,
+        "last_post_id": str(post_id),
+    }
+
+    # Optional debug info for humans; keep it out of deterministic runs
+    if not ctx.deterministic:
+        receipts_obj["abs_path"] = str(receipts_path)
 
     ev = {
         "run_id": str(run_id),
@@ -418,33 +500,58 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "deterministic": ctx.deterministic,
         "ts": ctx.now.isoformat(),
         "note": "stub",
+        "receipts": receipts_obj,
     }
+
     ev_path = ctx.evidence_dir / "publish_marketing_evidence.json"
     _json_dump(ev, ev_path)
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "run_id": str(run_id), "evidence": str(ev_path)}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "run_id": str(run_id),
+                    "evidence": str(ev_path),
+                    "receipts_path": str(receipts_path),
+                    "receipts_sha256": receipts_sha,
+                    "post_id": str(post_id),
+                }
+            )
+        )
     else:
         print(f"[run.publish-marketing] ok run_id={run_id}")
     return 0
 
 
-def cmd_run_drop(args: argparse.Namespace) -> int:
+def _write_drop_bundle(
+    *,
+    ctx: RunContext,
+    context: str,
+    schedule: str,
+) -> Tuple[uuid.UUID, Path]:
     """
-    Create a portable bundle that `mgc submission build --bundle-dir <dir>` can package.
+    Create a portable bundle (drop_bundle/) that `mgc submission build --bundle-dir <dir>` can package.
+    Returns (drop_id, evidence_path).
     """
-    ctx = _build_run_context(args)
-    context = getattr(args, "context", "focus")
-
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
-    # Stable ids (deterministic mode => uuid5; non-deterministic => uuid4)
-    drop_id = stable_uuid(ns, f"drop:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
-    run_id = stable_uuid(ns, f"run:daily:{ctx.now.isoformat()}:{context}", ctx.deterministic)
-    track_id = stable_uuid(ns, f"track:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
-    playlist_id = stable_uuid(ns, f"playlist:{ctx.now.date().isoformat()}:{context}", ctx.deterministic)
+    if schedule == "weekly":
+        period_start, period_end, period_label = _iso_week_period(ctx.now.date())
+        period_key = period_label
+    else:
+        period_start = ctx.now.date()
+        period_end = ctx.now.date()
+        period_label = ctx.now.date().isoformat()
+        period_key = ctx.now.date().isoformat()
 
-    # Ensure a deterministic track exists
+    # Stable ids: include schedule + period_key so weekly drops are distinct from daily drops.
+    drop_id = stable_uuid(ns, f"drop:{schedule}:{period_key}:{context}", ctx.deterministic)
+    run_id = stable_uuid(ns, f"run:{schedule}:{ctx.now.isoformat()}:{context}", ctx.deterministic)
+    track_id = stable_uuid(ns, f"track:{schedule}:{period_key}:{context}", ctx.deterministic)
+    playlist_id = stable_uuid(ns, f"playlist:{schedule}:{period_key}:{context}", ctx.deterministic)
+
+    # Ensure a deterministic track exists (source is out_dir/tracks/)
     wav_src = ctx.out_dir / "tracks" / f"{track_id}.wav"
     if not wav_src.exists():
         _ensure_dir(wav_src.parent)
@@ -461,13 +568,20 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     rel_track_path = _as_rel_posix(f"tracks/{wav_dst.name}")
     bundle_track_sha = _sha256_file(wav_dst)
 
-    # Write playlist.json (portable). Then force stable ts by rewriting (belt+suspenders).
+    # Playlist (portable)
     playlist_path = bundle_dir / "playlist.json"
     playlist = {
         "schema": "mgc.playlist.v1",
         "version": 1,
         "playlist_id": str(playlist_id),
         "context": context,
+        "schedule": schedule,
+        "period": {
+            "key": period_key,
+            "label": period_label,
+            "start_date": period_start.isoformat(),
+            "end_date": period_end.isoformat(),
+        },
         "ts": ctx.now.isoformat(),
         "tracks": [
             {
@@ -483,14 +597,13 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     }
     _json_dump(playlist, playlist_path)
 
-    # Force stable ts (in case other code paths ever modify ctx.now formatting)
+    # Force stable ts formatting (belt+suspenders)
     try:
         pl = _read_json(playlist_path)
         if isinstance(pl, dict):
             pl["ts"] = ctx.now.isoformat()
             _json_dump(pl, playlist_path)
     except Exception:
-        # If anything goes wrong reading/writing, keep the already-written file.
         pass
 
     playlist_sha = _sha256_file(playlist_path)
@@ -502,7 +615,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     def _write_bundle_daily_evidence(base_obj: Dict[str, Any]) -> None:
         norm = _normalize_daily_evidence(base_obj, out_dir=ctx.out_dir, evidence_dir=ctx.evidence_dir)
 
-        # Force stable fields in the bundled artifact
         norm["schema"] = "mgc.daily_evidence.v1"
         norm["version"] = int(norm.get("version") or 1)
         norm["stage"] = "daily"
@@ -510,24 +622,27 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         norm["deterministic"] = ctx.deterministic
         norm["run_id"] = str(run_id)
         norm["ts"] = ctx.now.isoformat()
+        norm["schedule"] = schedule
+        norm["period"] = {
+            "key": period_key,
+            "label": period_label,
+            "start_date": period_start.isoformat(),
+            "end_date": period_end.isoformat(),
+        }
 
-        # Track object must be portable
         norm["track"] = {
             "track_id": str(track_id),
             "path": rel_track_path,
         }
 
-        # Paths MUST be portable-only (no absolute dirs)
+        # PORTABLE ONLY (no absolute /tmp paths)
         norm["paths"] = {
-            # Validator-required keys:
             "playlist": "playlist.json",
             "track": rel_track_path,
-            # Back-compat keys:
             "bundle_playlist": "playlist.json",
             "bundle_track": rel_track_path,
         }
 
-        # Sha256 MUST include validator-required keys
         norm["sha256"] = {
             "track": bundle_track_sha,
             "playlist": playlist_sha,
@@ -551,12 +666,25 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         "MGC Drop Bundle (portable)\n"
         f"drop_id: {drop_id}\n"
         f"ts: {ctx.now.isoformat()}\n"
-        f"context: {context}\n",
+        f"context: {context}\n"
+        f"schedule: {schedule}\n"
+        f"period: {period_label} ({period_start.isoformat()}..{period_end.isoformat()})\n",
         encoding="utf-8",
     )
 
     root_ev = {
-        "drop": {"id": str(drop_id), "ts": ctx.now.isoformat(), "context": context},
+        "drop": {
+            "id": str(drop_id),
+            "ts": ctx.now.isoformat(),
+            "context": context,
+            "schedule": schedule,
+            "period": {
+                "key": period_key,
+                "label": period_label,
+                "start_date": period_start.isoformat(),
+                "end_date": period_end.isoformat(),
+            },
+        },
         "deterministic": ctx.deterministic,
         "paths": {
             "out_dir": str(ctx.out_dir),
@@ -567,15 +695,73 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         },
     }
     ev_path = _write_drop_evidence_root(ctx, root_ev)
+    return drop_id, ev_path
+
+
+def cmd_run_drop(args: argparse.Namespace) -> int:
+    """
+    Create a daily drop bundle.
+    """
+    ctx = _build_run_context(args)
+    context = getattr(args, "context", "focus")
+
+    drop_id, ev_path = _write_drop_bundle(ctx=ctx, context=context, schedule="daily")
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "drop_id": str(drop_id), "drop_evidence": str(ev_path), "bundle_dir": str(bundle_dir)}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "drop_id": str(drop_id),
+                    "drop_evidence": str(ev_path),
+                    "bundle_dir": str(ctx.out_dir / "drop_bundle"),
+                }
+            )
+        )
     else:
         print(f"[run.drop] ok drop_id={drop_id} evidence={ev_path}")
     return 0
 
 
+def cmd_run_weekly(args: argparse.Namespace) -> int:
+    """
+    Weekly pipeline: daily -> publish-marketing -> weekly drop bundle.
+    Uses the same artifacts but keys the drop by ISO week period.
+    """
+    rc = cmd_run_daily(args)
+    if rc != 0:
+        return rc
+
+    rc = cmd_publish_marketing(args)
+    if rc != 0:
+        return rc
+
+    ctx = _build_run_context(args)
+    context = getattr(args, "context", "focus")
+
+    drop_id, ev_path = _write_drop_bundle(ctx=ctx, context=context, schedule="weekly")
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "schedule": "weekly",
+                    "drop_id": str(drop_id),
+                    "drop_evidence": str(ev_path),
+                    "bundle_dir": str(ctx.out_dir / "drop_bundle"),
+                }
+            )
+        )
+    else:
+        print(f"[run.weekly] ok drop_id={drop_id} evidence={ev_path}")
+    return 0
+
+
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
+    """
+    Daily pipeline: daily -> publish-marketing -> drop (daily bundle).
+    """
     rc = cmd_run_daily(args)
     if rc != 0:
         return rc
@@ -615,7 +801,6 @@ def cmd_run_stage(args: argparse.Namespace) -> int:
         )
         con.commit()
 
-        # In deterministic mode, keep finished_ts stable too.
         finished = (_deterministic_now_utc() if ctx.deterministic else datetime.now(timezone.utc)).isoformat()
         con.execute(
             "UPDATE run_stages SET finished_ts=?, ok=?, meta_json=? WHERE id=?",
@@ -639,7 +824,16 @@ def cmd_run_manifest(args: argparse.Namespace) -> int:
     _json_dump(manifest, out_path)
 
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "out": str(out_path), "root_sha256": manifest["root_sha256"], "file_count": manifest["file_count"]}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "out": str(out_path),
+                    "root_sha256": manifest["root_sha256"],
+                    "file_count": manifest["file_count"],
+                }
+            )
+        )
     else:
         print(f"[run.manifest] ok out={out_path} root_sha256={manifest['root_sha256']} files={manifest['file_count']}")
     return 0
@@ -697,6 +891,8 @@ def cmd_run_dispatch(args: argparse.Namespace) -> int:
     cmd = getattr(args, "run_cmd", None)
     if cmd == "daily":
         return cmd_run_daily(args)
+    if cmd == "weekly":
+        return cmd_run_weekly(args)
     if cmd == "autonomous":
         return cmd_run_autonomous(args)
     if cmd == "publish-marketing":
@@ -723,7 +919,7 @@ def cmd_run_dispatch(args: argparse.Namespace) -> int:
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p_run = subparsers.add_parser(
         "run",
-        help="Run pipeline steps (daily, autonomous, publish-marketing, drop, stage, manifest, diff, status)",
+        help="Run pipeline steps (daily, weekly, autonomous, publish-marketing, drop, stage, manifest, diff, status)",
     )
 
     # Provide a handler at the run level too (some mgc.main variants dispatch here).
@@ -744,6 +940,10 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     add_common(p)
     p.set_defaults(fn=cmd_run_daily, func=cmd_run_daily)
 
+    p = run_sub.add_parser("weekly", help="Run the weekly pipeline (daily -> publish-marketing -> weekly drop bundle)")
+    add_common(p)
+    p.set_defaults(fn=cmd_run_weekly, func=cmd_run_weekly)
+
     p = run_sub.add_parser("autonomous", help="Run autonomous pipeline stages (daily -> publish-marketing -> drop)")
     add_common(p)
     p.set_defaults(fn=cmd_run_autonomous, func=cmd_run_autonomous)
@@ -752,7 +952,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     add_common(p)
     p.set_defaults(fn=cmd_publish_marketing, func=cmd_publish_marketing)
 
-    p = run_sub.add_parser("drop", help="Create a minimal drop bundle from the latest artifacts")
+    p = run_sub.add_parser("drop", help="Create a daily drop bundle from the latest artifacts")
     add_common(p)
     p.set_defaults(fn=cmd_run_drop, func=cmd_run_drop)
 
