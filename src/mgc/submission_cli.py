@@ -7,21 +7,21 @@ Submission packaging CLI.
 Goals:
 - Deterministic ZIP outputs (stable file ordering + fixed timestamps).
 - Flexible inputs:
-  - --bundle-dir <dir>            (points at a bundle directory)
-  - --evidence-root <dir>         (points at a run output dir; auto-detects drop_bundle/ and drop_evidence.json)
+  - --bundle-dir <dir>
+  - --evidence-root <dir> (auto-detects drop_bundle/ and drop_evidence.json)
   - latest: auto-find newest evidence root under an evidence directory
 
 Commands:
   mgc submission build   --bundle-dir <dir> --out submission.zip
   mgc submission build   --evidence-root <run_out_dir> --out submission.zip
   mgc submission latest  [--evidence-dir <dir>] --out submission.zip
-  mgc submission verify  --zip submission.zip [--strict]
+  mgc submission verify  --zip submission.zip [--strict] [--verbose]
 
-Notes:
-- If mgc.bundle_validate.validate_bundle is available, `submission verify` will *attempt* to use it.
-- By default verification is permissive: it ensures the ZIP contains the core portable artifacts
-  (tracks + playlist + some evidence JSON). This is the "submission.zip is usable" bar.
-- Use `--strict` to require the bundle validator to pass, if/when your bundle schema is stricter.
+Verification:
+- Default is permissive: ensure the ZIP contains core portable artifacts (tracks + playlist + evidence JSON).
+- `--strict` requires mgc.bundle_validate.validate_bundle() to pass (if available).
+- The verifier auto-detects the bundle root even if the ZIP contains a top-level wrapper dir
+  (common for submissions that include a folder like submission/ or drop_bundle/).
 """
 
 from __future__ import annotations
@@ -55,16 +55,14 @@ def _zip_write_file(zf: zipfile.ZipFile, *, arcname: str, src_path: Path) -> Non
     info = zipfile.ZipInfo(filename=arcname, date_time=_FIXED_ZIP_DT)
     info.compress_type = zipfile.ZIP_DEFLATED
     with src_path.open("rb") as f:
-        data = f.read()
-    zf.writestr(info, data)
+        zf.writestr(info, f.read())
 
 
 def _make_zip_deterministic(src_dir: Path, out_zip: Path) -> None:
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_zip, "w") as zf:
         for p in _stable_sorted_files(src_dir):
-            arc = p.relative_to(src_dir).as_posix()
-            _zip_write_file(zf, arcname=arc, src_path=p)
+            _zip_write_file(zf, arcname=p.relative_to(src_dir).as_posix(), src_path=p)
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +122,90 @@ def _find_latest_evidence_root(evidence_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validation helpers
 # ---------------------------------------------------------------------------
+
+_MARKER_FILES = (
+    "playlist.json",
+    "daily_evidence.json",
+    "drop_evidence.json",
+    "manifest.json",
+    "weekly_manifest.json",
+)
+_MARKER_DIRS = (
+    "tracks",
+    "playlists",
+    "data",  # might contain data/tracks
+    "drop_bundle",
+)
+
+
+def _looks_like_bundle_root(p: Path) -> bool:
+    if not p.exists() or not p.is_dir():
+        return False
+    # Any evidence file or playlist file
+    if any((p / f).exists() for f in _MARKER_FILES):
+        return True
+    # Any obvious dirs
+    if (p / "tracks").exists() or (p / "playlists").exists():
+        return True
+    if (p / "data" / "tracks").exists():
+        return True
+    return False
+
+
+def _auto_locate_bundle_root(extract_root: Path) -> Path:
+    """
+    Find the most plausible bundle root inside an extracted ZIP.
+
+    Priority:
+      1) extract_root/drop_bundle (if it looks like a bundle root)
+      2) extract_root (if it looks like a bundle root)
+      3) if there's exactly one top-level directory, descend (up to depth 4)
+    """
+    extract_root = extract_root.resolve()
+
+    # 1) drop_bundle
+    cand = extract_root / "drop_bundle"
+    if _looks_like_bundle_root(cand):
+        return cand
+
+    # 2) root
+    if _looks_like_bundle_root(extract_root):
+        return extract_root
+
+    # 3) single-wrapper directory descent
+    cur = extract_root
+    for _ in range(4):
+        children = [c for c in cur.iterdir() if c.is_dir()]
+        files = [c for c in cur.iterdir() if c.is_file()]
+        # if there are multiple dirs, try to pick drop_bundle or something that looks right
+        if len(children) > 1:
+            for name in ("drop_bundle", "bundle", "submission", "out", "evidence"):
+                for c in children:
+                    if c.name == name and _looks_like_bundle_root(c):
+                        return c
+            # fallback: first child that looks like a root
+            for c in children:
+                if _looks_like_bundle_root(c):
+                    return c
+            break
+
+        # if exactly one dir and no meaningful files, descend
+        if len(children) == 1 and len(files) == 0:
+            cur = children[0]
+            if _looks_like_bundle_root(cur):
+                return cur
+            continue
+
+        # If there are files but still not detected, try any child that looks like root
+        for c in children:
+            if _looks_like_bundle_root(c):
+                return c
+        break
+
+    return extract_root  # last resort
+
 
 def _extract_notes_from_validator_dict(d: Dict[str, Any]) -> List[str]:
     notes: List[str] = []
@@ -141,7 +221,6 @@ def _extract_notes_from_validator_dict(d: Dict[str, Any]) -> List[str]:
             for item in v:
                 notes.append(f"{key}:{item}")
         elif isinstance(v, dict):
-            # summarize shallowly to avoid huge dumps
             for k2, v2 in v.items():
                 notes.append(f"{key}.{k2}:{v2}")
         else:
@@ -150,9 +229,6 @@ def _extract_notes_from_validator_dict(d: Dict[str, Any]) -> List[str]:
 
 
 def _minimal_validate(bundle_dir: Path) -> Dict[str, Any]:
-    """
-    Permissive "is this zip usable?" checks.
-    """
     notes: List[str] = []
     ok = True
 
@@ -171,10 +247,7 @@ def _minimal_validate(bundle_dir: Path) -> Dict[str, Any]:
         ok = False
         notes.append("missing:playlist (playlist.json or playlists/*.json)")
 
-    evidence_ok = any(
-        (bundle_dir / name).exists()
-        for name in ("daily_evidence.json", "drop_evidence.json", "manifest.json", "weekly_manifest.json")
-    )
+    evidence_ok = any((bundle_dir / name).exists() for name in _MARKER_FILES[1:])  # any evidence file
     if not evidence_ok:
         ok = False
         notes.append("missing:evidence_json (daily_evidence.json/drop_evidence.json/manifest.json)")
@@ -183,10 +256,6 @@ def _minimal_validate(bundle_dir: Path) -> Dict[str, Any]:
 
 
 def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
-    """
-    Try mgc.bundle_validate.validate_bundle if available.
-    If it fails without diagnostics, fall back to minimal validation unless --strict.
-    """
     minimal = _minimal_validate(bundle_dir)
 
     try:
@@ -197,7 +266,6 @@ def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
             v_ok = bool(res.get("ok", False))
             v_notes = _extract_notes_from_validator_dict(res)
 
-            # If validator provides no actionable diagnostics, treat it as a soft signal unless strict.
             if (not v_ok) and (len(v_notes) == 0) and bool(minimal.get("ok", False)) and (not strict):
                 return {
                     "ok": True,
@@ -206,7 +274,6 @@ def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
                     "details": res,
                 }
 
-            # Merge notes
             merged: List[str] = []
             for n in (minimal.get("notes", []) or []) + v_notes:
                 if n and n not in merged:
@@ -215,7 +282,6 @@ def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
             if strict:
                 return {"ok": v_ok, "validator": "mgc.bundle_validate", "notes": merged, "details": res}
 
-            # permissive mode: require minimal OK, and treat validator failure as warning unless it includes notes
             if v_ok:
                 return {"ok": True, "validator": "mgc.bundle_validate", "notes": merged, "details": res}
 
@@ -223,21 +289,17 @@ def _try_validate_bundle(bundle_dir: Path, *, strict: bool) -> Dict[str, Any]:
                 warn = ["bundle_validate failed; passing minimal checks"] + merged
                 return {"ok": True, "validator": "minimal+warning", "notes": warn, "details": res}
 
-            # minimal already failed -> fail
             return {"ok": False, "validator": "minimal+bundle_validate", "notes": merged, "details": res}
 
-        # Non-dict result (bool / truthy)
         v_ok = bool(res)
         if strict:
             return {"ok": v_ok, "validator": "mgc.bundle_validate", "notes": minimal.get("notes", [])}
         if v_ok:
             return {"ok": True, "validator": "mgc.bundle_validate", "notes": minimal.get("notes", [])}
-        # permissive: allow if minimal passes
         if bool(minimal.get("ok", False)):
             return {"ok": True, "validator": "minimal (bundle_validate falsey)", "notes": ["bundle_validate returned falsey; passing minimal checks"]}
         return {"ok": False, "validator": "minimal+bundle_validate", "notes": minimal.get("notes", [])}
     except Exception as e:
-        # Validator missing/errored -> use minimal
         out = dict(minimal)
         out["notes"] = (out.get("notes", []) or []) + [f"validator_unavailable:{type(e).__name__}"]
         return out
@@ -319,10 +381,7 @@ def cmd_submission_verify(args: argparse.Namespace) -> int:
         with zipfile.ZipFile(zpath, "r") as zf:
             zf.extractall(tmp)
 
-        bundle_dir = tmp / "drop_bundle"
-        if not bundle_dir.exists():
-            bundle_dir = tmp
-
+        bundle_dir = _auto_locate_bundle_root(tmp)
         res = _try_validate_bundle(bundle_dir, strict=bool(getattr(args, "strict", False)))
         ok = bool(res.get("ok", False))
 
