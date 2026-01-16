@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -176,9 +178,21 @@ def _extract_track_ids(playlist_obj: Any) -> List[str]:
     return uniq
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
 def _db_connect(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA foreign_keys = ON;")
+    except Exception:
+        pass
     return con
 
 
@@ -191,6 +205,49 @@ def _table_exists(con: sqlite3.Connection, name: str) -> bool:
         return row is not None
     except Exception:
         return False
+
+
+def _billing_require_pro(con: sqlite3.Connection, token: str) -> Dict[str, Any]:
+    # Validate token and require an active entitlement with tier 'pro'.
+    for t in ("billing_users", "billing_tokens", "billing_entitlements"):
+        if not _table_exists(con, t):
+            raise ValueError(f"billing tables missing ({t}). Did you run migrations?")
+
+    token_sha = _sha256_hex(token)
+
+    tok = con.execute(
+        "SELECT token_sha256, user_id, created_ts, label FROM billing_tokens WHERE token_sha256 = ? LIMIT 1",
+        (token_sha,),
+    ).fetchone()
+    if tok is None:
+        raise ValueError("invalid_token")
+
+    user_id = str(tok["user_id"])
+    now_ts = _utc_now_iso()
+
+    ent = con.execute(
+        """
+        SELECT entitlement_id, user_id, tier, starts_ts, ends_ts, source, meta_json
+        FROM billing_entitlements
+        WHERE user_id = ?
+          AND starts_ts <= ?
+          AND (ends_ts IS NULL OR ends_ts > ?)
+        ORDER BY starts_ts DESC
+        LIMIT 1
+        """,
+        (user_id, now_ts, now_ts),
+    ).fetchone()
+
+    tier = str(ent["tier"]) if ent is not None else "free"
+    if tier != "pro":
+        raise ValueError(f"insufficient_tier:{tier}")
+
+    return {
+        "user_id": user_id,
+        "tier": tier,
+        "token_sha256": token_sha,
+        "entitlement_id": (str(ent["entitlement_id"]) if ent is not None else None),
+    }
 
 
 def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[List[str], Dict[str, Any]]:
@@ -313,6 +370,36 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional billing gate (only if --token is provided)
+    billing_ctx: Optional[Dict[str, Any]] = None
+    token = str(getattr(args, "token", "") or "").strip()
+    if token:
+        billing_db_raw = getattr(args, "billing_db", None) or getattr(args, "db", "")
+        billing_db = Path(str(billing_db_raw)).expanduser().resolve()
+        if not billing_db.exists():
+            out = {"ok": False, "reason": "billing_db_not_found", "billing_db": str(billing_db)}
+            sys.stdout.write(_stable_json_dumps(out) + "\n")
+            return 2
+
+        con = _db_connect(billing_db)
+        try:
+            billing_ctx = _billing_require_pro(con, token)
+        except ValueError as e:
+            out = {
+                "ok": False,
+                "reason": "billing_denied",
+                "detail": str(e),
+                "token_sha256": _sha256_hex(token),
+                "billing_db": str(billing_db),
+            }
+            sys.stdout.write(_stable_json_dumps(out) + "\n")
+            return 2
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
 
     playlist_obj = _read_json(playlist_path)
 
@@ -521,6 +608,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "items": bundled,
         "db_resolution": db_resolution,
         "strip_paths": strip_paths,
+        "billing": billing_ctx,
     }
     _write_json(manifest_path, manifest_obj)
 
@@ -537,6 +625,8 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     }
     if db_resolution is not None:
         out_obj["db_resolution"] = db_resolution
+    if billing_ctx is not None:
+        out_obj["billing"] = billing_ctx
 
     sys.stdout.write(_stable_json_dumps(out_obj) + "\n")
     return 0
@@ -548,12 +638,34 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         _eprint(f"[mgc.web] ERROR: directory not found: {directory}")
         return 2
 
+    # Optional billing gate (only if --token is provided)
+    token = str(getattr(args, "token", "") or "").strip()
+    if token:
+        billing_db_raw = getattr(args, "billing_db", None) or getattr(args, "db", "")
+        billing_db = Path(str(billing_db_raw)).expanduser().resolve()
+        if not billing_db.exists():
+            _eprint(f"[mgc.web] ERROR: billing DB not found: {billing_db}")
+            return 2
+        con = _db_connect(billing_db)
+        try:
+            _billing_require_pro(con, token)
+        except ValueError as e:
+            _eprint(f"[mgc.web] DENY billing: {e}")
+            return 2
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *a: Any, **kw: Any):
             super().__init__(*a, directory=str(directory), **kw)
+
+    ThreadingHTTPServer.allow_reuse_address = True
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     _eprint(f"[mgc.web] serving {directory} on http://{host}:{port}/")
@@ -577,6 +689,13 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     build.add_argument("--playlist", required=True, help="Playlist JSON path")
     build.add_argument("--out-dir", required=True, help="Output directory for the web bundle")
     build.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (used only if playlist contains IDs)")
+    build.add_argument("--token", default=None, help="Billing access token (requires pro)")
+    build.add_argument(
+        "--billing-db",
+        dest="billing_db",
+        default=None,
+        help="DB path for billing/token validation (optional). If omitted, uses --db.",
+    )
     build.add_argument("--prefer-mp3", action="store_true", help="Prefer .mp3 when a .wav sibling exists")
     build.add_argument("--clean", action="store_true", help="Delete out-dir contents before writing")
     build.add_argument("--fail-if-empty", action="store_true", help="Exit nonzero if playlist has zero tracks")
@@ -598,6 +717,14 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
 
     serve = ws.add_parser("serve", help="Serve a built web bundle")
     serve.add_argument("--dir", required=True, help="Directory to serve (output of web build)")
+    serve.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (required only if --token is used)")
+    serve.add_argument("--token", default=None, help="Billing access token (requires pro)")
+    serve.add_argument(
+        "--billing-db",
+        dest="billing_db",
+        default=None,
+        help="DB path for billing/token validation (optional). If omitted, uses --db.",
+    )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.set_defaults(func=cmd_web_serve)
