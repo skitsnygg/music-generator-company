@@ -4,12 +4,15 @@ src/mgc/billing_cli.py
 
 Billing (v0): users, API tokens, entitlements.
 
-Key CLI behavior:
-- Billing commands accept --billing-db (optional).
-- If omitted, billing uses the global mgc.main --db (args.db).
-- This avoids argparse conflicts with the global --db flag.
+Token UX polish:
+- billing whoami
+- billing tokens rotate
 
-Schema is created by migrations:
+Important CLI rule:
+- Billing commands DO NOT take --db on the subcommand (argparse footgun).
+- Billing uses global mgc.main --db, with optional override --billing-db.
+
+Schema created by:
   scripts/migrations/0002_billing.sql
 """
 
@@ -48,8 +51,24 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def die(msg: str, code: int = 2) -> None:
-    raise SystemExit(msg)  # mgc.main prints SystemExit messages cleanly
+@dataclass(frozen=True)
+class DB:
+    path: Path
+
+    def connect(self) -> sqlite3.Connection:
+        if not self.path.exists():
+            raise FileNotFoundError(f"DB not found: {self.path}")
+        con = sqlite3.connect(str(self.path))
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON;")
+        return con
+
+
+def _resolve_db_path(args: argparse.Namespace) -> Path:
+    raw = (getattr(args, "billing_db", None) or getattr(args, "db", None) or "").strip()
+    if not raw:
+        raise SystemExit("DB not set. Pass global --db to mgc.main or use --billing-db.")
+    return Path(raw).expanduser().resolve()
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -72,32 +91,6 @@ def _require_tables(con: sqlite3.Connection) -> None:
         )
 
 
-def _resolve_db_path(args: argparse.Namespace) -> Path:
-    """
-    Prefer --billing-db; otherwise fall back to global --db from mgc.main.
-    """
-    billing_db = getattr(args, "billing_db", None)
-    global_db = getattr(args, "db", None)
-
-    raw = (billing_db or global_db or "").strip()
-    if not raw:
-        raise SystemExit("DB not set. Pass global --db to mgc.main or use --billing-db for billing commands.")
-    return Path(raw).expanduser().resolve()
-
-
-@dataclass(frozen=True)
-class DB:
-    path: Path
-
-    def connect(self) -> sqlite3.Connection:
-        if not self.path.exists():
-            raise FileNotFoundError(f"DB not found: {self.path}")
-        con = sqlite3.connect(str(self.path))
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys = ON;")
-        return con
-
-
 def _user_get(con: sqlite3.Connection, user_id: str) -> Optional[sqlite3.Row]:
     return con.execute(
         "SELECT * FROM billing_users WHERE user_id = ? LIMIT 1", (user_id,)
@@ -116,9 +109,7 @@ def _user_upsert(con: sqlite3.Connection, user_id: str, email: Optional[str], cr
     )
 
 
-def _entitlement_active_row(
-    con: sqlite3.Connection, *, user_id: str, now_ts: str
-) -> Optional[sqlite3.Row]:
+def _entitlement_active_row(con: sqlite3.Connection, *, user_id: str, now_ts: str) -> Optional[sqlite3.Row]:
     return con.execute(
         """
         SELECT *
@@ -133,9 +124,18 @@ def _entitlement_active_row(
     ).fetchone()
 
 
+def _token_row_by_sha(con: sqlite3.Connection, token_sha: str) -> Optional[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM billing_tokens WHERE token_sha256 = ? LIMIT 1", (token_sha,)
+    ).fetchone()
+
+
+# -----------------------------
+# users
+# -----------------------------
+
 def cmd_billing_users_add(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
+    db = DB(_resolve_db_path(args))
     created_ts = args.created_ts or utc_now_iso()
 
     with db.connect() as con:
@@ -153,9 +153,7 @@ def cmd_billing_users_add(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_users_list(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
-
+    db = DB(_resolve_db_path(args))
     with db.connect() as con:
         _require_tables(con)
         rows = con.execute(
@@ -172,9 +170,12 @@ def cmd_billing_users_list(args: argparse.Namespace) -> int:
     return 0
 
 
+# -----------------------------
+# tokens
+# -----------------------------
+
 def cmd_billing_tokens_mint(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
+    db = DB(_resolve_db_path(args))
     created_ts = args.created_ts or utc_now_iso()
 
     token_value = args.token or secrets.token_urlsafe(32)
@@ -182,7 +183,6 @@ def cmd_billing_tokens_mint(args: argparse.Namespace) -> int:
 
     with db.connect() as con:
         _require_tables(con)
-
         if _user_get(con, args.user_id) is None:
             _user_upsert(con, args.user_id, args.email, created_ts)
 
@@ -216,9 +216,7 @@ def cmd_billing_tokens_mint(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_tokens_list(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
-
+    db = DB(_resolve_db_path(args))
     with db.connect() as con:
         _require_tables(con)
         if args.user_id:
@@ -247,9 +245,7 @@ def cmd_billing_tokens_list(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_tokens_revoke(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
-
+    db = DB(_resolve_db_path(args))
     token_sha = args.token_sha256 or sha256_hex(args.token)
 
     with db.connect() as con:
@@ -265,10 +261,67 @@ def cmd_billing_tokens_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
+def cmd_billing_tokens_rotate(args: argparse.Namespace) -> int:
+    db = DB(_resolve_db_path(args))
+    created_ts = args.created_ts or utc_now_iso()
 
+    new_token_value = args.token or secrets.token_urlsafe(32)
+    new_token_sha = sha256_hex(new_token_value)
+
+    revoke_sha: Optional[str] = None
+    if args.revoke_token_sha256:
+        revoke_sha = args.revoke_token_sha256
+    elif args.revoke_token:
+        revoke_sha = sha256_hex(args.revoke_token)
+
+    with db.connect() as con:
+        _require_tables(con)
+        if _user_get(con, args.user_id) is None:
+            _user_upsert(con, args.user_id, args.email, created_ts)
+
+        con.execute(
+            """
+            INSERT INTO billing_tokens(token_sha256, user_id, created_ts, label)
+            VALUES(?, ?, ?, ?)
+            """,
+            (new_token_sha, args.user_id, created_ts, args.label),
+        )
+
+        revoked = 0
+        if revoke_sha:
+            cur = con.execute("DELETE FROM billing_tokens WHERE token_sha256 = ?", (revoke_sha,))
+            revoked = cur.rowcount
+
+        con.commit()
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "cmd": "billing.tokens.rotate",
+        "user_id": args.user_id,
+        "token_sha256": new_token_sha,
+        "created_ts": created_ts,
+        "label": args.label,
+        "revoked_token_sha256": revoke_sha,
+        "revoked_count": revoked,
+    }
+    if args.show_token:
+        out["token"] = new_token_value
+
+    if args.json:
+        print(stable_json(out), end="")
+    else:
+        print(f"OK token_sha256={new_token_sha} user_id={args.user_id} revoked={revoked}")
+        if args.show_token:
+            print(new_token_value)
+    return 0
+
+
+# -----------------------------
+# entitlements
+# -----------------------------
+
+def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
+    db = DB(_resolve_db_path(args))
     starts_ts = args.starts_ts or utc_now_iso()
 
     meta_json = None
@@ -278,7 +331,6 @@ def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
 
     with db.connect() as con:
         _require_tables(con)
-
         if _user_get(con, args.user_id) is None:
             _user_upsert(con, args.user_id, args.email, utc_now_iso())
 
@@ -309,9 +361,7 @@ def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_entitlements_list(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
-
+    db = DB(_resolve_db_path(args))
     with db.connect() as con:
         _require_tables(con)
         if args.user_id:
@@ -342,21 +392,19 @@ def cmd_billing_entitlements_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_billing_check(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args)
-    db = DB(db_path)
+# -----------------------------
+# auth / UX
+# -----------------------------
 
+def cmd_billing_check(args: argparse.Namespace) -> int:
+    db = DB(_resolve_db_path(args))
     now_dt = parse_now(args.now)
     now_ts = now_dt.isoformat(timespec="seconds")
     token_sha = sha256_hex(args.token)
 
     with db.connect() as con:
         _require_tables(con)
-
-        tok = con.execute(
-            "SELECT * FROM billing_tokens WHERE token_sha256 = ? LIMIT 1", (token_sha,)
-        ).fetchone()
-
+        tok = _token_row_by_sha(con, token_sha)
         if tok is None:
             out = {"ok": False, "cmd": "billing.check", "reason": "invalid_token"}
             if args.json:
@@ -385,17 +433,61 @@ def cmd_billing_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_billing_whoami(args: argparse.Namespace) -> int:
+    db = DB(_resolve_db_path(args))
+    now_dt = parse_now(args.now)
+    now_ts = now_dt.isoformat(timespec="seconds")
+    token_sha = sha256_hex(args.token)
+
+    with db.connect() as con:
+        _require_tables(con)
+
+        tok = _token_row_by_sha(con, token_sha)
+        if tok is None:
+            out = {"ok": False, "cmd": "billing.whoami", "reason": "invalid_token", "token_sha256": token_sha}
+            if args.json:
+                print(stable_json(out), end="")
+            else:
+                print("DENY invalid_token")
+            return 2
+
+        user_id = str(tok["user_id"])
+        user = _user_get(con, user_id)
+        ent = _entitlement_active_row(con, user_id=user_id, now_ts=now_ts)
+        tier = str(ent["tier"]) if ent is not None else "free"
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "cmd": "billing.whoami",
+        "now": now_ts,
+        "token_sha256": token_sha,
+        "token": {"token_sha256": str(tok["token_sha256"]), "user_id": str(tok["user_id"]), "created_ts": str(tok["created_ts"]), "label": tok["label"]},
+        "user": dict(user) if user is not None else None,
+        "tier": tier,
+        "active_entitlement": dict(ent) if ent is not None else None,
+    }
+    if args.json:
+        print(stable_json(out), end="")
+    else:
+        email = (dict(user).get("email") if user is not None else "") or ""
+        label = tok["label"] or ""
+        print(f"OK user_id={user_id} tier={tier} email={email}".rstrip())
+        if label:
+            print(f"label={label}")
+        print(f"token_sha256={token_sha}")
+    return 0
+
+
+# -----------------------------
+# CLI registration
+# -----------------------------
+
 def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     billing = sub.add_parser("billing", help="Billing tools (users/tokens/entitlements)")
     bs = billing.add_subparsers(dest="billing_cmd", required=True)
 
     def add_billing_db_opt(p: argparse.ArgumentParser) -> None:
-        p.add_argument(
-            "--billing-db",
-            dest="billing_db",
-            default=None,
-            help="Billing DB path (optional). If omitted, uses global mgc.main --db.",
-        )
+        p.add_argument("--billing-db", dest="billing_db", default=None, help="Override billing DB path (optional). Otherwise uses global --db.")
 
     # users
     users = bs.add_parser("users", help="Billing users")
@@ -422,13 +514,27 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     tm = ts.add_parser("mint", help="Mint a token for a user")
     add_billing_db_opt(tm)
     tm.add_argument("user_id")
-    tm.add_argument("--email", default=None, help="If user doesn't exist, create with this email")
+    tm.add_argument("--email", default=None)
     tm.add_argument("--label", default=None)
     tm.add_argument("--created-ts", default=None)
-    tm.add_argument("--token", default=None, help="Provide token value (deterministic tests). Otherwise random.")
-    tm.add_argument("--show-token", action="store_true", help="Include raw token in output")
+    tm.add_argument("--token", default=None)
+    tm.add_argument("--show-token", action="store_true")
     tm.add_argument("--json", action="store_true")
     tm.set_defaults(func=cmd_billing_tokens_mint)
+
+    trt = ts.add_parser("rotate", help="Rotate token (mint new, optionally revoke old)")
+    add_billing_db_opt(trt)
+    trt.add_argument("user_id")
+    trt.add_argument("--email", default=None)
+    trt.add_argument("--label", default=None)
+    trt.add_argument("--created-ts", default=None)
+    trt.add_argument("--token", default=None)
+    g2 = trt.add_mutually_exclusive_group(required=False)
+    g2.add_argument("--revoke-token", default=None)
+    g2.add_argument("--revoke-token-sha256", default=None)
+    trt.add_argument("--show-token", action="store_true")
+    trt.add_argument("--json", action="store_true")
+    trt.set_defaults(func=cmd_billing_tokens_rotate)
 
     tl = ts.add_parser("list", help="List tokens")
     add_billing_db_opt(tl)
@@ -440,7 +546,7 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     tr = ts.add_parser("revoke", help="Revoke a token")
     add_billing_db_opt(tr)
     g = tr.add_mutually_exclusive_group(required=True)
-    g.add_argument("--token-sha256", default=None)
+    g.add_argument("--token-sha256", dest="token_sha256", default=None)
     g.add_argument("--token", default=None)
     tr.add_argument("--json", action="store_true")
     tr.set_defaults(func=cmd_billing_tokens_revoke)
@@ -458,7 +564,7 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     eg.add_argument("--ends-ts", default=None)
     eg.add_argument("--source", default="manual")
     eg.add_argument("--meta-json", default=None)
-    eg.add_argument("--email", default=None, help="If user doesn't exist, create with this email")
+    eg.add_argument("--email", default=None)
     eg.add_argument("--json", action="store_true")
     eg.set_defaults(func=cmd_billing_entitlements_grant)
 
@@ -469,10 +575,17 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     el.add_argument("--json", action="store_true")
     el.set_defaults(func=cmd_billing_entitlements_list)
 
-    # check
+    # auth / UX
     ck = bs.add_parser("check", help="Validate token and return tier")
     add_billing_db_opt(ck)
     ck.add_argument("--token", required=True)
-    ck.add_argument("--now", default=None, help="Override current time (ISO).")
+    ck.add_argument("--now", default=None)
     ck.add_argument("--json", action="store_true")
     ck.set_defaults(func=cmd_billing_check)
+
+    wa = bs.add_parser("whoami", help="Show who the token is (user/tier/entitlement)")
+    add_billing_db_opt(wa)
+    wa.add_argument("--token", required=True)
+    wa.add_argument("--now", default=None)
+    wa.add_argument("--json", action="store_true")
+    wa.set_defaults(func=cmd_billing_whoami)

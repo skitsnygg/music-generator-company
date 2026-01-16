@@ -208,7 +208,6 @@ def _table_exists(con: sqlite3.Connection, name: str) -> bool:
 
 
 def _billing_require_pro(con: sqlite3.Connection, token: str) -> Dict[str, Any]:
-    # Validate token and require an active entitlement with tier 'pro'.
     for t in ("billing_users", "billing_tokens", "billing_entitlements"):
         if not _table_exists(con, t):
             raise ValueError(f"billing tables missing ({t}). Did you run migrations?")
@@ -270,16 +269,7 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
         meta["tracks_table"] = True
 
         cols = [r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()]
-        candidates = [
-            "artifact_path",
-            "audio_path",
-            "path",
-            "file_path",
-            "filepath",
-            "src_path",
-            "wav_path",
-            "mp3_path",
-        ]
+        candidates = ["artifact_path", "audio_path", "path", "file_path", "filepath", "src_path", "wav_path", "mp3_path"]
         path_col = next((c for c in candidates if c in cols), None)
         meta["path_column"] = path_col
         if not path_col:
@@ -371,7 +361,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     tracks_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional billing gate (only if --token is provided)
     billing_ctx: Optional[Dict[str, Any]] = None
     token = str(getattr(args, "token", "") or "").strip()
     if token:
@@ -416,12 +405,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                 resolved_from = "db"
 
     if bool(getattr(args, "fail_if_empty", False)) and not raw_paths:
-        out: Dict[str, Any] = {
-            "ok": False,
-            "playlist": str(playlist_path),
-            "reason": "playlist_empty",
-            "track_count": 0,
-        }
+        out: Dict[str, Any] = {"ok": False, "playlist": str(playlist_path), "reason": "playlist_empty", "track_count": 0}
         if db_resolution is not None:
             out["db_resolution"] = db_resolution
         sys.stdout.write(_stable_json_dumps(out) + "\n")
@@ -444,9 +428,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     strip_paths_flag = bool(getattr(args, "strip_paths", False))
     strip_paths = strip_paths_flag or _env_truthy("MGC_DETERMINISTIC")
 
-    playlist_display = (
-        _display_path_strip(playlist_path, base_dir=playlist_dir) if strip_paths else str(playlist_path)
-    )
+    playlist_display = _display_path_strip(playlist_path, base_dir=playlist_dir) if strip_paths else str(playlist_path)
 
     copied = 0
     missing = 0
@@ -526,12 +508,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps(out) + "\n")
         return 2
 
-    web_playlist = {
-        "version": 1,
-        "source_playlist": playlist_display,
-        "resolved_from": resolved_from,
-        "tracks": [t for t in bundled if t.get("ok")],
-    }
+    web_playlist = {"version": 1, "source_playlist": playlist_display, "resolved_from": resolved_from, "tracks": [t for t in bundled if t.get("ok")]}
     _write_json(out_playlist_path, web_playlist)
 
     index_html = """<!doctype html>
@@ -591,13 +568,10 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 """
     index_path.write_text(index_html, encoding="utf-8", newline="\n")
 
-    # IMPORTANT determinism rule:
-    # The manifest written to disk must NOT include run-specific absolute paths.
-    # So out_dir is always "." in the file, and playlist path is portable when strip_paths.
     manifest_obj: Dict[str, Any] = {
         "ok": True,
         "playlist": playlist_display if strip_paths else _as_posix(Path("playlist.json")),
-        "out_dir": ".",  # <-- determinism fix (run1_web vs run2_web)
+        "out_dir": ".",
         "track_count": len(raw_paths),
         "copied_count": copied,
         "missing_count": missing,
@@ -638,7 +612,6 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         _eprint(f"[mgc.web] ERROR: directory not found: {directory}")
         return 2
 
-    # Optional billing gate (only if --token is provided)
     token = str(getattr(args, "token", "") or "").strip()
     if token:
         billing_db_raw = getattr(args, "billing_db", None) or getattr(args, "db", "")
@@ -666,7 +639,6 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
             super().__init__(*a, directory=str(directory), **kw)
 
     ThreadingHTTPServer.allow_reuse_address = True
-
     httpd = ThreadingHTTPServer((host, port), Handler)
     _eprint(f"[mgc.web] serving {directory} on http://{host}:{port}/")
     try:
