@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+"""
+src/mgc/web_cli.py
+
+Static web bundle builder + simple dev server.
+
+Design goals:
+- Keep this module ONLY about "web" commands.
+- Provide a registrar function that mgc.main can discover:
+    register_web_subcommand(subparsers)
+  (plus a few aliases for backwards compatibility)
+- Billing gate for web commands when --token is provided:
+    Requires an active entitlement tier == "pro".
+
+CRITICAL UX SAFETY FIX:
+- Never silently use MGC_DB (which may point at fixtures/CI) as the billing DB.
+- Billing DB resolution for gating is STRICT:
+    1) --billing-db if provided
+    2) env MGC_BILLING_DB if set
+    3) --db only if it does NOT equal env MGC_DB (i.e., not implicitly coming from env default)
+    4) otherwise -> error: billing_db_ambiguous / billing_db_missing
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,97 +36,219 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
+# -----------------------------
+# Small utilities
+# -----------------------------
+
+def _eprint(msg: str) -> None:
+    sys.stderr.write(msg.rstrip() + "\n")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _stable_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
-def _eprint(*args: Any) -> None:
-    print(*args, file=sys.stderr)
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _as_posix(p: Path) -> str:
-    return str(p).replace("\\", "/")
+def _connect(db_path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    return con
 
 
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
-def _write_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_stable_json_dumps(obj) + "\n", encoding="utf-8", newline="\n")
+def _resolve_path_maybe(p: str) -> str:
+    if not p:
+        return ""
+    try:
+        return str(Path(p).expanduser().resolve())
+    except Exception:
+        return p
 
 
-def _rm_tree_contents(root: Path) -> None:
-    if not root.exists():
-        return
-    for child in root.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink(missing_ok=True)
+# -----------------------------
+# Billing gate (pro only)
+# -----------------------------
+
+def _billing_require_pro(*, db_path: str, token: str) -> Dict[str, Any]:
+    """
+    Validate token and require an active entitlement with tier == "pro".
+
+    Expected tables:
+      billing_users(user_id, ...)
+      billing_tokens(token_sha256, user_id, created_ts, label, ...)
+      billing_entitlements(user_id, tier, starts_ts, ends_ts, source, ...)
+    """
+    if not db_path:
+        raise ValueError("billing_db_missing")
+
+    if not token.strip():
+        raise ValueError("token_missing")
+
+    dbp = Path(db_path).expanduser()
+    if not dbp.exists():
+        raise ValueError("billing_db_not_found")
+
+    con = _connect(str(dbp))
+    try:
+        for t in ("billing_users", "billing_tokens", "billing_entitlements"):
+            if not _table_exists(con, t):
+                raise ValueError(f"billing_tables_missing:{t}")
+
+        token_sha = _sha256_hex(token.strip())
+        tok = con.execute(
+            "SELECT token_sha256, user_id, created_ts, label "
+            "FROM billing_tokens WHERE token_sha256 = ? LIMIT 1",
+            (token_sha,),
+        ).fetchone()
+        if tok is None:
+            raise ValueError("invalid_token")
+
+        user_id = str(tok["user_id"])
+        now_ts = _utc_now_iso()
+
+        ent = con.execute(
+            """
+            SELECT user_id, tier, starts_ts, ends_ts, source
+              FROM billing_entitlements
+             WHERE user_id = ?
+               AND starts_ts <= ?
+               AND (ends_ts IS NULL OR ends_ts > ?)
+             ORDER BY starts_ts DESC
+             LIMIT 1
+            """,
+            (user_id, now_ts, now_ts),
+        ).fetchone()
+
+        tier = str(ent["tier"]) if ent is not None else "free"
+        if tier != "pro":
+            raise ValueError("requires_pro")
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "tier": tier,
+            "token_sha256": token_sha,
+            "now": now_ts,
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _resolve_billing_db_strict(args: argparse.Namespace) -> str:
+    """
+    STRICT billing DB resolution to prevent CI fixture bleed-through.
+
+    Order:
+      1) --billing-db (web subcommand arg)
+      2) env MGC_BILLING_DB
+      3) --db ONLY IF it does NOT equal env MGC_DB (i.e. not coming from implicit env default)
+      4) error
+
+    Notes:
+    - mgc.main may define a global --db whose default is os.environ["MGC_DB"].
+      That is exactly the footgun we prevent: if args.db == env MGC_DB and the
+      user didn't explicitly provide a billing DB, we refuse with billing_db_ambiguous.
+    """
+    billing_db = str(getattr(args, "billing_db", "") or "").strip()
+    if billing_db:
+        return billing_db
+
+    env_billing = str(os.environ.get("MGC_BILLING_DB", "") or "").strip()
+    if env_billing:
+        return env_billing
+
+    db = str(getattr(args, "db", "") or "").strip()
+    if not db:
+        raise ValueError("billing_db_missing")
+
+    env_mgc_db = str(os.environ.get("MGC_DB", "") or "").strip()
+
+    # If MGC_DB is set and args.db matches it, treat as ambiguous (likely implicit default).
+    if env_mgc_db:
+        db_res = _resolve_path_maybe(db)
+        env_res = _resolve_path_maybe(env_mgc_db)
+        if db_res and env_res and db_res == env_res:
+            raise ValueError("billing_db_ambiguous")
+
+    # Otherwise, allow args.db as the billing DB.
+    return db
+
+
+def _require_pro_if_token(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    token = str(getattr(args, "token", "") or "").strip()
+    if not token:
+        return None
+    billing_db = _resolve_billing_db_strict(args)
+    return _billing_require_pro(db_path=billing_db, token=token)
+
+
+# -----------------------------
+# Playlist helpers
+# -----------------------------
+
+_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".aiff", ".aif", ".m4a", ".ogg"}
 
 
 def _looks_like_audio_path(s: str) -> bool:
-    s2 = (s or "").strip().lower()
-    return any(s2.endswith(ext) for ext in AUDIO_EXTS)
+    try:
+        p = Path(s)
+    except Exception:
+        return False
+    return p.suffix.lower() in _AUDIO_EXTS
 
 
-def _prefer_mp3_path(p: Path) -> Path:
-    if p.suffix.lower() == ".wav":
-        mp3 = p.with_suffix(".mp3")
-        if mp3.exists():
-            return mp3
-    return p
-
-
-def _walk_collect_strings(obj: Any, out: List[str], limit: int = 20000) -> None:
-    if len(out) >= limit:
-        return
-    if obj is None:
-        return
+def _walk_collect_strings(obj: Any, out: List[str]) -> None:
     if isinstance(obj, str):
         out.append(obj)
         return
+    if isinstance(obj, list):
+        for it in obj:
+            _walk_collect_strings(it, out)
+        return
     if isinstance(obj, dict):
         for v in obj.values():
-            _walk_collect_strings(v, out, limit=limit)
-        return
-    if isinstance(obj, list):
-        for v in obj:
-            _walk_collect_strings(v, out, limit=limit)
+            _walk_collect_strings(v, out)
         return
 
 
-def _extract_track_paths(playlist_obj: Any) -> List[str]:
-    candidates: List[Any] = []
+def _collect_track_paths_from_playlist(playlist_obj: Any) -> List[str]:
+    """
+    Extract audio file paths from common playlist shapes.
 
-    if isinstance(playlist_obj, dict):
-        if "tracks" in playlist_obj:
-            candidates = playlist_obj.get("tracks")  # type: ignore[assignment]
-        elif "items" in playlist_obj:
-            candidates = playlist_obj.get("items")  # type: ignore[assignment]
-        elif isinstance(playlist_obj.get("playlist"), dict):
-            pl = playlist_obj.get("playlist")
-            if isinstance(pl, dict) and "items" in pl:
-                candidates = pl.get("items")  # type: ignore[assignment]
-    elif isinstance(playlist_obj, list):
-        candidates = playlist_obj
-
+    Supported patterns:
+      - top-level list[str]
+      - {"tracks": [str | dict]}
+      - dict entries containing keys like:
+          artifact_path, audio_path, path, file, uri, src, url
+      - any string anywhere that "looks like" an audio path
+    """
     out: List[str] = []
 
     def add_path(v: Any) -> None:
-        if v is None:
+        if not v:
             return
-        s = str(v).strip()
-        if s and _looks_like_audio_path(s):
-            out.append(s)
+        if isinstance(v, str) and _looks_like_audio_path(v.strip()):
+            out.append(v.strip())
 
-    if isinstance(candidates, list):
-        for it in candidates:
+    if isinstance(playlist_obj, list):
+        for it in playlist_obj:
             if isinstance(it, str):
                 add_path(it)
             elif isinstance(it, dict):
@@ -112,6 +256,18 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
                     if k in it:
                         add_path(it.get(k))
                         break
+
+    if isinstance(playlist_obj, dict):
+        tracks = playlist_obj.get("tracks")
+        if isinstance(tracks, list):
+            for it in tracks:
+                if isinstance(it, str):
+                    add_path(it)
+                elif isinstance(it, dict):
+                    for k in ("artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
+                        if k in it:
+                            add_path(it.get(k))
+                            break
 
     if not out:
         all_strs: List[str] = []
@@ -121,193 +277,110 @@ def _extract_track_paths(playlist_obj: Any) -> List[str]:
                 out.append(s)
 
     seen: set[str] = set()
-    uniq: List[str] = []
+    deduped: List[str] = []
     for p in out:
         if p not in seen:
             seen.add(p)
-            uniq.append(p)
-    return uniq
+            deduped.append(p)
+    return deduped
 
 
-def _extract_track_ids(playlist_obj: Any) -> List[str]:
+def _collect_track_ids_from_playlist(playlist_obj: Any) -> List[str]:
     ids: List[str] = []
 
     def add_id(v: Any) -> None:
-        if v is None:
+        if not v:
             return
-        s = str(v).strip()
-        if s:
-            ids.append(s)
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                ids.append(s)
 
     if isinstance(playlist_obj, dict):
         if isinstance(playlist_obj.get("track_ids"), list):
-            for v in playlist_obj["track_ids"]:
-                add_id(v)
-        if isinstance(playlist_obj.get("tracks"), list):
-            for it in playlist_obj["tracks"]:
-                if isinstance(it, dict):
-                    if "track_id" in it:
-                        add_id(it.get("track_id"))
-                    elif "id" in it:
-                        add_id(it.get("id"))
-                elif isinstance(it, str) and not _looks_like_audio_path(it):
-                    add_id(it)
-        if isinstance(playlist_obj.get("items"), list):
-            for it in playlist_obj["items"]:
-                if isinstance(it, dict):
-                    if "track_id" in it:
-                        add_id(it.get("track_id"))
-                    elif "id" in it:
-                        add_id(it.get("id"))
-    elif isinstance(playlist_obj, list):
-        for it in playlist_obj:
-            if isinstance(it, dict):
-                if "track_id" in it:
-                    add_id(it.get("track_id"))
-                elif "id" in it:
-                    add_id(it.get("id"))
-            elif isinstance(it, str) and not _looks_like_audio_path(it):
+            for it in playlist_obj["track_ids"]:
                 add_id(it)
 
+        tracks = playlist_obj.get("tracks")
+        if isinstance(tracks, list):
+            for it in tracks:
+                if isinstance(it, dict) and "track_id" in it:
+                    add_id(it.get("track_id"))
+
     seen: set[str] = set()
-    uniq: List[str] = []
+    out: List[str] = []
     for t in ids:
         if t not in seen:
             seen.add(t)
-            uniq.append(t)
-    return uniq
+            out.append(t)
+    return out
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _db_connect(db_path: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute("PRAGMA foreign_keys = ON;")
-    except Exception:
-        pass
-    return con
-
-
-def _table_exists(con: sqlite3.Connection, name: str) -> bool:
-    try:
-        row = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ? LIMIT 1",
-            (name,),
-        ).fetchone()
-        return row is not None
-    except Exception:
-        return False
-
-
-def _billing_require_pro(con: sqlite3.Connection, token: str) -> Dict[str, Any]:
-    for t in ("billing_users", "billing_tokens", "billing_entitlements"):
-        if not _table_exists(con, t):
-            raise ValueError(f"billing tables missing ({t}). Did you run migrations?")
-
-    token_sha = _sha256_hex(token)
-
-    tok = con.execute(
-        "SELECT token_sha256, user_id, created_ts, label FROM billing_tokens WHERE token_sha256 = ? LIMIT 1",
-        (token_sha,),
-    ).fetchone()
-    if tok is None:
-        raise ValueError("invalid_token")
-
-    user_id = str(tok["user_id"])
-    now_ts = _utc_now_iso()
-
-    ent = con.execute(
-        """
-        SELECT entitlement_id, user_id, tier, starts_ts, ends_ts, source, meta_json
-        FROM billing_entitlements
-        WHERE user_id = ?
-          AND starts_ts <= ?
-          AND (ends_ts IS NULL OR ends_ts > ?)
-        ORDER BY starts_ts DESC
-        LIMIT 1
-        """,
-        (user_id, now_ts, now_ts),
-    ).fetchone()
-
-    tier = str(ent["tier"]) if ent is not None else "free"
-    if tier != "pro":
-        raise ValueError(f"insufficient_tier:{tier}")
-
-    return {
-        "user_id": user_id,
-        "tier": tier,
-        "token_sha256": token_sha,
-        "entitlement_id": (str(ent["entitlement_id"]) if ent is not None else None),
-    }
-
-
-def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[List[str], Dict[str, Any]]:
+def _resolve_track_paths_from_db(*, db_path: str, track_ids: List[str]) -> Tuple[List[str], Dict[str, Any]]:
     meta: Dict[str, Any] = {
-        "used_db": str(db_path),
-        "tracks_table": False,
-        "path_column": None,
+        "resolved_from": "db",
+        "db": db_path,
+        "requested_ids": len(track_ids),
         "resolved": 0,
         "missing": 0,
+        "reason": None,
     }
-    if not db_path.exists():
+
+    if not db_path:
+        meta["reason"] = "db_missing"
+        return [], meta
+
+    p = Path(db_path).expanduser()
+    if not p.exists():
         meta["reason"] = "db_not_found"
         return [], meta
 
-    con = _db_connect(db_path)
+    con = _connect(str(p))
     try:
         if not _table_exists(con, "tracks"):
             meta["reason"] = "tracks_table_missing"
             return [], meta
-        meta["tracks_table"] = True
 
         cols = [r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()]
-        candidates = ["artifact_path", "audio_path", "path", "file_path", "filepath", "src_path", "wav_path", "mp3_path"]
-        path_col = next((c for c in candidates if c in cols), None)
-        meta["path_column"] = path_col
-        if not path_col:
-            meta["reason"] = "no_path_column_found"
+        path_col = None
+        for c in ("artifact_path", "audio_path", "path", "file_path", "uri"):
+            if c in cols:
+                path_col = c
+                break
+
+        id_col = None
+        for c in ("track_id", "id"):
+            if c in cols:
+                id_col = c
+                break
+
+        if not path_col or not id_col:
+            meta["reason"] = "tracks_schema_unexpected"
             return [], meta
 
-        id_col = "track_id" if "track_id" in cols else ("id" if "id" in cols else None)
-        if not id_col:
-            meta["reason"] = "no_id_column_found"
-            return [], meta
-
-        resolved_paths: List[str] = []
+        resolved: List[str] = []
         missing = 0
         CHUNK = 800
 
         for i in range(0, len(track_ids), CHUNK):
             chunk = track_ids[i : i + CHUNK]
-            qs = ",".join("?" for _ in chunk)
+            qmarks = ",".join(["?"] * len(chunk))
             rows = con.execute(
-                f"SELECT {id_col} AS tid, {path_col} AS p FROM tracks WHERE {id_col} IN ({qs})",
+                f"SELECT {id_col} AS track_id, {path_col} AS p FROM tracks WHERE {id_col} IN ({qmarks})",
                 tuple(chunk),
             ).fetchall()
-            got = {str(r["tid"]): (r["p"] if r else None) for r in rows}
+            got = {str(r["track_id"]): (str(r["p"]) if r["p"] is not None else "") for r in rows}
 
             for tid in chunk:
-                p = got.get(str(tid))
-                if p is None:
+                path = got.get(tid, "").strip()
+                if path:
+                    resolved.append(path)
+                else:
                     missing += 1
-                    continue
-                s = str(p).strip()
-                if not s:
-                    missing += 1
-                    continue
-                resolved_paths.append(s)
 
-        meta["resolved"] = len(resolved_paths)
+        meta["resolved"] = len(resolved)
         meta["missing"] = missing
-        return resolved_paths, meta
+        return resolved, meta
     finally:
         try:
             con.close()
@@ -316,123 +389,150 @@ def _resolve_track_paths_from_db(db_path: Path, track_ids: List[str]) -> Tuple[L
 
 
 def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
-    rp = Path(str(raw).strip())
+    rp = Path(raw).expanduser()
     if rp.is_absolute():
-        return rp.resolve()
+        return rp
     return (playlist_dir / rp).resolve()
 
 
-def _display_path_strip(p: Path, *, base_dir: Path) -> str:
-    try:
-        rp = p.resolve()
-    except Exception:
-        rp = p
-    try:
-        rel = rp.relative_to(base_dir.resolve())
-        return _as_posix(rel)
-    except Exception:
-        return rp.name
+def _prefer_mp3_path(p: Path) -> Path:
+    if p.suffix.lower() == ".wav":
+        alt = p.with_suffix(".mp3")
+        if alt.exists():
+            return alt
+    return p
 
 
-def _env_truthy(name: str) -> bool:
-    v = (os.environ.get(name) or "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
+def _safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Web build
+# -----------------------------
+
+_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MGC Web Player</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.4; }
+    .track { margin: 10px 0; }
+    audio { width: 100%; max-width: 760px; }
+    .muted { color: #666; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>MGC Web Player</h1>
+  <div class="muted">Loads <code>playlist.json</code> from this folder.</div>
+  <div id="app"></div>
+
+<script>
+async function main() {
+  const app = document.getElementById("app");
+  let playlist = null;
+
+  try {
+    const res = await fetch("./playlist.json", { cache: "no-store" });
+    playlist = await res.json();
+  } catch (e) {
+    app.innerHTML = "<p>Failed to load playlist.json</p>";
+    return;
+  }
+
+  const tracks = (playlist && playlist.tracks) ? playlist.tracks : [];
+  if (!Array.isArray(tracks) || tracks.length === 0) {
+    app.innerHTML = "<p>No tracks found in playlist.json</p>";
+    return;
+  }
+
+  for (const t of tracks) {
+    const row = document.createElement("div");
+    row.className = "track";
+    const title = document.createElement("div");
+    title.textContent = t.title || t.track_id || t.path || t.artifact_path || "Track";
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = t.web_path || t.path || "";
+    row.appendChild(title);
+    row.appendChild(audio);
+    app.appendChild(row);
+  }
+}
+main();
+</script>
+</body>
+</html>
+"""
 
 
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(args.playlist)).expanduser().resolve()
     if not playlist_path.exists():
-        out = {"ok": False, "reason": "playlist_not_found", "playlist": str(playlist_path)}
-        sys.stdout.write(_stable_json_dumps(out) + "\n")
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "playlist_not_found", "playlist": str(playlist_path)}) + "\n")
+        return 2
+
+    # Billing gate (strict DB resolution)
+    try:
+        _require_pro_if_token(args)
+    except Exception as e:
+        sys.stdout.write(_stable_json_dumps({
+            "ok": False,
+            "reason": "billing_denied",
+            "error": str(e),
+            "hint": "Pass --billing-db explicitly or set MGC_BILLING_DB (billing will not silently use MGC_DB).",
+        }) + "\n")
         return 2
 
     playlist_dir = playlist_path.parent
-
     out_dir = Path(str(args.out_dir)).expanduser().resolve()
     tracks_dir = out_dir / "tracks"
     manifest_path = out_dir / "web_manifest.json"
     out_playlist_path = out_dir / "playlist.json"
     index_path = out_dir / "index.html"
 
-    if bool(getattr(args, "clean", False)):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _rm_tree_contents(out_dir)
+    if bool(getattr(args, "clean", False)) and out_dir.exists():
+        shutil.rmtree(out_dir)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tracks_dir.mkdir(parents=True, exist_ok=True)
+    _safe_mkdir(tracks_dir)
 
-    billing_ctx: Optional[Dict[str, Any]] = None
-    token = str(getattr(args, "token", "") or "").strip()
-    if token:
-        billing_db_raw = getattr(args, "billing_db", None) or getattr(args, "db", "")
-        billing_db = Path(str(billing_db_raw)).expanduser().resolve()
-        if not billing_db.exists():
-            out = {"ok": False, "reason": "billing_db_not_found", "billing_db": str(billing_db)}
-            sys.stdout.write(_stable_json_dumps(out) + "\n")
-            return 2
+    prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
+    strip_paths = bool(getattr(args, "strip_paths", False))
+    fail_if_empty = bool(getattr(args, "fail_if_empty", False))
+    fail_if_none_copied = bool(getattr(args, "fail_if_none_copied", False))
+    fail_on_missing = bool(getattr(args, "fail_on_missing", False))
 
-        con = _db_connect(billing_db)
-        try:
-            billing_ctx = _billing_require_pro(con, token)
-        except ValueError as e:
-            out = {
-                "ok": False,
-                "reason": "billing_denied",
-                "detail": str(e),
-                "token_sha256": _sha256_hex(token),
-                "billing_db": str(billing_db),
-            }
-            sys.stdout.write(_stable_json_dumps(out) + "\n")
-            return 2
-        finally:
-            try:
-                con.close()
-            except Exception:
-                pass
+    playlist_obj = json.loads(playlist_path.read_text(encoding="utf-8"))
 
-    playlist_obj = _read_json(playlist_path)
-
-    raw_paths = _extract_track_paths(playlist_obj)
+    raw_paths = _collect_track_paths_from_playlist(playlist_obj)
     resolved_from = "playlist_path"
-    db_resolution: Optional[Dict[str, Any]] = None
 
+    # If no paths, try DB via track_ids
+    db_meta: Dict[str, Any] = {}
     if not raw_paths:
-        track_ids = _extract_track_ids(playlist_obj)
+        track_ids = _collect_track_ids_from_playlist(playlist_obj)
         if track_ids:
-            db_path = Path(str(getattr(args, "db", ""))).expanduser().resolve()
-            raw_paths, db_resolution = _resolve_track_paths_from_db(db_path, track_ids)
+            db_path = str(getattr(args, "db", "") or "").strip()
+            raw_paths, db_meta = _resolve_track_paths_from_db(db_path=db_path, track_ids=track_ids)
             if raw_paths:
                 resolved_from = "db"
 
-    if bool(getattr(args, "fail_if_empty", False)) and not raw_paths:
-        out: Dict[str, Any] = {"ok": False, "playlist": str(playlist_path), "reason": "playlist_empty", "track_count": 0}
-        if db_resolution is not None:
-            out["db_resolution"] = db_resolution
-        sys.stdout.write(_stable_json_dumps(out) + "\n")
-        return 2
-
-    if bool(getattr(args, "require_bundled_tracks", False)) and (resolved_from == "db"):
-        out = {
+    if fail_if_empty and not raw_paths:
+        sys.stdout.write(_stable_json_dumps({
             "ok": False,
+            "reason": "empty_playlist",
             "playlist": str(playlist_path),
-            "out_dir": str(out_dir),
-            "reason": "db_resolution_disallowed",
-            "track_count": len(raw_paths),
-            "db_resolution": db_resolution,
-        }
-        sys.stdout.write(_stable_json_dumps(out) + "\n")
+            "resolved_from": resolved_from,
+            "db_meta": db_meta,
+        }) + "\n")
         return 2
-
-    prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
-
-    strip_paths_flag = bool(getattr(args, "strip_paths", False))
-    strip_paths = strip_paths_flag or _env_truthy("MGC_DETERMINISTIC")
-
-    playlist_display = _display_path_strip(playlist_path, base_dir=playlist_dir) if strip_paths else str(playlist_path)
 
     copied = 0
     missing = 0
     bundled: List[Dict[str, Any]] = []
+    out_tracks: List[Dict[str, Any]] = []
 
     for i, raw in enumerate(raw_paths):
         rp = _resolve_input_path(raw, playlist_dir=playlist_dir)
@@ -441,16 +541,14 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
         if not rp.exists() or not rp.is_file():
             missing += 1
-            bundled.append(
-                {
-                    "index": i,
-                    "source": raw if not strip_paths else str(Path(raw)).replace("\\", "/"),
-                    "resolved": (str(rp) if not strip_paths else _display_path_strip(rp, base_dir=playlist_dir)),
-                    "ok": False,
-                    "reason": "missing",
-                    "resolved_from": resolved_from,
-                }
-            )
+            bundled.append({
+                "index": i,
+                "source": raw if not strip_paths else str(Path(raw)).as_posix(),
+                "resolved": str(rp) if not strip_paths else rp.name,
+                "ok": False,
+                "reason": "missing",
+                "resolved_from": resolved_from,
+            })
             continue
 
         dest = tracks_dir / rp.name
@@ -465,177 +563,101 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     break
                 n += 1
 
-        shutil.copyfile(rp, dest)
+        shutil.copy2(str(rp), str(dest))
         copied += 1
-        bundled.append(
-            {
-                "index": i,
-                "source": raw if not strip_paths else str(Path(raw)).replace("\\", "/"),
-                "resolved": (str(rp) if not strip_paths else _display_path_strip(rp, base_dir=playlist_dir)),
-                "ok": True,
-                "bundle_path": _as_posix(dest.relative_to(out_dir)),
-                "resolved_from": resolved_from,
-            }
-        )
+        rel = f"tracks/{dest.name}"
 
-    if bool(getattr(args, "fail_on_missing", False)) and missing > 0:
-        out = {
+        bundled.append({
+            "index": i,
+            "source": str(rp) if not strip_paths else rp.name,
+            "dest": str(dest),
+            "web_path": rel,
+            "ok": True,
+            "resolved_from": resolved_from,
+        })
+
+        out_tracks.append({
+            "title": rp.stem,
+            "path": str(rp) if not strip_paths else rp.name,
+            "web_path": rel,
+        })
+
+    if fail_if_none_copied and copied == 0:
+        sys.stdout.write(_stable_json_dumps({
             "ok": False,
-            "playlist": str(playlist_path),
+            "reason": "none_copied",
+            "copied_count": copied,
+            "missing_count": missing,
             "out_dir": str(out_dir),
+        }) + "\n")
+        return 2
+
+    if fail_on_missing and missing > 0:
+        sys.stdout.write(_stable_json_dumps({
+            "ok": False,
             "reason": "missing_tracks",
-            "track_count": len(raw_paths),
             "copied_count": copied,
             "missing_count": missing,
-        }
-        if db_resolution is not None:
-            out["db_resolution"] = db_resolution
-        sys.stdout.write(_stable_json_dumps(out) + "\n")
-        return 2
-
-    if bool(getattr(args, "fail_if_none_copied", False)) and copied == 0:
-        out = {
-            "ok": False,
-            "playlist": str(playlist_path),
             "out_dir": str(out_dir),
-            "reason": "no_tracks_copied",
-            "track_count": len(raw_paths),
-            "copied_count": copied,
-            "missing_count": missing,
-        }
-        if db_resolution is not None:
-            out["db_resolution"] = db_resolution
-        sys.stdout.write(_stable_json_dumps(out) + "\n")
+        }) + "\n")
         return 2
 
-    web_playlist = {"version": 1, "source_playlist": playlist_display, "resolved_from": resolved_from, "tracks": [t for t in bundled if t.get("ok")]}
-    _write_json(out_playlist_path, web_playlist)
-
-    index_html = """<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>MGC Web Player</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; margin: 20px; }
-    button { padding: 8px 12px; }
-    .row { margin: 8px 0; }
-    .small { color: #666; font-size: 12px; }
-    select { padding: 6px; min-width: 320px; }
-  </style>
-</head>
-<body>
-  <h1>MGC Web Player</h1>
-  <div class="row">
-    <select id="sel"></select>
-    <button id="play">Play</button>
-  </div>
-  <audio id="audio" controls style="width: 100%; max-width: 800px;"></audio>
-  <div class="row small" id="meta"></div>
-<script>
-(async function () {
-  const res = await fetch('./playlist.json');
-  const pl = await res.json();
-  const tracks = (pl.tracks || []).map(t => t.bundle_path);
-  const sel = document.getElementById('sel');
-  const audio = document.getElementById('audio');
-  const meta = document.getElementById('meta');
-
-  function setSrc(p) {
-    audio.src = './' + p;
-    meta.textContent = p;
-  }
-
-  tracks.forEach((p, i) => {
-    const opt = document.createElement('option');
-    opt.value = p;
-    opt.textContent = (i+1) + ' - ' + p.split('/').pop();
-    sel.appendChild(opt);
-  });
-
-  if (tracks.length) setSrc(tracks[0]);
-
-  sel.addEventListener('change', () => setSrc(sel.value));
-  document.getElementById('play').addEventListener('click', () => {
-    if (sel.value) setSrc(sel.value);
-    audio.play();
-  });
-})();
-</script>
-</body>
-</html>
-"""
-    index_path.write_text(index_html, encoding="utf-8", newline="\n")
-
-    manifest_obj: Dict[str, Any] = {
-        "ok": True,
-        "playlist": playlist_display if strip_paths else _as_posix(Path("playlist.json")),
-        "out_dir": ".",
-        "track_count": len(raw_paths),
-        "copied_count": copied,
-        "missing_count": missing,
-        "tracks_dir": _as_posix(tracks_dir.relative_to(out_dir)),
-        "playlist_json": _as_posix(out_playlist_path.relative_to(out_dir)),
-        "index_html": _as_posix(index_path.relative_to(out_dir)),
+    out_playlist = {
+        "source_playlist": str(playlist_path),
         "resolved_from": resolved_from,
-        "items": bundled,
-        "db_resolution": db_resolution,
-        "strip_paths": strip_paths,
-        "billing": billing_ctx,
+        "tracks": out_tracks,
     }
-    _write_json(manifest_path, manifest_obj)
 
-    out_obj: Dict[str, Any] = {
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_playlist_path.write_text(json.dumps(out_playlist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    index_path.write_text(_INDEX_HTML, encoding="utf-8")
+
+    manifest = {
         "ok": True,
-        "playlist": str(playlist_path),
+        "cmd": "web.build",
         "out_dir": str(out_dir),
-        "track_count": len(raw_paths),
-        "copied_count": copied,
-        "missing_count": missing,
+        "playlist": str(playlist_path),
+        "playlist_out": str(out_playlist_path),
+        "index": str(index_path),
         "manifest_path": str(manifest_path),
         "resolved_from": resolved_from,
-        "strip_paths": strip_paths,
+        "copied_count": copied,
+        "missing_count": missing,
+        "bundled": bundled,
+        "db_meta": db_meta,
     }
-    if db_resolution is not None:
-        out_obj["db_resolution"] = db_resolution
-    if billing_ctx is not None:
-        out_obj["billing"] = billing_ctx
+    manifest_path.write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
 
-    sys.stdout.write(_stable_json_dumps(out_obj) + "\n")
+    sys.stdout.write(_stable_json_dumps(manifest) + "\n")
     return 0
 
+
+# -----------------------------
+# Web serve
+# -----------------------------
 
 def cmd_web_serve(args: argparse.Namespace) -> int:
     directory = Path(str(args.dir)).expanduser().resolve()
     if not directory.exists() or not directory.is_dir():
-        _eprint(f"[mgc.web] ERROR: directory not found: {directory}")
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "dir_not_found", "dir": str(directory)}) + "\n")
         return 2
 
-    token = str(getattr(args, "token", "") or "").strip()
-    if token:
-        billing_db_raw = getattr(args, "billing_db", None) or getattr(args, "db", "")
-        billing_db = Path(str(billing_db_raw)).expanduser().resolve()
-        if not billing_db.exists():
-            _eprint(f"[mgc.web] ERROR: billing DB not found: {billing_db}")
-            return 2
-        con = _db_connect(billing_db)
-        try:
-            _billing_require_pro(con, token)
-        except ValueError as e:
-            _eprint(f"[mgc.web] DENY billing: {e}")
-            return 2
-        finally:
-            try:
-                con.close()
-            except Exception:
-                pass
+    try:
+        _require_pro_if_token(args)
+    except Exception as e:
+        sys.stdout.write(_stable_json_dumps({
+            "ok": False,
+            "reason": "billing_denied",
+            "error": str(e),
+            "hint": "Pass --billing-db explicitly or set MGC_BILLING_DB (billing will not silently use MGC_DB).",
+        }) + "\n")
+        return 2
 
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
 
     class Handler(SimpleHTTPRequestHandler):
-        def __init__(self, *a: Any, **kw: Any):
+        def __init__(self, *a: Any, **kw: Any) -> None:
             super().__init__(*a, directory=str(directory), **kw)
 
     ThreadingHTTPServer.allow_reuse_address = True
@@ -653,6 +675,10 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+# -----------------------------
+# Registrar
+# -----------------------------
+
 def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     web = subparsers.add_parser("web", help="Static web player build/serve")
     ws = web.add_subparsers(dest="web_cmd", required=True)
@@ -660,31 +686,23 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     build = ws.add_parser("build", help="Build a static web bundle")
     build.add_argument("--playlist", required=True, help="Playlist JSON path")
     build.add_argument("--out-dir", required=True, help="Output directory for the web bundle")
+
+    # Keep --db because builds may need it to resolve track IDs -> paths
+    # NOTE: billing DB is resolved STRICTLY and will not silently use env MGC_DB.
     build.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (used only if playlist contains IDs)")
     build.add_argument("--token", default=None, help="Billing access token (requires pro)")
     build.add_argument(
         "--billing-db",
         dest="billing_db",
         default=None,
-        help="DB path for billing/token validation (optional). If omitted, uses --db.",
+        help="DB path for billing/token validation (recommended). If omitted, uses MGC_BILLING_DB or --db (but will NOT silently use MGC_DB).",
     )
     build.add_argument("--prefer-mp3", action="store_true", help="Prefer .mp3 when a .wav sibling exists")
-    build.add_argument("--clean", action="store_true", help="Delete out-dir contents before writing")
-    build.add_argument("--fail-if-empty", action="store_true", help="Exit nonzero if playlist has zero tracks")
-    build.add_argument("--fail-on-missing", action="store_true", help="Exit nonzero if any referenced track cannot be found")
-    build.add_argument("--fail-if-none-copied", action="store_true", help="Exit nonzero if zero audio files were copied")
-    build.add_argument(
-        "--require-bundled-tracks",
-        dest="require_bundled_tracks",
-        action="store_true",
-        help="Exit nonzero if DB resolution was used (forces portable bundle playlists with file paths)",
-    )
-    build.add_argument(
-        "--strip-paths",
-        dest="strip_paths",
-        action="store_true",
-        help="Write portable outputs: avoid embedding absolute/temp paths in playlist.json and web_manifest.json",
-    )
+    build.add_argument("--strip-paths", action="store_true", help="Strip absolute paths in manifest output")
+    build.add_argument("--clean", action="store_true", help="Delete out-dir before building")
+    build.add_argument("--fail-if-empty", action="store_true", help="Fail if playlist resolves to 0 tracks")
+    build.add_argument("--fail-if-none-copied", action="store_true", help="Fail if no files were copied")
+    build.add_argument("--fail-on-missing", action="store_true", help="Fail if any referenced tracks are missing")
     build.set_defaults(func=cmd_web_build)
 
     serve = ws.add_parser("serve", help="Serve a built web bundle")
@@ -695,8 +713,29 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "--billing-db",
         dest="billing_db",
         default=None,
-        help="DB path for billing/token validation (optional). If omitted, uses --db.",
+        help="DB path for billing/token validation (recommended). If omitted, uses MGC_BILLING_DB or --db (but will NOT silently use MGC_DB).",
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.set_defaults(func=cmd_web_serve)
+
+
+# Compatibility aliases for mgc.main registrar probing
+def register_web_subparser(subparsers: argparse._SubParsersAction) -> None:
+    register_web_subcommand(subparsers)
+
+
+def register_web_cli(subparsers: argparse._SubParsersAction) -> None:
+    register_web_subcommand(subparsers)
+
+
+def register_web(subparsers: argparse._SubParsersAction) -> None:
+    register_web_subcommand(subparsers)
+
+
+def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
+    register_web_subcommand(subparsers)
+
+
+def register(subparsers: argparse._SubParsersAction) -> None:
+    register_web_subcommand(subparsers)

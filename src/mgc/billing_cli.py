@@ -360,6 +360,112 @@ def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_billing_entitlements_grant_user(args: argparse.Namespace) -> int:
+    """
+    Convenience: grant without forcing the caller to supply entitlement_id.
+
+    Usage:
+      mgc billing entitlements grant-user <user_id> <tier> [--source manual] [--starts-ts ...] [--ends-ts ...]
+    """
+    db = DB(_resolve_db_path(args))
+    starts_ts = args.starts_ts or utc_now_iso()
+
+    meta_json = None
+    if args.meta_json:
+        json.loads(args.meta_json)
+        meta_json = args.meta_json
+
+    entitlement_id = args.entitlement_id or secrets.token_hex(16)
+
+    with db.connect() as con:
+        _require_tables(con)
+        if _user_get(con, args.user_id) is None:
+            _user_upsert(con, args.user_id, args.email, utc_now_iso())
+
+        con.execute(
+            """
+            INSERT INTO billing_entitlements(entitlement_id, user_id, tier, starts_ts, ends_ts, source, meta_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (entitlement_id, args.user_id, args.tier, starts_ts, args.ends_ts, args.source, meta_json),
+        )
+        con.commit()
+
+    out = {
+        "ok": True,
+        "cmd": "billing.entitlements.grant-user",
+        "entitlement_id": entitlement_id,
+        "user_id": args.user_id,
+        "tier": args.tier,
+        "starts_ts": starts_ts,
+        "ends_ts": args.ends_ts,
+        "source": args.source,
+    }
+    if args.json:
+        print(stable_json(out), end="")
+    else:
+        print(f"OK entitlement_id={entitlement_id} user_id={args.user_id} tier={args.tier}")
+    return 0
+
+
+def cmd_billing_entitlements_revoke(args: argparse.Namespace) -> int:
+    """
+    Revoke entitlements by setting ends_ts.
+
+    Default behavior:
+      - If --entitlement-id is provided: revoke that exact row.
+      - Else: revoke ALL active entitlements for user_id (ends_ts is NULL OR ends_ts > now),
+              by setting ends_ts = now.
+    """
+    db = DB(_resolve_db_path(args))
+    now_dt = parse_now(args.now)
+    now_ts = now_dt.isoformat(timespec="seconds")
+
+    with db.connect() as con:
+        _require_tables(con)
+
+        if args.entitlement_id:
+            cur = con.execute(
+                """
+                UPDATE billing_entitlements
+                   SET ends_ts = ?
+                 WHERE entitlement_id = ?
+                """,
+                (now_ts, args.entitlement_id),
+            )
+            revoked = cur.rowcount
+        else:
+            cur = con.execute(
+                """
+                UPDATE billing_entitlements
+                   SET ends_ts = ?
+                 WHERE user_id = ?
+                   AND (ends_ts IS NULL OR ends_ts > ?)
+                """,
+                (now_ts, args.user_id, now_ts),
+            )
+            revoked = cur.rowcount
+
+        con.commit()
+
+    out = {
+        "ok": True,
+        "cmd": "billing.entitlements.revoke",
+        "user_id": args.user_id,
+        "entitlement_id": args.entitlement_id,
+        "now": now_ts,
+        "revoked": revoked,
+    }
+    if args.json:
+        print(stable_json(out), end="")
+    else:
+        if args.entitlement_id:
+            print(f"OK revoked={revoked} entitlement_id={args.entitlement_id}")
+        else:
+            print(f"OK revoked={revoked} user_id={args.user_id}")
+    return 0
+
+
 def cmd_billing_entitlements_list(args: argparse.Namespace) -> int:
     db = DB(_resolve_db_path(args))
     with db.connect() as con:
@@ -555,7 +661,7 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     ents = bs.add_parser("entitlements", help="Access entitlements")
     es = ents.add_subparsers(dest="ents_cmd", required=True)
 
-    eg = es.add_parser("grant", help="Grant an entitlement")
+    eg = es.add_parser("grant", help="Grant an entitlement (explicit entitlement_id required)")
     add_billing_db_opt(eg)
     eg.add_argument("entitlement_id")
     eg.add_argument("user_id")
@@ -567,6 +673,27 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     eg.add_argument("--email", default=None)
     eg.add_argument("--json", action="store_true")
     eg.set_defaults(func=cmd_billing_entitlements_grant)
+
+    eg2 = es.add_parser("grant-user", help="Grant an entitlement (auto-generate entitlement_id)")
+    add_billing_db_opt(eg2)
+    eg2.add_argument("user_id")
+    eg2.add_argument("tier", choices=["free", "supporter", "pro"])
+    eg2.add_argument("--entitlement-id", dest="entitlement_id", default=None, help="Optional explicit entitlement_id (otherwise generated).")
+    eg2.add_argument("--starts-ts", default=None)
+    eg2.add_argument("--ends-ts", default=None)
+    eg2.add_argument("--source", default="manual")
+    eg2.add_argument("--meta-json", default=None)
+    eg2.add_argument("--email", default=None)
+    eg2.add_argument("--json", action="store_true")
+    eg2.set_defaults(func=cmd_billing_entitlements_grant_user)
+
+    er = es.add_parser("revoke", help="Revoke entitlements by setting ends_ts")
+    add_billing_db_opt(er)
+    er.add_argument("user_id", help="User whose entitlements will be revoked (unless --entitlement-id is used).")
+    er.add_argument("--entitlement-id", dest="entitlement_id", default=None, help="Revoke a specific entitlement_id.")
+    er.add_argument("--now", default=None, help="Override current time (ISO).")
+    er.add_argument("--json", action="store_true")
+    er.set_defaults(func=cmd_billing_entitlements_revoke)
 
     el = es.add_parser("list", help="List entitlements")
     add_billing_db_opt(el)
@@ -589,3 +716,8 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     wa.add_argument("--now", default=None)
     wa.add_argument("--json", action="store_true")
     wa.set_defaults(func=cmd_billing_whoami)
+
+
+# Compatibility aliases (mgc.main registrar probing)
+def register(subparsers: argparse._SubParsersAction) -> None:
+    register_billing_subcommand(subparsers)
