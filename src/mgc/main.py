@@ -435,6 +435,174 @@ def cmd_providers_check(args: argparse.Namespace) -> int:
 
     return 0 if out["ok"] else 2
 
+# ----------------------------
+# db migrate/status (run migrations from anywhere)
+# ----------------------------
+
+def _infer_repo_root(repo_root_arg: str | None) -> Path:
+    if repo_root_arg:
+        return Path(repo_root_arg).expanduser().resolve()
+    # src/mgc/main.py -> repo root is two parents up from src/
+    return Path(__file__).resolve().parents[2]
+
+
+def _migrations_dir(repo_root: Path) -> Path:
+    return (repo_root / "scripts" / "migrations").resolve()
+
+
+def _ensure_schema_migrations(con: sqlite3.Connection) -> None:
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version TEXT PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        );
+        """
+    )
+
+
+def _applied_migration_versions(con: sqlite3.Connection) -> set[str]:
+    _ensure_schema_migrations(con)
+    rows = con.execute("SELECT version FROM schema_migrations ORDER BY version ASC").fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def _read_sql(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _migration_now_iso(args_now: str | None) -> str:
+    if args_now:
+        s = args_now.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return _utc_now_iso()
+
+
+def cmd_db_migrate(args: argparse.Namespace) -> int:
+    repo_root = _infer_repo_root(getattr(args, "repo_root", None))
+    db_path = Path(args.db).expanduser().resolve()
+    mig_dir = Path(args.migrations_dir).expanduser().resolve() if args.migrations_dir else _migrations_dir(repo_root)
+
+    if not db_path.exists():
+        die(f"DB not found: {db_path}")
+    if not mig_dir.exists() or not mig_dir.is_dir():
+        die(f"migrations dir missing: {mig_dir}")
+
+    sql_files = sorted([p for p in mig_dir.glob("*.sql") if p.is_file()])
+
+    applied_count = 0
+    applied: list[str] = []
+    skipped: list[str] = []
+
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON;")
+        _ensure_schema_migrations(con)
+        already = _applied_migration_versions(con)
+
+        now_ts = _migration_now_iso(getattr(args, "now", None))
+
+        con.execute("BEGIN;")
+        try:
+            for f in sql_files:
+                version = f.name
+                if version in already:
+                    skipped.append(version)
+                    continue
+
+                sql = _read_sql(f).strip()
+                if sql:
+                    con.executescript(sql)
+
+                con.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    (version, now_ts),
+                )
+                applied.append(version)
+                applied_count += 1
+
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+
+    finally:
+        con.close()
+
+    out = {
+        "ok": True,
+        "cmd": "db.migrate",
+        "db": str(db_path),
+        "migrations_dir": str(mig_dir),
+        "applied_count": applied_count,
+        "applied": applied,
+        "skipped_count": len(skipped),
+    }
+
+    if getattr(args, "json", False):
+        print(stable_dumps(out))
+    else:
+        print(f"OK: applied {applied_count} migrations to {db_path}")
+    return 0
+
+
+def cmd_db_status(args: argparse.Namespace) -> int:
+    repo_root = _infer_repo_root(getattr(args, "repo_root", None))
+    db_path = Path(args.db).expanduser().resolve()
+    mig_dir = Path(args.migrations_dir).expanduser().resolve() if args.migrations_dir else _migrations_dir(repo_root)
+
+    if not db_path.exists():
+        die(f"DB not found: {db_path}")
+
+    expected = sorted([p.name for p in mig_dir.glob("*.sql")]) if mig_dir.exists() else []
+
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.row_factory = sqlite3.Row
+        _ensure_schema_migrations(con)
+        rows = con.execute("SELECT version, applied_at FROM schema_migrations ORDER BY version ASC").fetchall()
+        applied_versions = [str(r["version"]) for r in rows]
+        applied_set = set(applied_versions)
+
+        missing = [v for v in expected if v not in applied_set]
+
+        billing_tables = {
+            "billing_users": _table_exists(con, "billing_users"),
+            "billing_tokens": _table_exists(con, "billing_tokens"),
+            "billing_entitlements": _table_exists(con, "billing_entitlements"),
+        }
+
+    finally:
+        con.close()
+
+    out = {
+        "ok": True,
+        "cmd": "db.status",
+        "db": str(db_path),
+        "migrations_dir": str(mig_dir),
+        "expected_count": len(expected),
+        "applied_count": len(applied_versions),
+        "applied": rows and [{"version": str(r["version"]), "applied_at": str(r["applied_at"])} for r in rows] or [],
+        "missing": missing,
+        "billing_tables": billing_tables,
+    }
+
+    if getattr(args, "json", False):
+        print(stable_dumps(out))
+    else:
+        print(f"DB: {db_path}")
+        print(f"migrations_dir: {mig_dir}")
+        print(f"expected: {len(expected)}  applied: {len(applied_versions)}  missing: {len(missing)}")
+        if missing:
+            for m in missing:
+                print(f"  missing: {m}")
+        for k, v in billing_tables.items():
+            print(f"{k}: {'YES' if v else 'NO'}")
+    return 0
 
 # ----------------------------
 # DB helpers
@@ -696,6 +864,23 @@ def _build_playlist_json_for_row(conn: sqlite3.Connection, d: Dict[str, Any]) ->
         return blob
 
     return _reconstruct_playlist_json(conn, d)
+
+def _safe_get_account(conn, account_id: str) -> Optional[sqlite3.Row]:
+    if not _table_exists(conn, "billing_accounts"):
+        return None
+    return conn.execute(
+        "SELECT * FROM billing_accounts WHERE id = ? LIMIT 1",
+        (account_id,)
+    ).fetchone()
+
+def _safe_has_entitlement(conn, account_id: str, entitlement: str) -> bool:
+    if not _table_exists(conn, "billing_entitlements"):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM billing_entitlements WHERE account_id = ? AND entitlement = ?",
+        (account_id, entitlement)
+    ).fetchone()
+    return row is not None
 
 
 # ----------------------------
@@ -1456,6 +1641,19 @@ def build_parser() -> argparse.ArgumentParser:
     prov_check = provs.add_parser("check", help="Validate env for selected provider (MGC_PROVIDER)")
     prov_check.set_defaults(func=cmd_providers_check)
 
+    # db
+    dbp = sub.add_parser("db", help="Database tools (migrations)")
+    dbs = dbp.add_subparsers(dest="db_cmd", required=True)
+
+    dbm = dbs.add_parser("migrate", help="Apply SQL migrations (scripts/migrations)")
+    dbm.add_argument("--migrations-dir", default=None, help="Override migrations dir (default: <repo-root>/scripts/migrations)")
+    dbm.add_argument("--now", default=None, help="Override applied_at timestamp (ISO; supports Z)")
+    dbm.set_defaults(func=cmd_db_migrate)
+
+    dbs_ = dbs.add_parser("status", help="Show applied migrations and billing table presence")
+    dbs_.add_argument("--migrations-dir", default=None, help="Override migrations dir (default: <repo-root>/scripts/migrations)")
+    dbs_.set_defaults(func=cmd_db_status)
+
     rebuild = sub.add_parser("rebuild", help="Rebuild derived artifacts deterministically (CI)")
     rs = rebuild.add_subparsers(dest="rebuild_cmd", required=True)
 
@@ -1605,6 +1803,14 @@ def build_parser() -> argparse.ArgumentParser:
     except Exception as e:
         raise SystemExit(f"[mgc.main] ERROR: failed to import mgc.run_cli: {e}") from e
     _register_run_subcommand(sub)
+
+    # Optional: billing (only if billing_cli is present)
+    try:
+        from mgc.billing_cli import register_billing_subcommand  # type: ignore
+    except Exception:
+        register_billing_subcommand = None  # type: ignore
+    if register_billing_subcommand:
+        register_billing_subcommand(sub)
 
     return p
 
