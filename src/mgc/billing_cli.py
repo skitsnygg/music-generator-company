@@ -361,12 +361,6 @@ def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_entitlements_grant_user(args: argparse.Namespace) -> int:
-    """
-    Convenience: grant without forcing the caller to supply entitlement_id.
-
-    Usage:
-      mgc billing entitlements grant-user <user_id> <tier> [--source manual] [--starts-ts ...] [--ends-ts ...]
-    """
     db = DB(_resolve_db_path(args))
     starts_ts = args.starts_ts or utc_now_iso()
 
@@ -409,14 +403,6 @@ def cmd_billing_entitlements_grant_user(args: argparse.Namespace) -> int:
 
 
 def cmd_billing_entitlements_revoke(args: argparse.Namespace) -> int:
-    """
-    Revoke entitlements by setting ends_ts.
-
-    Default behavior:
-      - If --entitlement-id is provided: revoke that exact row.
-      - Else: revoke ALL active entitlements for user_id (ends_ts is NULL OR ends_ts > now),
-              by setting ends_ts = now.
-    """
     db = DB(_resolve_db_path(args))
     now_dt = parse_now(args.now)
     now_ts = now_dt.isoformat(timespec="seconds")
@@ -463,6 +449,39 @@ def cmd_billing_entitlements_revoke(args: argparse.Namespace) -> int:
             print(f"OK revoked={revoked} entitlement_id={args.entitlement_id}")
         else:
             print(f"OK revoked={revoked} user_id={args.user_id}")
+    return 0
+
+
+def cmd_billing_entitlements_active(args: argparse.Namespace) -> int:
+    db = DB(_resolve_db_path(args))
+    now_dt = parse_now(args.now)
+    now_ts = now_dt.isoformat(timespec="seconds")
+
+    with db.connect() as con:
+        _require_tables(con)
+        ent = _entitlement_active_row(con, user_id=args.user_id, now_ts=now_ts)
+
+    tier = str(ent["tier"]) if ent is not None else "free"
+    ent_d = dict(ent) if ent is not None else None
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "cmd": "billing.entitlements.active",
+        "user_id": args.user_id,
+        "now": now_ts,
+        "tier": tier,
+        "active_entitlement": ent_d,
+    }
+    if args.json:
+        print(stable_json(out), end="")
+    else:
+        if ent_d is None:
+            print(f"OK user_id={args.user_id} tier=free active_entitlement=")
+        else:
+            print(
+                f"OK user_id={args.user_id} tier={tier} entitlement_id={ent_d.get('entitlement_id')} "
+                f"starts={ent_d.get('starts_ts')} ends={(ent_d.get('ends_ts') or '')} source={ent_d.get('source')}"
+            )
     return 0
 
 
@@ -695,6 +714,13 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     er.add_argument("--json", action="store_true")
     er.set_defaults(func=cmd_billing_entitlements_revoke)
 
+    ea = es.add_parser("active", help="Show active entitlement for a user")
+    add_billing_db_opt(ea)
+    ea.add_argument("user_id")
+    ea.add_argument("--now", default=None, help="Override current time (ISO).")
+    ea.add_argument("--json", action="store_true")
+    ea.set_defaults(func=cmd_billing_entitlements_active)
+
     el = es.add_parser("list", help="List entitlements")
     add_billing_db_opt(el)
     el.add_argument("--user-id", dest="user_id", default=None)
@@ -718,6 +744,5 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     wa.set_defaults(func=cmd_billing_whoami)
 
 
-# Compatibility aliases (mgc.main registrar probing)
 def register(subparsers: argparse._SubParsersAction) -> None:
     register_billing_subcommand(subparsers)
