@@ -1,24 +1,70 @@
 from __future__ import annotations
 
 import abc
+import hashlib
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 
 class ProviderError(RuntimeError):
-    pass
+    """Raised when a provider cannot be constructed or fails generation."""
+
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+@dataclass(frozen=True)
+class GenerateRequest:
+    """Normalized request passed to providers."""
+
+    # Required-ish fields used across the codebase
+    track_id: str
+    context: str
+    seed: int
+
+    # Optional metadata (present in some call paths)
+    run_id: Optional[str] = None
+    prompt: str = ""
+    deterministic: bool = False
+    ts: str = ""  # ISO timestamp string
+    schedule: str = ""  # e.g. daily/weekly
+    period_key: str = ""  # deterministic period label
+
+    # Output location hint (some providers want to know intended path)
+    out_rel: str = ""  # absolute or repo-relative path string
+    out_dir: str = ""  # work/output dir (not repo storage)
+
+
+@dataclass(frozen=True)
+class GenerateResult:
+    """Normalized provider output.
+
+    Providers should return bytes. The pipeline will decide where to write them.
+    """
+
+    provider: str
+    artifact_bytes: bytes
+
+    # File naming hints
+    ext: str = ""  # include leading dot, e.g. .wav
+    mime: str = ""  # e.g. audio/wav
+
+    # Provider-specific metadata (must be JSON-serializable)
+    meta: Optional[Dict[str, Any]] = None
+
+    @property
+    def sha256(self) -> str:
+        return sha256_bytes(self.artifact_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Legacy contract (kept for back-compat with older code paths)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class TrackArtifact:
-    """
-    Contract returned by providers.
-
-    - artifact_path must be a real file on disk (wav/mp3/etc).
-    - sha256 must be computed over artifact_path bytes.
-    - meta is provider-specific extras (JSON-serializable).
-    """
     track_id: str
     artifact_path: str
     sha256: str
@@ -32,25 +78,10 @@ class TrackArtifact:
 
 
 class Provider(abc.ABC):
-    """
-    Providers generate or fetch audio for a given context.
+    """Preferred provider interface."""
 
-    Determinism:
-    - If deterministic=True, provider MUST produce the same bytes for same inputs.
-    """
     name: str
 
     @abc.abstractmethod
-    def generate(
-        self,
-        *,
-        out_dir: Path,
-        track_id: str,
-        context: str,
-        seed: int,
-        deterministic: bool,
-        now_iso: str,
-        schedule: str,
-        period_key: str,
-    ) -> TrackArtifact:
+    def generate(self, req: GenerateRequest) -> GenerateResult:
         raise NotImplementedError

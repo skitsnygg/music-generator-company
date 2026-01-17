@@ -1749,6 +1749,14 @@ def build_parser() -> argparse.ArgumentParser:
     mrl.add_argument("--limit", type=int, default=20, help="Number of receipts to show (newest last)")
     mrl.set_defaults(func=cmd_marketing_receipts_list)
 
+    # Optional: agents (only if agents_cli is present)
+    try:
+        from mgc.agents_cli import register_agents_subcommand  # type: ignore
+    except Exception:
+        register_agents_subcommand = None  # type: ignore
+    if register_agents_subcommand:
+        register_agents_subcommand(sub)
+
     try:
         from mgc.drops_cli import register_drops_subcommand  # type: ignore
     except Exception:

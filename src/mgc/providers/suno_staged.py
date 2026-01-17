@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from mgc.providers.base import GenerateRequest, GenerateResult
+from typing import Any
+
+from .base import GenerateRequest, GenerateResult, ProviderError
 
 
 class SunoProvider:
     name = "suno"
 
-    def generate(self, req: GenerateRequest) -> GenerateResult:
-        raise RuntimeError("Suno provider is staged but not configured (no API key). Use stub or riffusion.")
+    def generate(self, req: GenerateRequest | None = None, **kwargs: Any) -> GenerateResult:
+        raise ProviderError(
+            "Suno provider is staged but not configured. "
+            "Wire an API client + key later. "
+            "Use MGC_PROVIDER=stub or MGC_PROVIDER=filesystem (or riffusion if available)."
+        )

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from mgc.providers.base import GenerateRequest, GenerateResult
+from typing import Any
+
+from .base import GenerateRequest, GenerateResult, ProviderError
 
 
 class DiffSingerProvider:
     name = "diffsinger"
 
-    def generate(self, req: GenerateRequest) -> GenerateResult:
-        raise RuntimeError("DiffSinger provider is staged but not configured. Wire a local runner later.")
+    def generate(self, req: GenerateRequest | None = None, **kwargs: Any) -> GenerateResult:
+        raise ProviderError(
+            "DiffSinger provider is staged but not configured yet. "
+            "Use MGC_PROVIDER=stub or MGC_PROVIDER=filesystem (or riffusion if you have a server running)."
+        )

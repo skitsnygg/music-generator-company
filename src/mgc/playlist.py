@@ -517,3 +517,42 @@ def build_playlist(
         }
     finally:
         conn.close()
+
+# Thin wrappers used by run_cli (daily/weekly)
+
+def build_daily_playlist(
+    *,
+    db_path: Path,
+    context: str,
+    period_key: str | None = None,
+    base_seed: int = 1,
+    target_minutes: int | None = 5,
+    lookback_playlists: int | None = 7,
+) -> Dict[str, Any]:
+    return build_playlist(
+        db_path=db_path,
+        context=context,
+        period_key=period_key,
+        base_seed=base_seed,
+        target_minutes=target_minutes,
+        lookback_playlists=lookback_playlists,
+    )
+
+
+def build_weekly_playlist(
+    *,
+    db_path: Path,
+    context: str,
+    period_key: str | None = None,
+    base_seed: int = 1,
+    target_minutes: int | None = 20,
+    lookback_playlists: int | None = 3,
+) -> Dict[str, Any]:
+    return build_playlist(
+        db_path=db_path,
+        context=context,
+        period_key=period_key,
+        base_seed=base_seed,
+        target_minutes=target_minutes,
+        lookback_playlists=lookback_playlists,
+    )

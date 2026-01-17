@@ -1,65 +1,50 @@
-#!/usr/bin/env python3
-"""
-src/mgc/providers/external_dummy.py
-
-Placeholder for real external generators (Suno, Diff-Singer, Riffusion).
-
-For now:
-- Deterministically copies a fixture WAV
-- Keeps CI + determinism intact
-"""
-
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any, Dict
 
+from .base import GenerateRequest, GenerateResult, ProviderError, sha256_bytes
+
 
 class ExternalDummyProvider:
+    """Placeholder external provider.
+
+    Uses a deterministic fixture WAV to keep the pipeline real in CI/dev.
+    """
+
     name = "external_dummy"
 
-    def generate(
-        self,
-        *,
-        out_dir: str | Path,
-        track_id: str,
-        context: str,
-        seed: int,
-        deterministic: bool,
-        now_iso: str,
-        schedule: str,
-        period_key: str,
-    ) -> Dict[str, Any]:
-        out_dir = Path(out_dir)
-        tracks_dir = out_dir / "tracks"
-        tracks_dir.mkdir(parents=True, exist_ok=True)
+    def generate(self, req: GenerateRequest | None = None, **kwargs: Any) -> GenerateResult:
+        if req is None:
+            req = GenerateRequest(
+                track_id=str(kwargs.get("track_id") or "track"),
+                context=str(kwargs.get("context") or "focus"),
+                seed=int(kwargs.get("seed") or 1),
+                deterministic=bool(kwargs.get("deterministic") or False),
+                schedule=str(kwargs.get("schedule") or ""),
+                period_key=str(kwargs.get("period_key") or ""),
+                out_dir=str(kwargs.get("out_dir") or ""),
+                out_rel=str(kwargs.get("out_rel") or ""),
+                run_id=kwargs.get("run_id"),
+                prompt=str(kwargs.get("prompt") or ""),
+                ts=str(kwargs.get("ts") or kwargs.get("now_iso") or ""),
+            )
 
-        wav_path = tracks_dir / f"{track_id}.wav"
-
-        # Deterministic fixture selection
         fixture_dir = Path(__file__).parent / "fixtures"
         fixture = fixture_dir / "external_dummy.wav"
         if not fixture.exists():
-            raise RuntimeError("missing external_dummy.wav fixture")
+            raise ProviderError("missing fixtures/external_dummy.wav")
 
-        data = fixture.read_bytes()
-        wav_path.write_bytes(data)
+        b = fixture.read_bytes()
 
-        sha = hashlib.sha256(data).hexdigest()
-
-        return {
-            "artifact_path": str(wav_path),
-            "track_id": track_id,
-            "provider": self.name,
-            "sha256": sha,
-            "meta": {
-                "context": context,
-                "schedule": schedule,
-                "period_key": period_key,
-                "external": True,
-            },
+        meta: Dict[str, Any] = {
+            "context": req.context,
+            "schedule": req.schedule,
+            "period_key": req.period_key,
+            "external": True,
+            "bytes": len(b),
+            "sha256": sha256_bytes(b),
             "genre": "stub",
-            "mood": context,
-            "title": f"{context.title()} Track (External)",
         }
+
+        return GenerateResult(provider=self.name, artifact_bytes=b, ext=".wav", mime="audio/wav", meta=meta)

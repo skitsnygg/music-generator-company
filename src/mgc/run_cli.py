@@ -48,7 +48,7 @@ class GenerateRequest:
     ts: str
     out_rel: str
 
-from mgc.playlist import build_playlist
+from mgc.playlist import build_daily_playlist, build_weekly_playlist
 
 @contextlib.contextmanager
 def _silence_stdout(enabled: bool = True):
@@ -1723,6 +1723,8 @@ def _stub_daily_run(
             "repo_artifact": _posix(artifact_rel),
             "bundle_track": _posix(bundled_track_rel),
             "playlist": _posix(playlist_rel),
+            "manifest": "manifest.json",
+            "manifest_sha256": manifest_sha256,
         },
         "sha256": {
             "repo_artifact": repo_artifact_sha256,
@@ -1782,91 +1784,162 @@ def _stub_daily_run(
     return evidence
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
+    """Build a daily drop bundle from the library DB using the deterministic playlist builder.
+
+    Outputs (under out_dir):
+      - drop_bundle/playlist.json
+      - drop_bundle/daily_evidence.json
+      - drop_bundle/tracks/<track_id>.<ext>   (copied from library; lead track only)
+      - evidence/daily_evidence.json          (lead track; marketing contract)
+      - drop_evidence.json                    (summary)
+
+    Notes:
+      - This is a selection + bundling step (no audio generation).
+      - Evidence uses relative paths (no absolute out_dir leakage) for determinism.
+    """
     deterministic = is_deterministic(args)
+    json_mode = bool(getattr(args, "json", False))
 
     db_path = resolve_db_path(args)
     context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
-    seed = str(getattr(args, "seed", None) if getattr(args, "seed", None) is not None else (os.environ.get("MGC_SEED") or "1"))
-    provider_set_version = str(os.environ.get("MGC_PROVIDER_SET_VERSION") or "v1")
 
-    ts = deterministic_now_iso(deterministic)
-    run_date = ts.split("T", 1)[0]
+    seed_val = getattr(args, "seed", None)
+    seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
 
-    out_dir = Path(getattr(args, "out_dir", None) or "data/evidence").resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
+    bundle_dir = out_dir / "drop_bundle"
+    bundle_tracks_dir = bundle_dir / "tracks"
+    evidence_dir = out_dir / "evidence"
 
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
+    bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    run_id = db_get_or_create_run_id(
-        con,
-        run_key=RunKey(run_date=run_date, context=context, seed=seed, provider_set_version=provider_set_version),
-        ts=ts,
-        argv=list(sys.argv),
-    )
+    now_iso = deterministic_now_iso(deterministic)
+    run_date = now_iso.split("T", 1)[0] if "T" in now_iso else now_iso
+    period_key = run_date
 
-    maybe = _maybe_call_external_daily_runner(
-        db_path=db_path,
+    # Playlist builder knobs
+    target_minutes = getattr(args, "target_minutes", None)
+    if target_minutes is None:
+        target_minutes = int(os.environ.get("MGC_DAILY_TARGET_MINUTES") or "5")
+
+    lookback_playlists = getattr(args, "lookback_playlists", None)
+    if lookback_playlists is None:
+        lookback_playlists = int(os.environ.get("MGC_DAILY_LOOKBACK_PLAYLISTS") or "7")
+
+    pl = build_daily_playlist(
+        db_path=Path(db_path),
         context=context,
-        seed=seed,
-        deterministic=deterministic,
-        ts=ts,
+        period_key=period_key,
+        base_seed=int(seed),
+        target_minutes=int(target_minutes),
+        lookback_playlists=int(lookback_playlists),
     )
-    if maybe is not None:
-        external_run_id = str(maybe.get("run_id") or "")
-        drop_id = str(maybe.get("drop_id") or stable_uuid5("drop", run_id))
-        track_id = str(maybe.get("track_id") or maybe.get("track", {}).get("id") or "")
 
-        db_insert_drop(
-            con,
-            drop_id=drop_id,
-            ts=ts,
-            context=context,
-            seed=seed,
-            run_id=run_id,
-            track_id=track_id if track_id else None,
-            meta={
-                "run_id": run_id,
-                "external_run_id": external_run_id,
-                "drop_id": drop_id,
-                "track_id": track_id,
-                "deterministic": deterministic,
-                "seed": seed,
-                "context": context,
-                "external_runner": True,
-            },
-        )
-        db_insert_event(
-            con,
-            event_id=stable_uuid5("event", "daily.external_runner", run_id),
-            ts=ts,
-            kind="daily.external_runner",
-            actor="system",
-            meta={
-                "run_id": run_id,
-                "external_run_id": external_run_id,
-                "drop_id": drop_id,
-                "module": "external",
-                "deterministic": deterministic,
-            },
-        )
-        out = dict(maybe)
-        out.setdefault("run_id", run_id)
-        out.setdefault("run_date", run_date)
-        out.setdefault("provider_set_version", provider_set_version)
-        sys.stdout.write(stable_json_dumps(out) + "\n")
-        return 0
+    items = pl.get("items") if isinstance(pl, dict) else None
+    if not items:
+        raise SystemExit("daily playlist builder produced no items")
 
-    evidence = _stub_daily_run(
-        con=con,
-        context=context,
-        seed=seed,
-        deterministic=deterministic,
-        ts=ts,
-        out_dir=out_dir,
-        run_id=run_id,
-    )
-    sys.stdout.write(stable_json_dumps(evidence) + "\n")
+    # Copy ONLY the lead track into bundle (daily contract is one track)
+    lead = dict(items[0])
+    lead_track_id = str(lead.get("track_id") or "")
+    full_path = lead.get("full_path") or lead.get("artifact_path")
+    if not lead_track_id or not full_path:
+        raise SystemExit("daily playlist lead item missing track_id/full_path")
+
+    src_path = Path(str(full_path))
+    if not src_path.is_absolute():
+        src_path = Path(getattr(args, "repo_root", ".")).expanduser().resolve() / src_path
+
+    if not src_path.exists():
+        raise SystemExit(f"[run.daily] missing source track file: {src_path}")
+
+    dst = bundle_tracks_dir / f"{lead_track_id}{src_path.suffix or '.wav'}"
+    shutil.copy2(src_path, dst)
+
+    copied = [{"track_id": lead_track_id, "path": f"tracks/{dst.name}"}]
+
+    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    if deterministic:
+        drop_id = stable_uuid5(f"drop:daily:{period_key}:{context}:{seed}", namespace=ns)
+        playlist_id = stable_uuid5(f"playlist:daily:{period_key}:{context}:{seed}", namespace=ns)
+        run_id = stable_uuid5(f"run:daily:{period_key}:{context}:{seed}", namespace=ns)
+    else:
+        drop_id = str(uuid.uuid4())
+        playlist_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+
+    playlist_obj = {
+        "schema": "mgc.playlist.v1",
+        "version": 1,
+        "schedule": "daily",
+        "ts": now_iso,
+        "playlist_id": str(playlist_id),
+        "context": context,
+        "period": {"label": period_key},
+        "tracks": copied,
+    }
+    (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    lead_rel_path = copied[0]["path"]
+    daily_ev = {
+        "schema": "mgc.daily_evidence.v1",
+        "version": 1,
+        "run_id": str(run_id),
+        "stage": "daily",
+        "context": context,
+        "deterministic": bool(deterministic),
+        "ts": now_iso,
+        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "filesystem"),
+        "schedule": "daily",
+        "track": {"track_id": lead_track_id, "path": lead_rel_path},
+        "sha256": {
+            "playlist": sha256_file(bundle_dir / "playlist.json"),
+            "track": sha256_file(bundle_dir / lead_rel_path),
+        },
+        "period": {"label": period_key},
+    }
+
+    (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (bundle_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+    # Compute deterministic repo manifest alongside playlist (helps CI provenance)
+    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+    include = getattr(args, "include", None) or None
+    exclude_dirs = getattr(args, "exclude_dir", None) or None
+    exclude_globs = getattr(args, "exclude_glob", None) or None
+
+    manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
+    manifest_path = out_dir / "manifest.json"
+    manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
+    manifest_sha256 = sha256_file(manifest_path)
+
+    drop_evidence = {
+        "ok": True,
+        "schedule": "daily",
+        "context": context,
+        "period_key": period_key,
+        "drop_id": str(drop_id),
+        "lead_track_id": lead_track_id,
+        "playlist_tracks": 1,
+        "paths": {
+            "bundle_dir": "drop_bundle",
+            "bundle_playlist": "drop_bundle/playlist.json",
+            "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
+            "daily_evidence": "evidence/daily_evidence.json",
+            "drop_evidence": "drop_evidence.json",
+            "manifest": "manifest.json",
+            "manifest_sha256": manifest_sha256,
+        },
+    }
+    (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if json_mode:
+        sys.stdout.write(stable_json_dumps(drop_evidence) + "\n")
+    else:
+        print(f"[run.daily] ok date={period_key} out_dir={out_dir}", file=sys.stderr)
+
     return 0
 
 
@@ -2349,6 +2422,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "stages": {"allow_resume": bool(allow_resume)},
             "paths": {
                 "manifest_path": str(manifest_path),
+                "manifest": "manifest.json",
                 "manifest_sha256": manifest_sha256,
             },
             "note": "dry_run=true; generator not executed",
@@ -2389,6 +2463,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "stages": {"allow_resume": bool(allow_resume)},
             "paths": {
                 "manifest_path": str(manifest_path),
+                "manifest": "manifest.json",
                 "manifest_sha256": manifest_sha256,
             },
             "daily": daily,
@@ -2610,6 +2685,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         "paths": {
             "evidence_path": str(evidence_path),
             "manifest_path": str(manifest_path),
+            "manifest": "manifest.json",
             "manifest_sha256": manifest_sha256,
         },
     }
@@ -2886,6 +2962,8 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
                         "generate_evidence": "evidence/generate_evidence.json",
                         "track": str(final_wav),
                         "meta": str(meta_path),
+                        "manifest": "manifest.json",
+                        "manifest_sha256": manifest_sha256,
                     },
                 }
             )
@@ -2951,7 +3029,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     if lookback_playlists is None:
         lookback_playlists = int(os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3")
 
-    pl = build_playlist(
+    pl = build_weekly_playlist(
         db_path=Path(db_path),
         context=context,
         period_key=period_key,
@@ -3030,6 +3108,18 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     }
     (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (bundle_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Compute deterministic repo manifest alongside playlist (helps CI provenance)
+    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+    include = getattr(args, "include", None) or None
+    exclude_dirs = getattr(args, "exclude_dir", None) or None
+    exclude_globs = getattr(args, "exclude_glob", None) or None
+
+    manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
+    manifest_path = out_dir / "weekly_manifest.json"
+    manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
+    manifest_sha256 = sha256_file(manifest_path)
+
     drop_evidence = {
         "ok": True,
         "schedule": "weekly",
@@ -3041,9 +3131,18 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
+
+            # Weekly runs still emit a lead-track evidence file using the daily schema
+            # (marketing contract). We expose semantically-correct keys while keeping
+            # legacy names for backward compatibility.
+            "bundle_weekly_evidence": "drop_bundle/daily_evidence.json",
+            "weekly_evidence": "evidence/daily_evidence.json",
             "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
             "daily_evidence": "evidence/daily_evidence.json",
+
             "drop_evidence": "drop_evidence.json",
+            "manifest": "weekly_manifest.json",
+            "manifest_sha256": manifest_sha256,
         },
     }
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -3878,6 +3977,8 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "evidence_path": "drop_evidence.json",
             # submission.zip lives outside out_dir and is stable; keep absolute for convenience.
             "submission_zip": str(zip_path),
+            "manifest": "weekly_manifest.json",
+            "manifest_sha256": manifest_sha256,
         },
         "verify": {
             "skipped": verify_skipped,
@@ -4013,6 +4114,13 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
         help="Evidence output directory",
     )
+    daily.add_argument("--repo-root", default=".", help="Repository root to hash for manifest")
+    daily.add_argument("--include", action="append", default=None,
+                      help="Optional glob(s) to include in manifest (repeatable)")
+    daily.add_argument("--exclude-dir", action="append", default=None,
+                      help="Directory name(s) to exclude during manifest (repeatable)")
+    daily.add_argument("--exclude-glob", action="append", default=None,
+                      help="Filename glob(s) to exclude during manifest (repeatable)")
     daily.add_argument(
         "--deterministic",
         action="store_true",
