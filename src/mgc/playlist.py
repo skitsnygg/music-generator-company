@@ -206,6 +206,14 @@ def _fetch_tracks(
         if not tid or not full_path:
             continue
 
+
+        # Skip missing files deterministically (prevents stale DB rows from breaking runs)
+        p = Path(full_path)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if not p.exists():
+            continue
+
         out.append(
             Track(
                 id=tid,
@@ -517,24 +525,30 @@ def build_playlist(
         }
     finally:
         conn.close()
-
-# Thin wrappers used by run_cli (daily/weekly)
+# -----------------------------
+# Thin wrappers for schedules
+# -----------------------------
 
 def build_daily_playlist(
     *,
     db_path: Path,
-    context: str,
-    period_key: str | None = None,
+    context: Optional[str] = None,
+    period_key: Optional[str] = None,
     base_seed: int = 1,
-    target_minutes: int | None = 5,
-    lookback_playlists: int | None = 7,
+    target_minutes: int | None = 20,
+    lookback_playlists: int | None = 3,
 ) -> Dict[str, Any]:
+    """Build a daily playlist (thin wrapper around build_playlist)."""
+    name = "Daily Playlist"
+    slug = f"daily-{context or 'mix'}-{period_key or 'latest'}"
     return build_playlist(
         db_path=db_path,
+        name=name,
+        slug=slug,
         context=context,
-        period_key=period_key,
-        base_seed=base_seed,
         target_minutes=target_minutes,
+        base_seed=base_seed,
+        period_key=period_key,
         lookback_playlists=lookback_playlists,
     )
 
@@ -542,17 +556,22 @@ def build_daily_playlist(
 def build_weekly_playlist(
     *,
     db_path: Path,
-    context: str,
-    period_key: str | None = None,
+    context: Optional[str] = None,
+    period_key: Optional[str] = None,
     base_seed: int = 1,
-    target_minutes: int | None = 20,
+    target_minutes: int | None = 60,
     lookback_playlists: int | None = 3,
 ) -> Dict[str, Any]:
+    """Build a weekly playlist (thin wrapper around build_playlist)."""
+    name = "Weekly Playlist"
+    slug = f"weekly-{context or 'mix'}-{period_key or 'latest'}"
     return build_playlist(
         db_path=db_path,
+        name=name,
+        slug=slug,
         context=context,
-        period_key=period_key,
-        base_seed=base_seed,
         target_minutes=target_minutes,
+        base_seed=base_seed,
+        period_key=period_key,
         lookback_playlists=lookback_playlists,
     )
