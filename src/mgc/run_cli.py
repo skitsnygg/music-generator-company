@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import random
 import io
 import json
 import os
@@ -197,6 +198,67 @@ def stable_json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _relpath_from_out_dir(out_dir: Path, p: str) -> str:
+    """Return POSIX relative path from out_dir to p.
+
+    Guarantees:
+      - Never returns an absolute path.
+      - Never includes system-specific prefixes like /tmp or /private/tmp.
+      - Stable across runs as long as the on-disk layout relative to out_dir is stable.
+
+    Notes:
+      - If p is already relative, we normalize separators to POSIX.
+      - If p looks like a URL, we leave it untouched.
+    """
+    if not isinstance(p, str):
+        return p  # type: ignore[return-value]
+    s = p.strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+
+    # Normalize slashes for the relative-path case.
+    s_norm = s.replace("\\", "/")
+    try:
+        pp = Path(s_norm)
+    except Exception:
+        return s_norm
+
+    if not pp.is_absolute():
+        return pp.as_posix()
+
+    try:
+        rel = Path(os.path.relpath(str(pp), start=str(out_dir)))
+        return rel.as_posix()
+    except Exception:
+        # Fallback: last resort, strip leading slash to avoid absolute leakage.
+        return s_norm.lstrip("/")
+
+
+def _scrub_absolute_paths(obj: object, *, out_dir: Path) -> object:
+    """Recursively convert any absolute path strings to paths relative to out_dir."""
+    if isinstance(obj, dict):
+        return {k: _scrub_absolute_paths(v, out_dir=out_dir) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_absolute_paths(v, out_dir=out_dir) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_absolute_paths(v, out_dir=out_dir) for v in obj)
+    if isinstance(obj, str):
+        # Only transform actual absolute filesystem paths.
+        try:
+            if Path(obj.replace("\\", "/")).is_absolute():
+                return _relpath_from_out_dir(out_dir, obj)
+        except Exception:
+            pass
+        return obj.replace("\\", "/")
+    return obj
+
+
+
+def _posix(p: Path) -> str:
+    """Return a stable POSIX-style relative path string for JSON/evidence."""
+    return p.as_posix()
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -209,6 +271,347 @@ def read_text_bytes(path: Path) -> bytes:
         return s.encode("utf-8")
     except Exception:
         return b
+
+
+
+# ---------------------------------------------------------------------------
+# Agents wiring helpers (music generation + marketing plan)
+# ---------------------------------------------------------------------------
+
+def _normalize_provider_result(res: Any) -> Tuple[bytes, str, str, Dict[str, Any]]:
+    """Accept both legacy dict results and modern GenerateResult-like objects."""
+    if isinstance(res, dict):
+        b = res.get("artifact_bytes")
+        ext = str(res.get("ext") or "wav").lstrip(".")
+        mime = str(res.get("mime") or "")
+        meta = res.get("meta") if isinstance(res.get("meta"), dict) else {}
+        if not isinstance(b, (bytes, bytearray)):
+            raise RuntimeError("provider dict result missing artifact_bytes bytes")
+        return (bytes(b), ext, mime, meta)
+
+    # dataclass?
+    try:
+        from dataclasses import is_dataclass, asdict
+        if is_dataclass(res):
+            d = asdict(res)
+            b = d.get("artifact_bytes") or d.get("audio_bytes") or d.get("bytes")
+            ext = str(d.get("ext") or d.get("extension") or "wav").lstrip(".")
+            mime = str(d.get("mime") or d.get("content_type") or "")
+            meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+            if not isinstance(b, (bytes, bytearray)):
+                raise RuntimeError("provider dataclass result missing artifact_bytes bytes")
+            return (bytes(b), ext, mime, meta)
+    except Exception:
+        pass
+
+    b = getattr(res, "artifact_bytes", None)
+    if b is None:
+        b = getattr(res, "audio_bytes", None)
+    ext = getattr(res, "ext", None) or getattr(res, "extension", None) or "wav"
+    mime = getattr(res, "mime", None) or getattr(res, "content_type", None) or ""
+    meta = getattr(res, "meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    if not isinstance(b, (bytes, bytearray)):
+        raise RuntimeError(f"provider returned unsupported result type: {type(res)}")
+    return (bytes(b), str(ext).lstrip("."), str(mime), meta)
+
+
+def _agents_generate_and_ingest(
+    *,
+    db_path: str,
+    repo_root: Path,
+    context: str,
+    schedule: str,
+    period_key: str,
+    seed: int,
+    deterministic: bool,
+    count: int,
+    provider_name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    now_iso: str,
+) -> List[Dict[str, Any]]:
+    """Generate `count` tracks via provider and ingest into (tracks dir + DB).
+
+    This keeps the run daily/weekly command self-contained: generate -> library -> playlist builder.
+    """
+    if count <= 0:
+        return []
+
+    pname = (provider_name or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    provider = get_provider(pname)
+
+    tracks_dir = (repo_root / "tracks").resolve()
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    generated: List[Dict[str, Any]] = []
+    try:
+        for i in range(int(count)):
+            if deterministic:
+                track_id = stable_uuid5(f"agentgen:{pname}:{context}:{schedule}:{period_key}:seed={seed}:i={i}:prompt={prompt or ''}")
+            else:
+                track_id = str(uuid.uuid4())
+
+            res = provider.generate(
+                track_id=track_id,
+                context=context,
+                seed=int(seed),
+                prompt=prompt,
+                deterministic=bool(deterministic),
+                schedule=schedule,
+                period_key=period_key,
+                ts=now_iso,
+                out_dir=str(repo_root),
+                out_rel=None,
+                run_id=None,
+            )
+            audio_bytes, ext, mime, meta = _normalize_provider_result(res)
+            ext = ext or "wav"
+            filename = f"{track_id}.{ext}"
+            rel_path = Path("tracks") / filename
+            abs_path = tracks_dir / filename
+            abs_path.write_bytes(audio_bytes)
+
+            title = str(meta.get("title") or f"{context} track {track_id[:8]}")
+            genre = str(meta.get("genre") or (pname if pname != "filesystem" else "library"))
+
+            db_insert_track(
+                con,
+                track_id=str(track_id),
+                ts=now_iso,
+                title=title,
+                provider=pname,
+                mood=context,
+                genre=genre,
+                artifact_path=_posix(rel_path),
+                meta={
+                    "context": context,
+                    "schedule": schedule,
+                    "period_key": period_key,
+                    "deterministic": bool(deterministic),
+                    "seed": int(seed),
+                    "prompt": prompt,
+                    **meta,
+                },
+            )
+            generated.append(
+                {
+                    "track_id": str(track_id),
+                    "artifact_path": _posix(rel_path),
+                    "provider": pname,
+                    "ext": ext,
+                    "mime": mime,
+                    "meta": meta,
+                }
+            )
+
+            if deterministic and i == 0 and count > 1:
+                # continue; deterministic supports multiple, but fail-fast on errors only
+                pass
+
+        con.commit()
+        return generated
+    finally:
+        con.close()
+
+
+def _marketing_cover_bytes_png(seed: int, size_px: int = 1024) -> Tuple[Optional[bytes], Optional[str]]:
+    """Try to produce a PNG cover. Returns (png_bytes, error)."""
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+    except Exception as e:
+        return (None, f"Pillow not available: {e}")
+
+    # Deterministic abstract art (no text)
+    rng = random.Random(int(seed))
+    img = Image.new("RGB", (int(size_px), int(size_px)), (250, 245, 235))
+    d = ImageDraw.Draw(img)
+
+    # layered rectangles
+    for _ in range(40):
+        x0 = rng.randint(0, size_px - 1)
+        y0 = rng.randint(0, size_px - 1)
+        x1 = rng.randint(x0 + 1, size_px)
+        y1 = rng.randint(y0 + 1, size_px)
+        col = (rng.randint(10, 240), rng.randint(10, 240), rng.randint(10, 240))
+        d.rectangle([x0, y0, x1, y1], fill=col)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return (buf.getvalue(), None)
+
+
+def _marketing_cover_svg(seed: int, size_px: int = 1024) -> str:
+    rng = random.Random(int(seed))
+    bg = f"#{rng.randint(0, 0xFFFFFF):06x}"
+    rects = []
+    for _ in range(30):
+        x = rng.randint(0, size_px - 1)
+        y = rng.randint(0, size_px - 1)
+        w = rng.randint(20, size_px // 2)
+        h = rng.randint(20, size_px // 2)
+        col = f"#{rng.randint(0, 0xFFFFFF):06x}"
+        op = rng.random() * 0.6 + 0.2
+        rects.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{col}" fill-opacity="{op:.3f}" />')
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size_px}" height="{size_px}" viewBox="0 0 {size_px} {size_px}">'
+        f'<rect width="{size_px}" height="{size_px}" fill="{bg}" />'
+        + "".join(rects)
+        + "</svg>"
+    )
+
+
+def _marketing_teaser_wav(
+    *,
+    lead_audio: Path,
+    out_path: Path,
+    teaser_seconds: int,
+) -> Tuple[bool, str]:
+    """Write teaser wav if possible. Returns (written, reason_if_skipped)."""
+    if lead_audio.suffix.lower() != ".wav" or not lead_audio.exists():
+        return (False, "lead track is not a .wav or does not exist")
+
+    try:
+        with wave.open(str(lead_audio), "rb") as r:
+            nch = r.getnchannels()
+            sw = r.getsampwidth()
+            fr = r.getframerate()
+            nframes = r.getnframes()
+            max_frames = min(nframes, int(fr * int(teaser_seconds)))
+            frames = r.readframes(max_frames)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(out_path), "wb") as w:
+            w.setnchannels(nch)
+            w.setsampwidth(sw)
+            w.setframerate(fr)
+            w.writeframes(frames)
+
+        return (True, "")
+    except Exception as e:
+        return (False, f"teaser failed: {e}")
+
+
+def _agents_marketing_plan(
+    *,
+    drop_dir: Path,
+    repo_root: Path,
+    out_dir: Path,
+    seed: int,
+    teaser_seconds: int,
+    ts: str,
+) -> Dict[str, Any]:
+    """Generate a deterministic marketing plan for a drop bundle.
+
+    Determinism + portability requirements:
+      - All paths serialized in the returned object and marketing_plan.json MUST be
+        relative to out_dir.
+      - Never serialize absolute paths (no /tmp, no /private/tmp, etc.).
+    """
+    drop_dir = drop_dir.expanduser().resolve()
+    out_dir = out_dir.expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    playlist_path = drop_dir / "playlist.json"
+    if not playlist_path.exists():
+        raise SystemExit(f"[agents.marketing.plan] missing playlist.json under {drop_dir}")
+
+    pl = json.loads(playlist_path.read_text(encoding="utf-8"))
+    tracks = pl.get("tracks") or []
+    if not tracks:
+        raise SystemExit("[agents.marketing.plan] playlist has no tracks")
+
+    lead_track_id = str(tracks[0].get("track_id") or "")
+    if not lead_track_id:
+        raise SystemExit("[agents.marketing.plan] lead track missing track_id")
+
+    # Try locate lead audio in repo (best) then in bundle
+    lead_audio_repo = (repo_root.expanduser().resolve() / "tracks" / f"{lead_track_id}.wav").resolve()
+    lead_audio_bundle = (drop_dir / "tracks" / f"{lead_track_id}.wav").resolve()
+    lead_audio = lead_audio_repo if lead_audio_repo.exists() else lead_audio_bundle
+
+    receipts = out_dir / "receipts.jsonl"
+    plan_path = out_dir / "marketing_plan.json"
+
+    # teaser
+    teaser_path = out_dir / "teaser.wav"
+    wrote, reason = _marketing_teaser_wav(lead_audio=lead_audio, out_path=teaser_path, teaser_seconds=int(teaser_seconds))
+
+    # cover
+    cover_path_png = out_dir / "cover.png"
+    png_bytes, png_err = _marketing_cover_bytes_png(int(seed), 1024)
+    cover_path: Path
+    cover_obj: Dict[str, Any]
+    if png_bytes is not None:
+        cover_path_png.write_bytes(png_bytes)
+        cover_path = cover_path_png
+        cover_obj = {"dst": _relpath_from_out_dir(out_dir, str(cover_path)), "size_px": 1024}
+    else:
+        cover_path_svg = out_dir / "cover.svg"
+        cover_path_svg.write_text(_marketing_cover_svg(int(seed), 1024), encoding="utf-8")
+        cover_path = cover_path_svg
+        cover_obj = {
+            "dst": _relpath_from_out_dir(out_dir, str(cover_path)),
+            "size_px": 1024,
+            "note": png_err or "svg_fallback",
+        }
+
+    # posts (simple deterministic copy)
+    context = str(pl.get("context") or "focus")
+    schedule = str(pl.get("schedule") or "daily")
+    period = (pl.get("period") or {}).get("label") or ""
+    base = f"{context} | {schedule} | {period}".strip(" |")
+    posts_text = [
+        f"New {context} drop is live. {base}. Listen now.",
+        f"{context.capitalize()} session soundtrack: fresh release for {base}.",
+        f"Today’s {context} pick: {lead_track_id}. {base}.",
+    ]
+    post_paths: List[str] = []
+    for idx, txt in enumerate(posts_text, start=1):
+        p = out_dir / f"post_{idx}.txt"
+        p.write_text(txt + "\n", encoding="utf-8")
+        post_paths.append(_relpath_from_out_dir(out_dir, str(p)))
+
+    out_obj: Dict[str, Any] = {
+        "ok": True,
+        "cmd": "agents.marketing.plan",
+        "ts": ts,
+        "seed": int(seed),
+        "drop_dir": _relpath_from_out_dir(out_dir, str(drop_dir)),
+        "lead_track_id": lead_track_id,
+        "cover": cover_obj,
+        "teaser": {
+            "lead_audio": _relpath_from_out_dir(out_dir, str(lead_audio)),
+            "seconds": int(teaser_seconds),
+            "skipped": (not wrote),
+            "reason": reason if not wrote else "",
+        },
+        "paths": {
+            "out_dir": ".",
+            "playlist": _relpath_from_out_dir(out_dir, str(playlist_path)),
+            "lead_audio": _relpath_from_out_dir(out_dir, str(lead_audio)),
+            "cover": _relpath_from_out_dir(out_dir, str(cover_path)),
+            "teaser": _relpath_from_out_dir(out_dir, str(teaser_path)),
+            "posts": post_paths,
+            "receipts": _relpath_from_out_dir(out_dir, str(receipts)),
+            "plan": _relpath_from_out_dir(out_dir, str(plan_path)),
+        },
+    }
+
+    # Final safety: scrub any remaining absolute paths anywhere in the object.
+    out_obj = _scrub_absolute_paths(out_obj, out_dir=out_dir)
+
+    # receipts + plan file
+    with receipts.open("a", encoding="utf-8") as f:
+        f.write(stable_json_dumps(out_obj) + "\n")
+    plan_path.write_text(json.dumps(out_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    return out_obj
+
+
 
 
 def _parse_iso_utc(s: str, *, fallback: str = "2020-01-01T00:00:00+00:00") -> datetime:
@@ -1357,7 +1760,9 @@ def compute_manifest(
     entries.sort(key=lambda e: e.path)
     manifest_obj = {
         "version": 1,
-        "root": str(repo_root.resolve()),
+        # Determinism + portability: never serialize absolute paths.
+        # All paths in JSON must be relative to the output directory.
+        "root": ".",
         "entries": [{"path": e.path, "sha256": e.sha256, "size": e.size} for e in entries],
     }
     root_hash_payload = [{"path": e.path, "sha256": e.sha256, "size": e.size} for e in entries]
@@ -1818,6 +2223,26 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     run_date = now_iso.split("T", 1)[0] if "T" in now_iso else now_iso
     period_key = run_date
 
+
+    # Optional: generate new tracks into the library before selecting today's playlist
+    gen_count = int(getattr(args, "generate_count", 0) or 0)
+    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
+    gen_prompt = getattr(args, "prompt", None) or None
+    if gen_count > 0:
+        _agents_generate_and_ingest(
+            db_path=db_path,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            context=context,
+            schedule="daily",
+            period_key=period_key,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            count=int(gen_count),
+            provider_name=str(gen_provider) if gen_provider else None,
+            prompt=str(gen_prompt) if gen_prompt else None,
+            now_iso=now_iso,
+        )
+
     # Playlist builder knobs
     target_minutes = getattr(args, "target_minutes", None)
     if target_minutes is None:
@@ -1915,6 +2340,17 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
 
+    marketing_obj: Optional[Dict[str, Any]] = None
+    if bool(getattr(args, "marketing", False)):
+        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
+        marketing_obj = _agents_marketing_plan(
+            drop_dir=bundle_dir,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            out_dir=marketing_out,
+            seed=int(seed),
+            teaser_seconds=int(getattr(args, "teaser_seconds", 15) or 15),
+            ts=now_iso,
+        )
     drop_evidence = {
         "ok": True,
         "schedule": "daily",
@@ -1923,6 +2359,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "drop_id": str(drop_id),
         "lead_track_id": lead_track_id,
         "playlist_tracks": 1,
+        "marketing": marketing_obj,
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
@@ -1933,6 +2370,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             "manifest_sha256": manifest_sha256,
         },
     }
+    drop_evidence = _scrub_absolute_paths(drop_evidence, out_dir=out_dir)
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if json_mode:
@@ -2513,6 +2951,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     # Write drop evidence (initial)
     # ---------------------------------------------------------------------
     evidence_path = out_dir / "drop_evidence.json"
+    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir)
     evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
@@ -2672,7 +3111,8 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 evidence_obj["artifacts"]["web_bundle_tree_sha256"] = web_tree_sha
             evidence_obj["artifacts"]["submission_receipt_json"] = str(receipt_path)
 
-        evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
+    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir)
+    evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
     # Print stdout summary JSON
@@ -3020,6 +3460,25 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     iso_year, iso_week, _ = today.isocalendar()
     period_key = f"{iso_year}-W{iso_week:02d}"
 
+    # Optional: generate new tracks into the library before building the weekly playlist
+    gen_count = int(getattr(args, "generate_count", 0) or 0)
+    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
+    gen_prompt = getattr(args, "prompt", None) or None
+    if gen_count > 0:
+        _agents_generate_and_ingest(
+            db_path=db_path,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            context=context,
+            schedule="weekly",
+            period_key=period_key,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            count=int(gen_count),
+            provider_name=str(gen_provider) if gen_provider else None,
+            prompt=str(gen_prompt) if gen_prompt else None,
+            now_iso=now_iso,
+        )
+
     # Playlist builder knobs
     target_minutes = getattr(args, "target_minutes", None)
     if target_minutes is None:
@@ -3120,6 +3579,18 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
 
+    marketing_obj: Optional[Dict[str, Any]] = None
+    if bool(getattr(args, "marketing", False)):
+        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
+        marketing_obj = _agents_marketing_plan(
+            drop_dir=bundle_dir,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            out_dir=marketing_out,
+            seed=int(seed),
+            teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
+            ts=now_iso,
+        )
+
     drop_evidence = {
         "ok": True,
         "schedule": "weekly",
@@ -3128,6 +3599,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "drop_id": str(drop_id),
         "lead_track_id": lead_track_id,
         "playlist_tracks": int(len(copied)),
+        "marketing": marketing_obj,
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
@@ -4126,6 +4598,40 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Enable deterministic mode (also via MGC_DETERMINISTIC=1)",
     )
+
+    daily.add_argument(
+        "--generate-count",
+        type=int,
+        default=int(os.environ.get("MGC_GENERATE_COUNT") or "0"),
+        help="Generate N new tracks into the library before selecting the daily playlist (0 = off)",
+    )
+    daily.add_argument(
+        "--generate-provider",
+        default=os.environ.get("MGC_PROVIDER") or None,
+        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'stub')",
+    )
+    daily.add_argument(
+        "--prompt",
+        default=None,
+        help="Optional prompt to pass to the generator/provider",
+    )
+    daily.add_argument(
+        "--marketing",
+        action="store_true",
+        help="Also generate a marketing plan for the resulting drop bundle",
+    )
+    daily.add_argument(
+        "--marketing-out-dir",
+        default=None,
+        help="Where to write marketing assets (default: <out_dir>/marketing)",
+    )
+    daily.add_argument(
+        "--teaser-seconds",
+        type=int,
+        default=int(os.environ.get("MGC_TEASER_SECONDS") or "15"),
+        help="Teaser length in seconds (wav-only; otherwise skipped)",
+    )
+
     daily.set_defaults(func=cmd_run_daily)
 
     # ----------------------------
@@ -4205,6 +4711,40 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Deterministic mode (also via MGC_DETERMINISTIC=1)",
     )
+
+    weekly.add_argument(
+        "--generate-count",
+        type=int,
+        default=int(os.environ.get("MGC_GENERATE_COUNT") or "0"),
+        help="Generate N new tracks into the library before selecting the weekly playlist (0 = off)",
+    )
+    weekly.add_argument(
+        "--generate-provider",
+        default=os.environ.get("MGC_PROVIDER") or None,
+        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'stub')",
+    )
+    weekly.add_argument(
+        "--prompt",
+        default=None,
+        help="Optional prompt to pass to the generator/provider",
+    )
+    weekly.add_argument(
+        "--marketing",
+        action="store_true",
+        help="Also generate a marketing plan for the resulting drop bundle",
+    )
+    weekly.add_argument(
+        "--marketing-out-dir",
+        default=None,
+        help="Where to write marketing assets (default: <out_dir>/marketing)",
+    )
+    weekly.add_argument(
+        "--teaser-seconds",
+        type=int,
+        default=int(os.environ.get("MGC_TEASER_SECONDS") or "20"),
+        help="Teaser length in seconds (wav-only; otherwise skipped)",
+    )
+
     weekly.set_defaults(func=cmd_run_weekly)
 
     # ----------------------------

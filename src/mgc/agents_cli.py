@@ -358,6 +358,20 @@ def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> 
 
 
 def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
+    """Generate teaser + cover + post copy from a drop bundle.
+
+    Determinism note:
+      In deterministic pipelines (run daily/weekly), the same plan should hash-identical
+      even when the *output directory differs*. To achieve that, we write *relative* paths
+      (no absolute /tmp/... prefixes) whenever drop_dir and out_dir are siblings.
+
+    Behavior:
+      - teaser.wav: WAV-only clipping in v1; if lead audio is not WAV or missing, skip.
+      - cover.png: deterministic abstract image (no text).
+      - post_*.txt: plain text copy variants (no emojis).
+      - marketing_plan.json + receipts.jsonl
+    """
+
     json_mode = bool(getattr(args, "json", False))
 
     drop_dir = Path(str(getattr(args, "drop_dir", ""))).expanduser().resolve()
@@ -371,6 +385,14 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
 
     receipts_path = out_dir / "receipts.jsonl"
     plan_path = out_dir / "marketing_plan.json"
+    def _rel_to_out(target: Path) -> str:
+        # All serialized paths are relative to out_dir (no absolute leakage).
+        try:
+            import os
+            return Path(os.path.relpath(str(target), start=str(out_dir))).as_posix()
+        except Exception:
+            return target.name
+
 
     try:
         playlist_path, playlist = _load_playlist(drop_dir)
@@ -384,15 +406,19 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
         teaser_info: Optional[Dict[str, Any]] = None
         if audio_path.suffix.lower() == ".wav" and audio_path.exists():
             teaser_info = _write_teaser_wav(audio_path, teaser_path, teaser_seconds)
+            # normalize teaser_info paths to deterministic relative when possible
+            teaser_info["src"] = _rel_to_out(Path(teaser_info["src"]))
+            teaser_info["dst"] = _rel_to_out(Path(teaser_info["dst"]))
         else:
-            # If non-wav, we skip creating teaser for v1.
             teaser_info = {
                 "skipped": True,
                 "reason": "lead track is not a .wav or does not exist",
-                "lead_audio": str(audio_path),
+                "lead_audio": _rel_to_out(audio_path),
             }
 
+        # cover should be deterministic across different out_dir paths
         cover_info = _write_cover_png(cover_path, seed_material=f"{lead_track_id}|{now_iso}|seed={seed}")
+        cover_info["dst"] = _rel_to_out(Path(cover_info["dst"]))
 
         # Copy variants (no emojis)
         title = str(lead_track.get("title") or "New drop")
@@ -402,33 +428,33 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
 
         posts = [
             f"New release: {title}. Context: {context or 'mix'}. Listen now.",
-            f"Fresh drop out now ({schedule or 'release'} {period_key or now_iso[:10]}). {title}.", 
+            f"Fresh drop out now ({schedule or 'release'} {period_key or now_iso[:10]}). {title}.",
             f"New music for {context or 'your day'}: {title}. Press play.",
         ]
 
         post_paths: List[str] = []
         out_dir.mkdir(parents=True, exist_ok=True)
         for idx, text in enumerate(posts, start=1):
-            p = out_dir / f"post_{idx}.txt"
-            _write_text(p, text.strip() + "\n")
-            post_paths.append(str(p))
+            pth = out_dir / f"post_{idx}.txt"
+            _write_text(pth, text.strip() + "\n")
+            post_paths.append(_rel_to_out(pth))
 
         plan = {
             "ok": True,
             "cmd": "agents.marketing.plan",
             "ts": now_iso,
             "seed": seed,
+            "drop_dir": _rel_to_out(drop_dir),
+            "lead_track_id": lead_track_id,
             "paths": {
-                "out_dir": str(out_dir),
-                "playlist": str(playlist_path),
-                "lead_audio": str(audio_path),
-                "teaser": str(teaser_path),
-                "cover": str(cover_path),
-                "plan": str(plan_path),
-                "receipts": str(receipts_path),
+                "playlist": _rel_to_out(playlist_path),
+                "lead_audio": _rel_to_out(audio_path),
+                "teaser": _rel_to_out(teaser_path),
+                "cover": _rel_to_out(cover_path),
+                "plan": _rel_to_out(plan_path),
+                "receipts": _rel_to_out(receipts_path),
                 "posts": post_paths,
             },
-            "lead_track_id": lead_track_id,
             "teaser": teaser_info,
             "cover": cover_info,
         }
@@ -448,8 +474,8 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
             "cmd": "agents.marketing.plan",
             "ts": now_iso,
             "seed": seed,
-            "drop_dir": str(drop_dir),
-            "out_dir": str(out_dir),
+            "drop_dir": _rel_to_out(drop_dir),
+            "out_dir": ".",
             "error": str(e),
         }
         _append_jsonl(receipts_path, err)
