@@ -1749,6 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
     mrl.add_argument("--limit", type=int, default=20, help="Number of receipts to show (newest last)")
     mrl.set_defaults(func=cmd_marketing_receipts_list)
 
+
     # Optional: agents (only if agents_cli is present)
     try:
         from mgc.agents_cli import register_agents_subcommand  # type: ignore
@@ -1804,7 +1805,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
     _web_registrar(sub)
 
-    register_submission_subcommand(sub)
+    # submission (deterministic submission ZIPs)
+    try:
+        register_submission_subcommand(sub)
+    except Exception as e:
+        print(f"[mgc.main] WARN: submission subcommand not registered: {e}")
 
     try:
         from mgc.run_cli import register_run_subcommand as _register_run_subcommand  # type: ignore
@@ -1844,7 +1849,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json_mode=bool(getattr(args, "json", False)),
     )
 
-    fn = getattr(args, "func", None)
+    fn = getattr(args, "func", None) or getattr(args, "fn", None)
     if not callable(fn):
         parser.print_help()
         return 2

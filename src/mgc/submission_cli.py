@@ -2,255 +2,261 @@
 """
 src/mgc/submission_cli.py
 
-Submission bundle packaging (deterministic).
+Deterministic submission bundle packaging.
 
-This module is imported by mgc.main via:
-  from mgc.submission_cli import register_submission_subcommand
-
-So we MUST provide register_submission_subcommand(subparsers).
+Commands (via mgc.main):
+  mgc submission build  --bundle-dir <dir> --out submission.zip [--evidence-root <dir>]
+  mgc submission build  --drop-id <id> --db <db> --out submission.zip [--evidence-root <dir>]
+  mgc submission latest --db <db> --out submission.zip [--evidence-root <dir>]
+  mgc submission verify --zip <submission.zip>
 
 Design goals:
-- No DB mutation
-- Deterministic ZIP bytes (stable ordering, timestamps, perms)
-- Deterministic README
-- Validate bundle before packaging
+- No DB mutation.
+- Deterministic ZIP output: stable ordering + stable timestamps + stable manifest bytes.
+- Validate bundle schema before packaging (mgc.bundle_validate.validate_bundle).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sqlite3
+import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Optional
 
 from mgc.bundle_validate import validate_bundle
 
 
 # -----------------------------
-# Determinism constants
+# Determinism helpers
 # -----------------------------
 
-FIXED_ISO_TS = "2020-01-01T00:00:00+00:00"
-FIXED_ZIP_DT = (2020, 1, 1, 0, 0, 0)
-FIXED_FILE_MODE = 0o100644  # -rw-r--r--
+_EPOCH_ZIP_DT = (1980, 1, 1, 0, 0, 0)  # stable ZIP timestamp
 
 
-# -----------------------------
-# JSON helpers
-# -----------------------------
-
-def _read_json(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _stable_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+def _stable_zip_write(zf: zipfile.ZipFile, arcname: str, data: bytes) -> None:
+    zi = zipfile.ZipInfo(filename=arcname, date_time=_EPOCH_ZIP_DT)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.external_attr = (0o100644 & 0xFFFF) << 16  # rw-r--r--
+    zi.create_system = 3  # force Unix
+    zf.writestr(zi, data)
 
 
-def _emit_json(obj: Dict[str, Any]) -> None:
-    # In --json mode, caller contract expects exactly one JSON object on stdout.
-    print(_stable_json_dumps(obj))
-
-
-# -----------------------------
-# Deterministic ZIP writer
-# -----------------------------
-
-def _write_zip_deterministic(zip_path: Path, root_dir: Path, rel_paths: Iterable[str]) -> None:
-    rels = sorted(set(rel_paths))
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for rel in rels:
-            src = root_dir / rel
-            data = src.read_bytes()
-
-            zi = zipfile.ZipInfo(filename=rel.replace(os.sep, "/"), date_time=FIXED_ZIP_DT)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            zi.external_attr = (FIXED_FILE_MODE & 0xFFFF) << 16
-
-            zf.writestr(zi, data)
-
-
-# -----------------------------
-# Bundle collection
-# -----------------------------
-
-def _collect_files_strict(root: Path) -> List[str]:
-    """
-    Collect files under `root` with basic hygiene rules.
-    This prevents volatile junk from sneaking into the submission.
-    """
-    out: List[str] = []
+def _sorted_files(root: Path) -> list[Path]:
+    files: list[Path] = []
     for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-
-        rel = p.relative_to(root).as_posix()
-
-        # hygiene / determinism
-        if rel.startswith("."):
-            continue
-        if "/." in rel:
-            continue
-        if "__pycache__" in rel:
-            continue
-        if rel.endswith(".pyc"):
-            continue
-        if rel.endswith(".tmp"):
-            continue
-        if rel.endswith(".DS_Store") or rel.endswith("DS_Store"):
-            continue
-
-        out.append(rel)
-
-    return sorted(set(out))
+        if p.is_file():
+            files.append(p)
+    files.sort(key=lambda x: x.as_posix())
+    return files
 
 
-def _stable_readme(drop_id: str) -> str:
-    return (
-        "Music Generator Company – Submission\n"
-        "\n"
-        f"Drop ID: {drop_id}\n"
-        f"Generated: {FIXED_ISO_TS}\n"
-        "\n"
-        "This archive is generated deterministically.\n"
-    )
+def _write_json_bytes(obj: Any) -> bytes:
+    return (json.dumps(obj, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def _snapshot_bundle_bytes(bundle_dir: Path) -> Dict[str, bytes]:
+    bundle_dir = bundle_dir.resolve()
+    files = _sorted_files(bundle_dir)
+    snap: Dict[str, bytes] = {}
+    for f in files:
+        rel = f.relative_to(bundle_dir).as_posix()
+        snap[rel] = f.read_bytes()
+    return snap
+
+
+def _validate_bundle_without_mutating(bundle_dir: Path) -> None:
+    bundle_dir = bundle_dir.resolve()
+    with tempfile.TemporaryDirectory(prefix="mgc_submission_validate_") as td:
+        tmp_bundle = Path(td) / "drop_bundle"
+        shutil.copytree(bundle_dir, tmp_bundle)
+        validate_bundle(str(tmp_bundle))
 
 
 # -----------------------------
-# Core build
+# Bundle resolution
 # -----------------------------
 
-def build_submission_zip_from_bundle_dir(bundle_dir: Path, out_zip: Path) -> Dict[str, Any]:
-    """
-    Validate bundle, stage a deterministic view, then write a deterministic ZIP.
-    Returns a small receipt dict (caller may persist separately).
-    """
-    validate_bundle(bundle_dir)
-
-    drop_json = bundle_dir / "drop.json"
-    drop = _read_json(drop_json)
-    drop_id = str(drop.get("drop_id") or "")
-
-    if not drop_id:
-        raise SystemExit(f"bundle missing drop_id in {drop_json}")
-
-    staging = out_zip.parent / f".staging_submission_{drop_id}"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True, exist_ok=True)
-
-    # Copy bundle files into staging (exact bytes preserved)
-    bundle_files = _collect_files_strict(bundle_dir)
-    for rel in bundle_files:
-        src = bundle_dir / rel
-        dst = staging / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-
-    # Deterministic README
-    (staging / "README.txt").write_text(_stable_readme(drop_id), encoding="utf-8")
-
-    # Deterministic ZIP (sorted rel list)
-    staging_files = _collect_files_strict(staging)
-    if "README.txt" not in staging_files:
-        staging_files.append("README.txt")
-    _write_zip_deterministic(out_zip, staging, staging_files)
-
-    shutil.rmtree(staging)
-
-    return {
-        "ok": True,
-        "drop_id": drop_id,
-        "bundle_dir": str(bundle_dir),
-        "out_zip": str(out_zip),
-    }
+def _resolve_bundle_dir_from_evidence_root(evidence_root: Optional[str]) -> Optional[Path]:
+    if not evidence_root:
+        return None
+    p = Path(evidence_root).expanduser().resolve()
+    bd = p / "drop_bundle"
+    return bd if bd.exists() and bd.is_dir() else None
 
 
-def _bundle_dir_from_db(drop_id: str, db_path: Path, evidence_root: Optional[Path] = None) -> Path:
-    """
-    Find the bundle directory for a drop. We try a couple common DB schemas.
-    If your schema differs, we adjust this query, but this is a sensible default.
-    """
-    con = sqlite3.connect(str(db_path))
-    try:
-        # Common case: drops table has bundle_dir column
-        row = con.execute(
-            "SELECT bundle_dir FROM drops WHERE drop_id = ?",
-            (drop_id,),
-        ).fetchone()
-        if row and row[0]:
-            return Path(row[0])
+def _db_connect(db_path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    return con
 
-        # Alternate: drop_bundles table
-        row2 = con.execute(
-            "SELECT bundle_dir FROM drop_bundles WHERE drop_id = ?",
-            (drop_id,),
-        ).fetchone()
-        if row2 and row2[0]:
-            return Path(row2[0])
-    finally:
-        con.close()
 
-    # As a fallback, if evidence_root is provided, try evidence_root/<drop_id>
+def _db_latest_drop_id(con: sqlite3.Connection) -> str:
+    for table in ("drops", "drop"):
+        try:
+            row = con.execute(f"SELECT drop_id FROM {table} ORDER BY ts DESC LIMIT 1").fetchone()
+            if row and row["drop_id"]:
+                return str(row["drop_id"])
+        except sqlite3.Error:
+            continue
+    raise RuntimeError("Could not determine latest drop_id from DB (expected drops/drop table).")
+
+
+def _db_bundle_dir_for_drop_id(con: sqlite3.Connection, drop_id: str, evidence_root: Optional[str]) -> Path:
     if evidence_root:
-        cand = evidence_root / drop_id
-        if cand.exists():
+        er = Path(evidence_root).expanduser().resolve()
+        cand = er / drop_id / "drop_bundle"
+        if cand.exists() and cand.is_dir():
             return cand
 
-    raise SystemExit(f"Could not locate bundle_dir for drop_id={drop_id} in db={db_path}")
+    for table in ("drops", "drop"):
+        try:
+            row = con.execute(f"SELECT bundle_dir FROM {table} WHERE drop_id = ?", (drop_id,)).fetchone()
+            if row and row["bundle_dir"]:
+                bd = Path(str(row["bundle_dir"])).expanduser().resolve()
+                if bd.exists() and bd.is_dir():
+                    return bd
+        except sqlite3.Error:
+            continue
+
+    raise RuntimeError("Could not resolve bundle_dir for drop_id (no evidence-root bundle and no DB bundle_dir).")
 
 
 # -----------------------------
-# CLI commands (registered by mgc.main)
+# Core operations
+# -----------------------------
+
+def build_submission_zip(bundle_dir: Path, out_zip: Path) -> Dict[str, Any]:
+    bundle_dir = bundle_dir.resolve()
+    out_zip = out_zip.expanduser().resolve()
+    if not bundle_dir.exists():
+        raise FileNotFoundError(f"bundle_dir not found: {bundle_dir}")
+
+    # Snapshot before any validation/side effects
+    snap = _snapshot_bundle_bytes(bundle_dir)
+    rels = sorted(snap.keys())
+
+    # Validate on a temp copy (prevent mutations of real bundle)
+    _validate_bundle_without_mutating(bundle_dir)
+
+    # Deterministic manifest:
+    # - no timestamps
+    # - no absolute paths
+    # - no output-zip name (because CI builds submission.zip and submission_2.zip)
+    manifest: Dict[str, Any] = {
+        "format": "mgc_submission_manifest_v1",
+        "bundle_root": "drop_bundle",
+        "files": rels,
+    }
+
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    if out_zip.exists():
+        out_zip.unlink()
+
+    with zipfile.ZipFile(out_zip, "w") as zf:
+        for rel in rels:
+            _stable_zip_write(zf, rel, snap[rel])
+        _stable_zip_write(zf, "submission_manifest.json", _write_json_bytes(manifest))
+
+    return {"ok": True, "out": str(out_zip), "file_count": len(rels)}
+
+
+def verify_submission_zip(zip_path: Path) -> Dict[str, Any]:
+    zip_path = zip_path.expanduser().resolve()
+    if not zip_path.exists():
+        raise FileNotFoundError(f"zip not found: {zip_path}")
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        ok = "submission_manifest.json" in names
+        return {"ok": bool(ok), "zip": str(zip_path), "entries": len(names)}
+
+
+# -----------------------------
+# CLI handlers
 # -----------------------------
 
 def cmd_submission_build(args: argparse.Namespace) -> int:
-    out_zip = Path(args.out).resolve()
+    bundle_dir: Optional[Path] = None
 
     if args.bundle_dir:
-        bundle_dir = Path(args.bundle_dir).resolve()
+        bundle_dir = Path(args.bundle_dir).expanduser().resolve()
     else:
+        bundle_dir = _resolve_bundle_dir_from_evidence_root(args.evidence_root)
+
+    if bundle_dir is None and args.drop_id:
         if not args.db:
-            raise SystemExit("--db is required with --drop-id")
-        bundle_dir = _bundle_dir_from_db(
-            drop_id=str(args.drop_id),
-            db_path=Path(args.db).resolve(),
-            evidence_root=Path(args.evidence_root).resolve() if args.evidence_root else None,
-        )
+            raise SystemExit("submission build: --drop-id requires --db")
+        con = _db_connect(args.db)
+        try:
+            bundle_dir = _db_bundle_dir_for_drop_id(con, args.drop_id, args.evidence_root)
+        finally:
+            con.close()
 
-    receipt = build_submission_zip_from_bundle_dir(bundle_dir=bundle_dir, out_zip=out_zip)
+    if bundle_dir is None:
+        raise SystemExit("submission build: need --bundle-dir OR (--drop-id and --db) OR evidence-root with drop_bundle")
 
+    out = Path(args.out).expanduser().resolve()
+    res = build_submission_zip(bundle_dir=bundle_dir, out_zip=out)
     if getattr(args, "json", False):
-        _emit_json({"cmd": "submission.build", **receipt})
-    else:
-        print(f"[submission.build] ok drop_id={receipt['drop_id']} out={receipt['out_zip']}")
-
+        print(json.dumps(res, sort_keys=True))
     return 0
 
 
+def cmd_submission_latest(args: argparse.Namespace) -> int:
+    if not args.db:
+        raise SystemExit("submission latest: requires --db")
+
+    con = _db_connect(args.db)
+    try:
+        drop_id = _db_latest_drop_id(con)
+        bundle_dir = _db_bundle_dir_for_drop_id(con, drop_id, args.evidence_root)
+    finally:
+        con.close()
+
+    out = Path(args.out).expanduser().resolve()
+    res = build_submission_zip(bundle_dir=bundle_dir, out_zip=out)
+    res["drop_id"] = drop_id
+    if getattr(args, "json", False):
+        print(json.dumps(res, sort_keys=True))
+    return 0
+
+
+def cmd_submission_verify(args: argparse.Namespace) -> int:
+    res = verify_submission_zip(Path(args.zip))
+    if getattr(args, "json", False):
+        print(json.dumps(res, sort_keys=True))
+    else:
+        if not res["ok"]:
+            print(json.dumps(res, sort_keys=True))
+            return 2
+    return 0
+
+
+# -----------------------------
+# Registrar
+# -----------------------------
+
 def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    """
-    Hook for mgc.main. Adds:
-      mgc submission build ...
-    """
     p = subparsers.add_parser("submission", help="Build deterministic submission ZIPs")
-    sub = p.add_subparsers(dest="submission_cmd", required=True)
+    sp = p.add_subparsers(dest="submission_cmd", required=True)
 
-    b = sub.add_parser("build", help="Build a submission ZIP from a bundle dir or drop_id")
-    src = b.add_mutually_exclusive_group(required=True)
-    src.add_argument("--bundle-dir", dest="bundle_dir", type=str, help="Path to bundle directory")
-    src.add_argument("--drop-id", dest="drop_id", type=str, help="Drop id to resolve via DB")
-
-    b.add_argument("--db", type=str, default=None, help="SQLite DB path (required with --drop-id)")
-    b.add_argument("--evidence-root", type=str, default=None, help="Optional evidence root fallback")
-    b.add_argument("--out", type=str, required=True, help="Output ZIP path")
-
-    # mgc.main usually plumbs global --json onto args; keep it compatible.
+    b = sp.add_parser("build", help="Build a submission ZIP from a drop bundle")
+    b.add_argument("--bundle-dir", default=None, help="Path to drop_bundle directory")
+    b.add_argument("--drop-id", default=None, help="Drop id to resolve bundle via DB/evidence-root")
+    b.add_argument("--out", required=True, help="Output ZIP path")
+    b.add_argument("--evidence-root", default=None, help="Evidence root (may contain drop_bundle)")
     b.set_defaults(fn=cmd_submission_build)
+
+    l = sp.add_parser("latest", help="Build submission ZIP for latest drop in DB")
+    l.add_argument("--db", required=True, help="SQLite DB path")
+    l.add_argument("--out", required=True, help="Output ZIP path")
+    l.add_argument("--evidence-root", default=None, help="Evidence root")
+    l.set_defaults(fn=cmd_submission_latest)
+
+    v = sp.add_parser("verify", help="Verify a submission ZIP structure")
+    v.add_argument("--zip", required=True, help="ZIP path to verify")
+    v.set_defaults(fn=cmd_submission_verify)
