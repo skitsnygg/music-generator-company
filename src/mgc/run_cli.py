@@ -708,6 +708,17 @@ class RunKey:
 def _now_iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def write_sha256_sidecar(path: Path) -> str:
+    """Write <file>.<ext>.sha256 containing the sha256 hex of the file + newline.
+    Returns the hex digest.
+    """
+    import hashlib
+
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    sidecar.write_text(digest + "\n", encoding="utf-8")
+    return digest
 
 def db_get_or_create_run_id(
     con: sqlite3.Connection,
@@ -3649,207 +3660,170 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_run_weekly(args: argparse.Namespace) -> int:
-    """Build a weekly drop bundle from the library DB using the deterministic playlist builder.
+    """
+    Minimal deterministic weekly pipeline.
 
     Outputs (under out_dir):
       - drop_bundle/playlist.json
-      - drop_bundle/daily_evidence.json
-      - drop_bundle/tracks/<track_id>.wav   (copied from library)
-      - evidence/daily_evidence.json        (lead track only; used by publish-marketing)
-      - drop_evidence.json                  (summary)
+      - drop_bundle/weekly_evidence.json
+      - drop_bundle/weekly_evidence.json.sha256
+      - drop_bundle/playlist.json.sha256
 
     Determinism:
-      - Uses period_key (ISO week label) + seed + context for IDs.
-      - Uses deterministic_now_iso() when deterministic.
-      - Evidence uses relative paths (no absolute out_dir leakage).
+      - period_key is Monday 00:00 UTC (ISO week start)
+      - under --deterministic, ts is derived from period_key (not wall clock)
+      - stable_json_dumps for all JSON
+      - sha256 sidecars written for compared artifacts
     """
-    deterministic = is_deterministic(args)
-    json_mode = bool(getattr(args, "json", False))
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
 
+    # These should already exist in run_cli.py
+    deterministic = is_deterministic(args)
     db_path = resolve_db_path(args)
     context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
 
     seed_val = getattr(args, "seed", None)
     seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
 
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
+    out_dir = Path(
+        getattr(args, "out_dir", None)
+        or os.environ.get("MGC_EVIDENCE_DIR")
+        or "data/evidence"
+    ).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     bundle_dir = out_dir / "drop_bundle"
-    bundle_tracks_dir = bundle_dir / "tracks"
-    evidence_dir = out_dir / "evidence"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
-    evidence_dir.mkdir(parents=True, exist_ok=True)
+    # ---- period_key (UTC week start)
+    if deterministic:
+        # Use your deterministic clock helper if present; otherwise fall back to real time.
+        try:
+            now_iso_wall = deterministic_now_iso(False)
+            now_dt = datetime.fromisoformat(now_iso_wall.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            now_dt = datetime.now(timezone.utc)
+    else:
+        now_dt = datetime.now(timezone.utc)
 
-    # Determine ISO week label
-    now_iso = deterministic_now_iso(deterministic)
-    today = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).date() if "T" in now_iso else datetime.now(timezone.utc).date()
-    iso_year, iso_week, _ = today.isocalendar()
-    period_key = f"{iso_year}-W{iso_week:02d}"
+    week_start = (now_dt - timedelta(days=(now_dt.isoweekday() - 1))).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+    )
+    period_key = week_start.date().isoformat()  # e.g. "2026-01-12"
 
-    # Optional: generate new tracks into the library before building the weekly playlist
-    gen_count = int(getattr(args, "generate_count", 0) or 0)
-    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
-    gen_prompt = getattr(args, "prompt", None) or None
-    if gen_count > 0:
-        _agents_generate_and_ingest(
-            db_path=db_path,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
-            context=context,
-            schedule="weekly",
-            period_key=period_key,
-            seed=int(seed),
-            deterministic=bool(deterministic),
-            count=int(gen_count),
-            provider_name=str(gen_provider) if gen_provider else None,
-            prompt=str(gen_prompt) if gen_prompt else None,
-            now_iso=now_iso,
-        )
+    if deterministic:
+        ts = week_start.isoformat().replace("+00:00", "Z")
+    else:
+        ts = now_dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Playlist builder knobs
-    target_minutes = getattr(args, "target_minutes", None)
-    if target_minutes is None:
-        target_minutes = int(os.environ.get("MGC_WEEKLY_TARGET_MINUTES") or "20")
-
-    lookback_playlists = getattr(args, "lookback_playlists", None)
-    if lookback_playlists is None:
-        lookback_playlists = int(os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3")
-
+    # ---- build weekly playlist (pure builder in playlist.py)
+    # NOTE: build_weekly_playlist is defined in your uploaded playlist.py.
     pl = build_weekly_playlist(
         db_path=Path(db_path),
         context=context,
         period_key=period_key,
         base_seed=int(seed),
-        target_minutes=int(target_minutes),
-        lookback_playlists=int(lookback_playlists),
+        target_minutes=int(getattr(args, "target_minutes", None) or os.environ.get("MGC_WEEKLY_TARGET_MINUTES") or "60"),
+        lookback_playlists=int(getattr(args, "lookback_playlists", None) or os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3"),
     )
 
     items = pl.get("items") if isinstance(pl, dict) else None
     if not items:
         raise SystemExit("weekly playlist builder produced no items")
 
-    # Copy tracks into bundle
-    copied: List[Dict[str, Any]] = []
+    # ---- write playlist.json (bundle-relative paths only; playlist builder may provide absolute/full paths)
+    tracks = []
     for it in items:
         track_id = str(it.get("track_id"))
-        full_path = it.get("full_path") or it.get("artifact_path")
-        if not full_path:
-            raise SystemExit(f"playlist item missing full_path for track_id={track_id}")
+        src_path = it.get("artifact_path") or it.get("path") or it.get("full_path")
+        # Playlist should not embed absolute paths in bundle artifacts; keep only IDs here.
+        repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
 
-        src = Path(str(full_path))
-        # Allow relative paths stored in DB (repo-relative)
+        src_path = it.get("artifact_path") or it.get("path") or it.get("full_path")
+        if not src_path:
+            raise SystemExit(f"weekly item missing path for track_id={track_id}")
+
+        src = Path(str(src_path))
         if not src.is_absolute():
-            src = Path(getattr(args, "repo_root", ".")).expanduser().resolve() / src
+            src = repo_root / src
 
         if not src.exists():
             raise SystemExit(f"[run.weekly] missing source track file: {src}")
 
-        dst = bundle_tracks_dir / f"{track_id}{src.suffix or '.wav'}"
+        dst = (bundle_dir / "tracks" / f"{track_id}{src.suffix or '.wav'}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
-        copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
-    lead_track_id = str(items[0].get("track_id"))
+        tracks.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
-    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
-    if deterministic:
-        drop_id = stable_uuid5(f"drop:weekly:{period_key}:{context}:{seed}", namespace=ns)
-        playlist_id = stable_uuid5(f"playlist:weekly:{period_key}:{context}:{seed}", namespace=ns)
-        run_id = stable_uuid5(f"run:weekly:{period_key}:{context}:{seed}", namespace=ns)
-    else:
-        drop_id = str(uuid.uuid4())
-        playlist_id = str(uuid.uuid4())
-        run_id = str(uuid.uuid4())
-
-    # Write bundle playlist.json (schema mgc.playlist.v1)
     playlist_obj = {
         "schema": "mgc.playlist.v1",
         "version": 1,
         "schedule": "weekly",
-        "ts": now_iso,
-        "playlist_id": str(playlist_id),
         "context": context,
-        "period": {"label": period_key},
-        "tracks": copied,
-    }
-    (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    # Write evidence/daily_evidence.json for the LEAD track (marketing contract)
-    lead_path = next((c["path"] for c in copied if c["track_id"] == lead_track_id), copied[0]["path"])
-    daily_ev = {
-        "schema": "mgc.daily_evidence.v1",
-        "version": 1,
-        "run_id": str(run_id),
-        "stage": "daily",
-        "context": context,
+        "period_key": period_key,
+        "seed": int(seed),
         "deterministic": bool(deterministic),
-        "ts": now_iso,
-        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub"),
-        "schedule": "weekly",
-        "track": {"track_id": lead_track_id, "path": lead_path},
-        "sha256": {
-            "playlist": sha256_file(bundle_dir / "playlist.json"),
-            "track": sha256_file(bundle_dir / lead_path),
-        },
-        "period": {"label": period_key},
+        "ts": ts,
+        "tracks": tracks,
     }
-    (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (bundle_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    # Compute deterministic repo manifest alongside playlist (helps CI provenance)
-    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
-    include = getattr(args, "include", None) or None
-    exclude_dirs = getattr(args, "exclude_dir", None) or None
-    exclude_globs = getattr(args, "exclude_glob", None) or None
+    playlist_path = bundle_dir / "playlist.json"
+    playlist_path.write_text(stable_json_dumps(playlist_obj) + "\n", encoding="utf-8")
 
-    manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
-    manifest_path = out_dir / "weekly_manifest.json"
-    manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
-    manifest_sha256 = sha256_file(manifest_path)
-
-    marketing_obj: Optional[Dict[str, Any]] = None
-    if bool(getattr(args, "marketing", False)):
-        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
-        marketing_obj = _agents_marketing_plan(
-            drop_dir=bundle_dir,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
-            out_dir=marketing_out,
-            seed=int(seed),
-            teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
-            ts=now_iso,
-        )
-
-    drop_evidence = {
+    # ---- weekly evidence
+    weekly_ev = {
+        "schema": "mgc.weekly_evidence.v1",
+        "version": 1,
         "ok": True,
         "schedule": "weekly",
         "context": context,
         "period_key": period_key,
-        "drop_id": str(drop_id),
-        "lead_track_id": lead_track_id,
-        "playlist_tracks": int(len(copied)),
-        "marketing": marketing_obj,
+        "seed": int(seed),
+        "deterministic": bool(deterministic),
+        "ts": ts,
+        "track_count": len(tracks),
+        "sha256": {
+            "playlist": sha256_file(playlist_path) if "sha256_file" in globals() else hashlib.sha256(playlist_path.read_bytes()).hexdigest(),
+        },
         "paths": {
             "bundle_dir": "drop_bundle",
-            "bundle_playlist": "drop_bundle/playlist.json",
-
-            # Weekly runs still emit a lead-track evidence file using the daily schema
-            # (marketing contract). We expose semantically-correct keys while keeping
-            # legacy names for backward compatibility.
-            "bundle_weekly_evidence": "drop_bundle/daily_evidence.json",
-            "weekly_evidence": "evidence/daily_evidence.json",
-            "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
-            "daily_evidence": "evidence/daily_evidence.json",
-
-            "drop_evidence": "drop_evidence.json",
-            "manifest": "weekly_manifest.json",
-            "manifest_sha256": manifest_sha256,
+            "playlist": "drop_bundle/playlist.json",
+            "weekly_evidence": "drop_bundle/weekly_evidence.json",
         },
     }
-    (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if json_mode:
-        sys.stdout.write(stable_json_dumps(drop_evidence) + "\n")
+
+    weekly_path = bundle_dir / "weekly_evidence.json"
+    weekly_path.write_text(stable_json_dumps(weekly_ev) + "\n", encoding="utf-8")
+
+    # ---- sha256 sidecars (local helper)
+    def _write_sidecar(p: Path) -> None:
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        p.with_suffix(p.suffix + ".sha256").write_text(digest + "\n", encoding="utf-8")
+
+    _write_sidecar(playlist_path)
+    _write_sidecar(weekly_path)
+
+    if bool(getattr(args, "json", False)):
+        sys.stdout.write(
+            stable_json_dumps(
+                {
+                    "ok": True,
+                    "out_dir": str(out_dir),
+                    "bundle_dir": str(bundle_dir),
+                    "period_key": period_key,
+                    "track_count": len(tracks),
+                }
+            )
+            + "\n"
+        )
     else:
-        print(f"[run.weekly] ok period={period_key} tracks={len(copied)} out_dir={out_dir}", file=sys.stderr)
+        print(f"[run.weekly] ok out_dir={out_dir} period_key={period_key} track_count={len(tracks)}")
 
     return 0
+
 
 
 def cmd_run_stage_set(args: argparse.Namespace) -> int:

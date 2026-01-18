@@ -23,6 +23,45 @@ class Track:
     preview_path: str
 
 
+@dataclass(frozen=True)
+class PlaylistResult:
+    """Deterministic playlist build result.
+
+    This is a pure function of the DB contents + inputs (context/period/seed/etc).
+    It does not consult the filesystem or wall-clock time.
+    """
+
+    name: str
+    slug: str
+    filters: Dict[str, Any]
+    stats: Dict[str, Any]
+    dedupe: Dict[str, Any]
+    tracks: List[Track]
+    items: List[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class WeeklyResult:
+    """Weekly build wrapper around PlaylistResult."""
+
+    period_key: str
+    context: str
+    seed: int
+    deterministic: bool
+    playlist: PlaylistResult
+
+
+@dataclass(frozen=True)
+class DailyResult:
+    """Daily build wrapper around PlaylistResult."""
+
+    period_key: str
+    context: str
+    seed: int
+    deterministic: bool
+    playlist: PlaylistResult
+
+
 PLAYLIST_PRESETS = {
     "focus": {"mood": "focus", "bpm_window": (80, 125), "name": "Focus Radio"},
     "workout": {"mood": "workout", "bpm_window": (125, 170), "name": "Workout Radio"},
@@ -206,14 +245,6 @@ def _fetch_tracks(
         if not tid or not full_path:
             continue
 
-
-        # Skip missing files deterministically (prevents stale DB rows from breaking runs)
-        p = Path(full_path)
-        if not p.is_absolute():
-            p = Path.cwd() / p
-        if not p.exists():
-            continue
-
         out.append(
             Track(
                 id=tid,
@@ -360,7 +391,152 @@ def _fetch_recently_used_track_ids(
 
 
 # -----------------------------------------------------------------------------
-# Public API
+# Core builder (pure; DB-only)
+# -----------------------------------------------------------------------------
+
+def _build_playlist_from_conn(
+    *,
+    conn: sqlite3.Connection,
+    name: str,
+    slug: str,
+    context: Optional[str],
+    mood: Optional[str],
+    genre: Optional[str],
+    target_minutes: int,
+    bpm_window: Optional[Tuple[int, int]],
+    base_seed: int,
+    period_key: Optional[str],
+    lookback_playlists: int,
+) -> PlaylistResult:
+    if context and context in PLAYLIST_PRESETS:
+        preset = PLAYLIST_PRESETS[context]
+        name = preset.get("name", name)
+        mood = preset.get("mood", mood)
+        bpm_window = preset.get("bpm_window", bpm_window)
+
+    bpm_min, bpm_max = (None, None)
+    if bpm_window:
+        bpm_min, bpm_max = bpm_window
+
+    candidates = _fetch_tracks(
+        conn,
+        mood=mood,
+        genre=genre,
+        bpm_min=bpm_min,
+        bpm_max=bpm_max,
+        limit=400,
+    )
+
+    if not candidates:
+        candidates = _fetch_tracks(conn, limit=400)
+
+    recently_used, dedupe = _fetch_recently_used_track_ids(
+        conn,
+        context=context,
+        slug=slug,
+        lookback_playlists=lookback_playlists,
+    )
+
+    if recently_used:
+        filtered = [t for t in candidates if t.id not in recently_used]
+        dedupe["excluded_count"] = len(candidates) - len(filtered)
+
+        # Only apply dedupe if still enough material
+        if len(filtered) >= 10:
+            candidates = filtered
+            dedupe["applied"] = True
+        else:
+            dedupe["reason"] = "not_enough_unique_tracks"
+
+    derived_seed = _stable_seed(
+        context or "",
+        slug or "",
+        period_key or "",
+        base_seed=base_seed,
+    )
+
+    ordered = _shuffle_with_diversity(candidates, seed=derived_seed)
+
+    target_sec = int(target_minutes * 60)
+    total = 0
+    chosen: List[Track] = []
+
+    def _dur(t: Track) -> int:
+        try:
+            return int(float(t.duration_sec))
+        except Exception:
+            return 0
+
+    for t in ordered:
+        if total >= target_sec and len(chosen) >= 3:
+            break
+        chosen.append(t)
+        total += _dur(t)
+
+    items: List[Dict[str, Any]] = []
+    for t in chosen:
+        items.append(
+            {
+                "track_id": t.id,
+                "title": t.title,
+                "mood": t.mood,
+                "genre": t.genre,
+                "bpm": t.bpm,
+                "duration_sec": t.duration_sec,
+                "preview_path": t.preview_path,
+                "full_path": t.full_path,
+                "created_at": t.created_at,
+            }
+        )
+
+    bpms = [int(x["bpm"]) for x in items if x.get("bpm") is not None and int(x["bpm"]) > 0]
+    avg_bpm = int(round(sum(bpms) / len(bpms))) if bpms else None
+    bpm_min_used = min(bpms) if bpms else None
+    bpm_max_used = max(bpms) if bpms else None
+
+    mood_counts = Counter([x.get("mood") for x in items if x.get("mood")])
+    genre_counts = Counter([x.get("genre") for x in items if x.get("genre")])
+
+    unique_track_count = len({x["track_id"] for x in items})
+    duration_minutes = round(total / 60.0, 2)
+
+    filters: Dict[str, Any] = {
+        "context": context,
+        "mood": mood,
+        "genre": genre,
+        "bpm_window": list(bpm_window) if bpm_window else None,
+        "target_minutes": int(target_minutes),
+        "base_seed": int(base_seed),
+        "period_key": period_key,
+        "derived_seed": int(derived_seed),
+        "lookback_playlists": int(lookback_playlists or 0),
+    }
+
+    stats: Dict[str, Any] = {
+        "track_count": len(items),
+        "unique_track_count": unique_track_count,
+        "total_duration_sec": total,
+        "duration_minutes": duration_minutes,
+        "avg_bpm": avg_bpm,
+        "bpm_min": bpm_min_used,
+        "bpm_max": bpm_max_used,
+        "mood_counts": dict(mood_counts),
+        "genre_counts": dict(genre_counts),
+    }
+
+    return PlaylistResult(
+        name=name,
+        slug=slug,
+        filters=filters,
+        stats=stats,
+        dedupe=dedupe,
+        tracks=chosen,
+        items=items,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Public API (legacy dict-returning functions, kept for compatibility)
 # -----------------------------------------------------------------------------
 
 def build_playlist(
@@ -373,158 +549,49 @@ def build_playlist(
     genre: Optional[str] = None,
     target_minutes: int | None = 20,
     bpm_window: Optional[Tuple[int, int]] = None,
-    # Determinism controls
     base_seed: int = 1,
     period_key: Optional[str] = None,
     lookback_playlists: int | None = 3,
 ) -> Dict[str, Any]:
     """
-    Spotify-like 'radio' playlist builder using metadata only.
+    Backward-compatible dict-returning playlist builder.
 
-    - Filters: mood/genre + bpm window (if schema supports those columns)
-    - Bias: recency (DB order)
-    - Shuffle: diversity constraint (deterministic)
-    - Fill: until target duration (min 3 tracks if possible)
-
-    Returns:
-      {
-        "tracks": List[Track],     # programmatic use (weekly copies these)
-        "items":  List[dict],      # JSON-friendly mirror of tracks
-        ...
-      }
+    NOTE: This function is deterministic with respect to DB contents + inputs.
+    It does not consult the filesystem.
     """
-    if context and context in PLAYLIST_PRESETS:
-        preset = PLAYLIST_PRESETS[context]
-        name = preset.get("name", name)
-        mood = preset.get("mood", mood)
-        bpm_window = preset.get("bpm_window", bpm_window)
-
-    # Allow callers to pass None (weekly optional knob)
     if target_minutes is None:
         target_minutes = 20
 
-    bpm_min, bpm_max = (None, None)
-    if bpm_window:
-        bpm_min, bpm_max = bpm_window
+    if slug is None:
+        slug = f"{context or 'mix'}-{period_key or 'latest'}"
 
     conn = _connect(db_path)
     try:
-        candidates = _fetch_tracks(
-            conn,
+        res = _build_playlist_from_conn(
+            conn=conn,
+            name=name,
+            slug=slug,
+            context=context,
             mood=mood,
             genre=genre,
-            bpm_min=bpm_min,
-            bpm_max=bpm_max,
-            limit=400,
+            target_minutes=int(target_minutes),
+            bpm_window=bpm_window,
+            base_seed=int(base_seed),
+            period_key=period_key,
+            lookback_playlists=int(lookback_playlists or 0),
         )
-
-        if not candidates:
-            candidates = _fetch_tracks(conn, limit=400)
-
-        recently_used, dedupe = _fetch_recently_used_track_ids(
-            conn,
-            context=context,
-            slug=slug,
-            lookback_playlists=lookback_playlists,
-        )
-
-        if recently_used:
-            filtered = [t for t in candidates if t.id not in recently_used]
-            dedupe["excluded_count"] = len(candidates) - len(filtered)
-
-            # Only apply dedupe if still enough material
-            if len(filtered) >= 10:
-                candidates = filtered
-                dedupe["applied"] = True
-            else:
-                dedupe["reason"] = "not_enough_unique_tracks"
-
-        seed = _stable_seed(
-            context or "",
-            slug or "",
-            period_key or "",
-            base_seed=base_seed,
-        )
-
-        ordered = _shuffle_with_diversity(candidates, seed=seed)
-
-        target_sec = int(target_minutes * 60)
-        total = 0
-        chosen: List[Track] = []
-
-        def _dur(t: Track) -> int:
-            # Older schema often has duration=0; treat as 0 but still allow selection.
-            try:
-                return int(float(t.duration_sec))
-            except Exception:
-                return 0
-
-        for t in ordered:
-            if total >= target_sec and len(chosen) >= 3:
-                break
-            chosen.append(t)
-            total += _dur(t)
-
-        # JSON-friendly mirror
-        items: List[Dict[str, Any]] = []
-        for t in chosen:
-            items.append(
-                {
-                    "track_id": t.id,
-                    "title": t.title,
-                    "mood": t.mood,
-                    "genre": t.genre,
-                    "bpm": t.bpm,
-                    "duration_sec": t.duration_sec,
-                    "preview_path": t.preview_path,
-                    "full_path": t.full_path,
-                    "created_at": t.created_at,
-                }
-            )
-
-        # Stats
-        bpms = [int(x["bpm"]) for x in items if x.get("bpm") is not None and int(x["bpm"]) > 0]
-        avg_bpm = int(round(sum(bpms) / len(bpms))) if bpms else None
-        bpm_min_used = min(bpms) if bpms else None
-        bpm_max_used = max(bpms) if bpms else None
-
-        mood_counts = Counter([x.get("mood") for x in items if x.get("mood")])
-        genre_counts = Counter([x.get("genre") for x in items if x.get("genre")])
-
-        unique_track_count = len({x["track_id"] for x in items})
-        duration_minutes = round(total / 60.0, 2)
-
         return {
-            "name": name,
-            "filters": {
-                "context": context,
-                "mood": mood,
-                "genre": genre,
-                "bpm_window": list(bpm_window) if bpm_window else None,
-                "target_minutes": int(target_minutes),
-                "base_seed": int(base_seed),
-                "period_key": period_key,
-                "derived_seed": int(seed),
-                "lookback_playlists": int(lookback_playlists or 0),
-            },
-            "stats": {
-                "track_count": len(items),
-                "unique_track_count": unique_track_count,
-                "total_duration_sec": total,
-                "duration_minutes": duration_minutes,
-                "avg_bpm": avg_bpm,
-                "bpm_min": bpm_min_used,
-                "bpm_max": bpm_max_used,
-                "mood_counts": dict(mood_counts),
-                "genre_counts": dict(genre_counts),
-            },
-            "dedupe": dedupe,
-            # Programmatic + JSON-friendly outputs:
-            "tracks": chosen,
-            "items": items,
+            "name": res.name,
+            "filters": res.filters,
+            "stats": res.stats,
+            "dedupe": res.dedupe,
+            "tracks": res.tracks,
+            "items": res.items,
         }
     finally:
         conn.close()
+
+
 # -----------------------------
 # Thin wrappers for schedules
 # -----------------------------
@@ -575,3 +642,81 @@ def build_weekly_playlist(
         period_key=period_key,
         lookback_playlists=lookback_playlists,
     )
+
+
+# -----------------------------------------------------------------------------
+# New pure schedule APIs (strongly-typed)
+# -----------------------------------------------------------------------------
+
+def build_weekly(
+    *,
+    db_path: Path,
+    context: str,
+    seed: int,
+    period_key: str,
+    deterministic: bool,
+    target_minutes: int = 60,
+    lookback_playlists: int = 3,
+) -> WeeklyResult:
+    """Typed weekly builder (DB-only)."""
+    conn = _connect(db_path)
+    try:
+        pl = _build_playlist_from_conn(
+            conn=conn,
+            name="Weekly Playlist",
+            slug=f"weekly-{context}-{period_key}",
+            context=context,
+            mood=None,
+            genre=None,
+            target_minutes=int(target_minutes),
+            bpm_window=None,
+            base_seed=int(seed),
+            period_key=period_key,
+            lookback_playlists=int(lookback_playlists),
+        )
+        return WeeklyResult(
+            period_key=period_key,
+            context=context,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            playlist=pl,
+        )
+    finally:
+        conn.close()
+
+
+def build_daily(
+    *,
+    db_path: Path,
+    context: str,
+    seed: int,
+    period_key: str,
+    deterministic: bool,
+    target_minutes: int = 20,
+    lookback_playlists: int = 3,
+) -> DailyResult:
+    """Typed daily builder (DB-only)."""
+    conn = _connect(db_path)
+    try:
+        pl = _build_playlist_from_conn(
+            conn=conn,
+            name="Daily Playlist",
+            slug=f"daily-{context}-{period_key}",
+            context=context,
+            mood=None,
+            genre=None,
+            target_minutes=int(target_minutes),
+            bpm_window=None,
+            base_seed=int(seed),
+            period_key=period_key,
+            lookback_playlists=int(lookback_playlists),
+        )
+        return DailyResult(
+            period_key=period_key,
+            context=context,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            playlist=pl,
+        )
+    finally:
+        conn.close()
