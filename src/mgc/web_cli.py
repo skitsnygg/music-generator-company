@@ -650,8 +650,14 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     out_playlist_path.write_text(json.dumps(out_playlist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     index_path.write_text(_INDEX_HTML, encoding="utf-8")
 
+    ok = True
+    if missing > 0:
+        ok = False
+    if raw_paths and copied == 0:
+        ok = False
+
     manifest = {
-        "ok": True,
+        "ok": ok,
         "cmd": "web.build",
         "out_dir": str(out_dir),
         "playlist": str(playlist_path),
