@@ -198,6 +198,17 @@ jobs:
           bash scripts/ci_gate.sh
           bash scripts/ci_gate.sh
 
+      - name: Verify DB track paths exist (non-empty only)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+        run: |
+          set -euxo pipefail
+          python scripts/verify_track_paths.py \
+            --db "${MGC_DB}" \
+            --repo-root .
+
+
       # -----------------------------
       # FULL gate: only on main pushes
       # -----------------------------
