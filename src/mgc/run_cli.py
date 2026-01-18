@@ -1244,10 +1244,25 @@ def _best_text_payload_column(con: sqlite3.Connection, table: str, reserved: Seq
 def _extract_inner_content_from_blob(s: str) -> Optional[str]:
     try:
         obj = json.loads(s)
-        if isinstance(obj, dict):
-            v = obj.get("content")
-            if isinstance(v, str):
+        if not isinstance(obj, dict):
+            return None
+
+        # Common keys for post copy across schemas
+        for k in ("content", "text", "body", "draft", "caption", "copy", "post_text", "message"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
                 return v
+
+        # Sometimes nested payloads exist
+        for k in ("payload", "data", "draft_obj"):
+            v = obj.get(k)
+            if isinstance(v, dict):
+                # recurse once, cheaply
+                for kk in ("content", "text", "body", "draft", "caption", "copy", "post_text", "message"):
+                    vv = v.get(kk)
+                    if isinstance(vv, str) and vv.strip():
+                        return vv
+
     except Exception:
         return None
     return None
@@ -1590,18 +1605,19 @@ def db_insert_marketing_post(
 
 def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> List[sqlite3.Row]:
     """
-    Return pending marketing posts with schema drift tolerance.
+    Return publishable (pending) marketing posts with schema drift tolerance.
 
-    Supports schemas where the primary key is either:
-      - id
-      - post_id
-      - marketing_post_id
-
-    Also tolerates created_at / created_ts naming.
+    Key behaviors:
+    - Prefers publishable states like 'planned' (NOT 'draft').
+      Drafts are placeholders and may have empty payload_json, so they must not be published.
+    - Tolerates PK drift: id / post_id / marketing_post_id
+    - Tolerates created timestamp drift: created_at / created_ts / ts
+    - Tolerates status column drift: status / state
+    - Deterministic ordering: created ASC, pk ASC
     """
     cols = {r["name"] for r in con.execute("PRAGMA table_info(marketing_posts)").fetchall()}
 
-    # pick PK column
+    # Pick PK column
     if "id" in cols:
         pk = "id"
     elif "post_id" in cols:
@@ -1609,11 +1625,10 @@ def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> L
     elif "marketing_post_id" in cols:
         pk = "marketing_post_id"
     else:
-        # fall back: pick the first column that looks like an id
-        pk_candidates = [c for c in cols if c.endswith("_id")]
+        pk_candidates = sorted([c for c in cols if c.endswith("_id")])
         pk = pk_candidates[0] if pk_candidates else "rowid"
 
-    # pick created timestamp column for ordering
+    # Pick created timestamp column for ordering
     if "created_at" in cols:
         created_col = "created_at"
     elif "created_ts" in cols:
@@ -1623,22 +1638,27 @@ def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> L
     else:
         created_col = pk  # last resort ordering
 
-    # status column name drift
+    # Status column name drift
     status_col = "status" if "status" in cols else ("state" if "state" in cols else None)
     if status_col is None:
-        # can't filter drafts; return empty rather than crashing CI
+        # Can't determine publishable items safely; return empty rather than crashing CI
         return []
 
-    # select everything, but ensure deterministic ordering and stable limit
+    # Publishable statuses (draft is intentionally excluded)
+    # Keep this list small + explicit to avoid accidentally publishing placeholders.
+    publishable_statuses = ("planned", "pending", "ready")
+
+    # Deterministic ordering + stable limit
+    placeholders = ",".join(["?"] * len(publishable_statuses))
     sql = f"""
     SELECT *
     FROM marketing_posts
-    WHERE {status_col} = ?
+    WHERE {status_col} IN ({placeholders})
     ORDER BY {created_col} ASC, {pk} ASC
     LIMIT ?
     """
 
-    cur = con.execute(sql, ("draft", int(limit)))
+    cur = con.execute(sql, tuple(publishable_statuses) + (int(limit),))
     return list(cur.fetchall())
 
 def db_marketing_post_set_status(
@@ -2381,139 +2401,37 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     import sys
-    import sqlite3
-    from typing import Any, Dict, List, Tuple
+
+    from mgc.marketing.publish import PublishDeps, publish_marketing
 
     deterministic = is_deterministic(args)
-
     db_path = resolve_db_path(args)
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
-    ts = deterministic_now_iso(deterministic)
-
-    con = db_connect(db_path)
-    ensure_tables_minimal(con)
-
-    pending = db_marketing_posts_pending(con, limit=limit)
-
-    # Defensive stable ordering (even if helper already orders)
-    def _row_get(r: sqlite3.Row, key: str) -> Any:
-        try:
-            return r[key]
-        except Exception:
-            return None
-
-    def _first_id(r: sqlite3.Row) -> str:
-        v = _row_first(r, ["id", "post_id", "marketing_post_id"], default="")
-        return str(v or "")
-
-    def _first_created(r: sqlite3.Row) -> str:
-        v = _row_first(r, ["created_at", "created_ts", "ts"], default="")
-        return str(v or "")
-
-    pending_sorted = sorted(
-        list(pending),
-        key=lambda r: (_first_created(r), _first_id(r)),
+    deps = PublishDeps(
+        deterministic_now_iso=deterministic_now_iso,
+        stable_uuid5=stable_uuid5,
+        stable_json_dumps=stable_json_dumps,
+        db_connect=db_connect,
+        ensure_tables_minimal=ensure_tables_minimal,
+        db_marketing_posts_pending=db_marketing_posts_pending,
+        db_marketing_post_set_status=db_marketing_post_set_status,
+        db_drop_mark_published=db_drop_mark_published,
+        db_insert_event=db_insert_event,
+        row_first=lambda r, keys: _row_first(r, list(keys), default=None),
+        marketing_row_meta=_marketing_row_meta,
+        marketing_row_content=_marketing_row_content,
     )
 
-    published: List[Dict[str, Any]] = []
-    skipped_ids: List[str] = []
-    run_ids_touched: List[str] = []
-
-    # Collect run_ids deterministically (based on the pending set, not publish side effects)
-    for row in pending_sorted:
-        meta = _marketing_row_meta(con, row)
-        rid = str((meta or {}).get("run_id") or "")
-        if rid:
-            run_ids_touched.append(rid)
-    run_ids_touched = sorted(set([r for r in run_ids_touched if r]))
-
-    # Batch id should be deterministic given (ts in live mode) and stable inputs.
-    # In deterministic mode, ts is already fixed (via deterministic_now_iso), but we still treat it as stable.
-    batch_id = stable_uuid5(
-        "marketing_publish_batch",
-        (ts if not deterministic else "fixed"),
-        str(limit),
-        ("dry" if dry_run else "live"),
-        ("|".join(run_ids_touched) if run_ids_touched else "no_runs"),
+    out_obj = publish_marketing(
+        deps=deps,
+        db_path=db_path,
+        limit=limit,
+        dry_run=dry_run,
+        deterministic=deterministic,
     )
 
-    # Now publish items
-    for row in pending_sorted:
-        post_id = _first_id(row)
-        platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
-        content = _marketing_row_content(con, row)
-
-        if not content.strip():
-            skipped_ids.append(post_id)
-            continue
-
-        meta = _marketing_row_meta(con, row)
-        run_id = str((meta or {}).get("run_id") or "")
-        drop_id = str((meta or {}).get("drop_id") or "")
-
-        # publish_id must be stable; derive from batch_id + post_id + platform
-        publish_id = stable_uuid5("publish", batch_id, post_id, platform)
-
-        if not dry_run:
-            db_marketing_post_set_status(
-                con,
-                post_id=post_id,
-                status="published",
-                ts=ts,
-                meta_patch={"published_id": publish_id, "published_ts": ts, "batch_id": batch_id},
-            )
-
-        published.append(
-            {
-                "post_id": post_id,
-                "platform": platform,
-                "published_id": publish_id,
-                "published_ts": ts,
-                "dry_run": dry_run,
-                "content": content,
-                "run_id": run_id,
-                "drop_id": drop_id,
-            }
-        )
-
-    drops_updated: Dict[str, int] = {}
-    if run_ids_touched and not dry_run:
-        for rid in run_ids_touched:
-            drops_updated[rid] = db_drop_mark_published(
-                con,
-                run_id=rid,
-                marketing_batch_id=batch_id,
-                published_ts=ts,
-            )
-
-    db_insert_event(
-        con,
-        event_id=stable_uuid5("event", "marketing.published", batch_id),
-        ts=ts,
-        kind="marketing.published",
-        actor="system",
-        meta={
-            "batch_id": batch_id,
-            "count": len(published),
-            "dry_run": dry_run,
-            "skipped_empty": len(skipped_ids),
-            "run_ids": run_ids_touched,
-            "drops_updated": drops_updated,
-        },
-    )
-
-    out_obj = {
-        "batch_id": batch_id,
-        "ts": ts,
-        "count": len(published),
-        "skipped_empty": len(skipped_ids),
-        "skipped_ids": skipped_ids,
-        "run_ids": run_ids_touched,
-        "drops_updated": drops_updated,
-        "items": published,
-    }
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
 
