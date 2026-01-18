@@ -1847,16 +1847,6 @@ def _stub_daily_run(
       - bundled copy under out_dir/tracks/<track_id>.<ext> (portable drop artifact)
       - out_dir/playlist.json pointing at bundled track (web-build friendly)
       - out_dir/daily_evidence*.json includes bundle paths + sha256
-
-    Supports:
-      - stub (deterministic placeholder)
-      - riffusion (local server)
-      - staged providers (suno, diffsinger)
-
-    Provider API compatibility:
-      - generate()                          (current StubProvider)
-      - generate(**kwargs)                  (kwargs-style providers)
-      - generate(request_obj)               (older request-object providers)
     """
     import hashlib
     import os
@@ -1889,14 +1879,11 @@ def _stub_daily_run(
     artifact_path = (Path.cwd() / artifact_rel).resolve()
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build prompt from context
     prompt = build_prompt(context)
 
-    # Pick provider
     provider_name = str(os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
     provider = get_provider(provider_name)
 
-    # Build legacy request object (matches your GenerateRequest dataclass)
     req_obj = GenerateRequest(
         track_id=track_id,
         run_id=run_id,
@@ -1908,9 +1895,7 @@ def _stub_daily_run(
         out_rel=str(artifact_path),
     )
 
-    # kwargs form for providers that accept **kwargs
     req_kwargs = {
-        # Common keys used across provider implementations
         "track_id": req_obj.track_id,
         "run_id": req_obj.run_id,
         "context": req_obj.context,
@@ -1919,16 +1904,12 @@ def _stub_daily_run(
         "deterministic": req_obj.deterministic,
         "ts": req_obj.ts,
         "out_rel": req_obj.out_rel,
-
-        # Keys expected by the current StubProvider.generate(...) API (keyword-only)
         "out_dir": str(out_dir),
         "now_iso": ts,
         "schedule": "daily",
-        # period_key must be stable under determinism; align with CI convention
         "period_key": ("2020-01-01" if deterministic else ts.split("T", 1)[0]),
     }
 
-    # Generate (compatibility order: filtered kwargs -> no-arg -> request object)
     def _call_generate_with_filtered_kwargs():
         import inspect
 
@@ -1936,15 +1917,16 @@ def _stub_daily_run(
         sig = inspect.signature(fn)
         params = sig.parameters
 
-        # If provider accepts **kwargs, pass the full dict (minus clearly-foreign keys)
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
             safe = dict(req_kwargs)
-            # historically some providers did not accept run_id
             safe.pop("run_id", None)
             return fn(**safe)  # type: ignore[misc]
 
-        # Otherwise, only pass supported keyword args
-        allowed = {k for k, p in params.items() if p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)}
+        allowed = {
+            k
+            for k, p in params.items()
+            if p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        }
         filtered = {k: v for k, v in req_kwargs.items() if k in allowed}
         return fn(**filtered)  # type: ignore[misc]
 
@@ -1956,7 +1938,6 @@ def _stub_daily_run(
         except TypeError:
             result = provider.generate(req_obj)  # type: ignore[misc]
 
-    # Ensure extension matches provider output
     if getattr(result, "ext", None):
         ext = result.ext if result.ext.startswith(".") else f".{result.ext}"
         if artifact_path.suffix != ext:
@@ -1964,11 +1945,9 @@ def _stub_daily_run(
             artifact_path = (Path.cwd() / artifact_rel).resolve()
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write provider artifact bytes (repo storage)
     artifact_bytes = getattr(result, "artifact_bytes", None) or b""
     artifact_path.write_bytes(artifact_bytes)
 
-    # Insert track
     db_insert_track(
         con,
         track_id=track_id,
@@ -1988,7 +1967,6 @@ def _stub_daily_run(
         },
     )
 
-    # Insert drop
     db_insert_drop(
         con,
         drop_id=drop_id,
@@ -2008,7 +1986,6 @@ def _stub_daily_run(
         },
     )
 
-    # Events
     db_insert_event(
         con,
         event_id=stable_uuid5("event", "drop.created", drop_id),
@@ -2033,7 +2010,6 @@ def _stub_daily_run(
         },
     )
 
-    # Marketing drafts
     platforms = ["x", "youtube_shorts", "instagram_reels", "tiktok"]
     post_ids: List[str] = []
     for platform in platforms:
@@ -2074,9 +2050,6 @@ def _stub_daily_run(
         meta={"run_id": run_id, "drop_id": drop_id, "count": len(post_ids), "post_ids": post_ids},
     )
 
-    # ---------------------------------------------------------------------
-    # Portable bundle outputs (tracks + playlist.json)
-    # ---------------------------------------------------------------------
     bundle_tracks_dir = out_dir / "tracks"
     bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2110,6 +2083,10 @@ def _stub_daily_run(
     repo_artifact_sha256 = _sha256_file(artifact_path)
     bundled_track_sha256 = _sha256_file(bundled_track_path)
     playlist_sha256 = _sha256_file(playlist_path)
+
+    # IMPORTANT: manifest sha is computed later by the manifest stage.
+    # _stub_daily_run may execute before that, so keep a stable placeholder.
+    manifest_sha256 = ""
 
     evidence_obj: Dict[str, Any] = {
         "schema": "mgc.daily_evidence.v1",
@@ -2182,11 +2159,6 @@ def _stub_daily_run(
         },
         "marketing_post_ids": post_ids,
     }
-
-    evidence_path = out_dir / ("daily_evidence.json" if deterministic else f"daily_evidence_{run_id}.json")
-    evidence_path.write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8")
-
-    return evidence
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
     """Build a daily drop bundle from the library DB using the deterministic playlist builder.
@@ -4438,6 +4410,11 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     drop_id = str(evidence_obj.get("drop_id") or "")
     run_id = str(evidence_obj.get("run_id") or "")
 
+    # Prefer the manifest computed by the drop pipeline (portable path + sha).
+    drop_paths = (evidence_obj.get("paths") if isinstance(evidence_obj, dict) else None) or {}
+    manifest_name = str(drop_paths.get("manifest") or "manifest.json")
+    manifest_sha256 = str(drop_paths.get("manifest_sha256") or "")
+
     # IMPORTANT: top-level paths must be portable so runs in different out_dir still diff clean.
     # drop.paths already contains portable paths ("." / manifest.json / drop_evidence.json).
     out: Dict[str, Any] = {
@@ -4449,7 +4426,7 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "evidence_path": "drop_evidence.json",
             # submission.zip lives outside out_dir and is stable; keep absolute for convenience.
             "submission_zip": str(zip_path),
-            "manifest": "weekly_manifest.json",
+            "manifest": manifest_name,
             "manifest_sha256": manifest_sha256,
         },
         "verify": {
