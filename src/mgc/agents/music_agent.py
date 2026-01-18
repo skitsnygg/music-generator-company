@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -130,8 +130,38 @@ class MusicAgent:
             period_key=str(period_key),
         )
 
-        if not isinstance(art, dict):
-            raise TypeError(f"Provider returned non-dict artifact: {type(art)}")
+        # Providers may return either a dict (preferred) or a dataclass/GenerateResult-like object.
+        if isinstance(art, dict):
+            art_dict = art
+        elif is_dataclass(art):
+            art_dict = asdict(art)
+        elif hasattr(art, "__dict__"):
+            art_dict = dict(vars(art))
+        else:
+            raise TypeError(f"Provider returned unsupported artifact type: {type(art)}")
+
+        art = art_dict
+
+
+        # If provider returned bytes instead of a path, materialize to disk under out_dir.
+        if (not art.get("artifact_path")) and art.get("artifact_bytes"):
+            out_dir_p = Path(out_dir).expanduser().resolve()
+            out_dir_p.mkdir(parents=True, exist_ok=True)
+
+            ext = str(art.get("ext") or "").strip().lower()
+            if ext and not ext.startswith("."):
+                ext = "." + ext
+            if not ext:
+                ext = ".wav"
+
+            out_path = out_dir_p / f"{track_id}{ext}"
+            out_path.write_bytes(art["artifact_bytes"])
+            art["artifact_path"] = str(out_path)
+
+        if not art.get("artifact_path"):
+            raise TypeError(
+                f"Provider artifact missing required 'artifact_path' key: keys={sorted(list(art.keys()))}"
+            )
 
         artifact_path = str(art.get("artifact_path") or "")
         if not artifact_path:

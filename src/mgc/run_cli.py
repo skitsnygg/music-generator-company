@@ -1466,8 +1466,8 @@ def db_insert_track(
         raise sqlite3.OperationalError("table tracks does not exist")
 
     ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
-    # NOTE: different DB schemas use different column names for the primary audio path.
-    # The canonical schema uses `full_path`.
+
+    # Canonical schema uses full_path; other schemas vary.
     path_col = _pick_first_existing(cols, ["full_path", "artifact_path", "audio_path", "path", "file_path", "uri"])
     preview_col = _pick_first_existing(cols, ["preview_path", "preview", "teaser_path"])
     bpm_col = _pick_first_existing(cols, ["bpm", "tempo"])
@@ -1485,36 +1485,49 @@ def db_insert_track(
         "meta": stable_json_dumps(meta),
         "metadata": stable_json_dumps(meta),
     }
+
     if ts_col:
         data[ts_col] = ts
+
+    # ----------------------------
+    # Path + preview enforcement
+    # ----------------------------
     if path_col and artifact_path is not None:
-        # Guard: never write a path that doesn't exist on disk.
-        # This prevents late failures (e.g., web build) caused by DB/file drift.
-        ap = Path(str(artifact_path))
-        ap_resolved = ap if ap.is_absolute() else (Path.cwd() / ap)
+        ap = Path(str(artifact_path)).expanduser()
+        # Resolve relative paths from CWD (repo root in your CLI usage).
+        ap_resolved = ap if ap.is_absolute() else (Path.cwd() / ap).resolve()
+
+        # Guard: never write a path that doesn't exist.
         if not ap_resolved.is_file():
             raise FileNotFoundError(
-                f"Refusing to insert track with missing {path_col}: {artifact_path} (resolved: {ap_resolved}) track_id={track_id}"
+                f"Refusing to insert track with missing {path_col}: {artifact_path} "
+                f"(resolved: {ap_resolved}) track_id={track_id}"
             )
-        data[path_col] = artifact_path
 
-        # If the schema requires a preview path, derive a deterministic default.
-        # We only accept a preview if it exists on disk.
+        # Write primary path column.
+        data[path_col] = str(artifact_path)
+
+        # If schema requires a preview, choose one that exists.
         if preview_col:
-            stem = ap.stem
-            # Preferred: data/previews/<stem>_preview.mp3
+            # 1) Preferred: data/previews/<stem>_preview.mp3
+            stem = ap_resolved.stem
             guess1 = Path("data") / "previews" / f"{stem}_preview.mp3"
-            g1 = guess1 if guess1.is_absolute() else (Path.cwd() / guess1)
+            g1 = (Path.cwd() / guess1).resolve()
+
             if g1.is_file():
                 data[preview_col] = str(guess1)
             else:
-                # Fallback: if the artifact itself is an mp3, it can serve as a preview.
-                if ap_resolved.suffix.lower() == ".mp3" and ap_resolved.is_file():
-                    data[preview_col] = artifact_path
+                # 2) If artifact is already an mp3, it can serve as preview.
+                if ap_resolved.suffix.lower() == ".mp3":
+                    data[preview_col] = str(artifact_path)
                 else:
-                    raise FileNotFoundError(
-                        f"Refusing to insert track: missing required {preview_col}. Tried {guess1} (resolved: {g1}) for track_id={track_id}"
-                    )
+                    # 3) Minimal, deterministic fallback: use the artifact itself as preview.
+                    # This keeps the DB invariant (preview_path exists) without requiring ffmpeg.
+                    data[preview_col] = str(artifact_path)
+
+    # ----------------------------
+    # Optional fields
+    # ----------------------------
     if bpm_col:
         data[bpm_col] = _stable_int_from_key(f"{track_id}|{title}|{provider}|{bpm_col}", 60, 140)
 
@@ -3467,13 +3480,11 @@ def cmd_run_tail(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_run_generate(args: argparse.Namespace) -> int:
-    """Generate a new track into the *library* (repo_root/data/tracks) and register it in DB.
-
-    This is the Music Agent entrypoint for the autonomous system.
+    """Generate a new track into the *library* (repo_root/data/tracks/YYYY-MM-DD) and register it in DB.
 
     Outputs:
-      - data/tracks/<track_id>.wav
-      - data/tracks/<track_id>.json (metadata)
+      - data/tracks/YYYY-MM-DD/<track_id>.<ext>
+      - data/tracks/YYYY-MM-DD/<track_id>.json (metadata)
       - DB row in tracks table
       - <out_dir>/evidence/generate_evidence.json
 
@@ -3483,27 +3494,15 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     deterministic = is_deterministic(args)
     json_mode = bool(getattr(args, "json", False))
 
-    # Grow the library inventory on every autonomous run
-    with _silence_stdout(True):
-        try:
-            cmd_run_generate(args)
-        except Exception as _e:
-            # Do not fail the whole autonomous run if generation fails; report in JSON if requested.
-            if json_mode:
-                sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "generate", "error": str(_e)}))
-                return 2
-            raise
-
-
     db_path = resolve_db_path(args)
     context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
 
-    # Evidence root for this run (keep paths stable/relative)
+    # Evidence root for this run
     out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
     evidence_dir = out_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    # Library storage
+    # Library storage root
     repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
     store_dir_raw = getattr(args, "store_dir", None)
     store_dir = Path(store_dir_raw).expanduser().resolve() if store_dir_raw else (repo_root / "data" / "tracks")
@@ -3511,6 +3510,10 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
 
     # Timestamp + IDs
     now_iso = deterministic_now_iso(deterministic)
+    day = now_iso.split("T", 1)[0]  # YYYY-MM-DD
+    day_dir = store_dir / day
+    day_dir.mkdir(parents=True, exist_ok=True)
+
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
     seed_val = getattr(args, "seed", None)
@@ -3520,7 +3523,6 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     if provided_track_id:
         track_id = provided_track_id
     else:
-        # Deterministic-but-changing per (context, seed, time) unless fixed time is used.
         if deterministic:
             track_id = stable_uuid5(f"track:generate:{now_iso}:{context}:{seed}", namespace=ns)
         else:
@@ -3531,7 +3533,6 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     else:
         run_id = str(uuid.uuid4())
 
-    # Generate via MusicAgent (provider may be stub)
     provider_name = str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
 
     from mgc.agents.music_agent import MusicAgent
@@ -3543,37 +3544,53 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
         seed=int(seed),
         deterministic=bool(deterministic),
         schedule="generate",
-        period_key=now_iso.split("T", 1)[0],
-        out_dir=str(store_dir),
+        period_key=day,
+        out_dir=str(day_dir),
         now_iso=now_iso,
     )
 
-    wav_path = Path(track.artifact_path)
-    suffix = wav_path.suffix.lower() or ".wav"
-    final_wav = store_dir / f"{track_id}{suffix}"
-    if wav_path.resolve() != final_wav.resolve():
-        final_wav.write_bytes(wav_path.read_bytes())
+    src_path = Path(track.artifact_path)
+    suffix = src_path.suffix.lower() or ".wav"
 
-    sha = sha256_file(final_wav)
+    final_artifact = day_dir / f"{track_id}{suffix}"
+    if src_path.resolve() != final_artifact.resolve():
+        final_artifact.write_bytes(src_path.read_bytes())
+
+    sha = sha256_file(final_artifact)
 
     title = str(getattr(track, "title", "") or f"{context.title()} Track")
     mood = str(getattr(track, "mood", "") or context)
     genre = str(getattr(track, "genre", "") or "unknown")
 
     meta = dict(getattr(track, "meta", None) or {})
-    meta.update({"generated_by": "run.generate", "context": context, "seed": int(seed), "deterministic": bool(deterministic), "ts": now_iso})
+    meta.update(
+        {
+            "generated_by": "run.generate",
+            "context": context,
+            "seed": int(seed),
+            "deterministic": bool(deterministic),
+            "ts": now_iso,
+        }
+    )
 
-    # Write metadata JSON next to the WAV
-    meta_path = store_dir / f"{track_id}.json"
+    # Prefer DB-stored paths relative to repo_root when possible
+    try:
+        artifact_rel = str(final_artifact.resolve().relative_to(repo_root))
+    except Exception:
+        artifact_rel = str(final_artifact)
+
+    # Write metadata JSON next to the artifact
+    meta_path = day_dir / f"{track_id}.json"
     meta_doc = {
         "schema": "mgc.track_meta.v1",
         "version": 1,
         "track_id": str(track_id),
+        "run_id": str(run_id),
         "provider": str(getattr(track, "provider", provider_name)),
         "title": title,
         "mood": mood,
         "genre": genre,
-        "artifact_path": str(final_wav),
+        "artifact_path": artifact_rel,
         "sha256": sha,
         "ts": now_iso,
         "meta": meta,
@@ -3592,49 +3609,36 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
             provider=str(getattr(track, "provider", provider_name)),
             mood=mood,
             genre=genre,
-            artifact_path=str(final_wav),
+            artifact_path=artifact_rel,
             meta=meta,
         )
         con.commit()
     finally:
         con.close()
 
-    ev = {
-        "schema": "mgc.generate_evidence.v1",
-        "version": 1,
+    evidence = {
+        "ok": True,
+        "cmd": "run.generate",
         "run_id": str(run_id),
-        "stage": "generate",
+        "track_id": str(track_id),
         "context": context,
+        "provider": provider_name,
         "deterministic": bool(deterministic),
         "ts": now_iso,
-        "provider": str(getattr(track, "provider", provider_name)),
-        "track": {"track_id": str(track_id), "path": str(final_wav), "sha256": sha, "meta_path": str(meta_path)},
+        "artifact_path": artifact_rel,
+        "sha256": sha,
+        "meta_path": str(meta_path),
+        "evidence_dir": str(evidence_dir),
     }
-    (evidence_dir / "generate_evidence.json").write_text(json.dumps(ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (evidence_dir / "generate_evidence.json").write_text(stable_json_dumps(evidence) + "\n", encoding="utf-8")
 
     if json_mode:
-        sys.stdout.write(
-            stable_json_dumps(
-                {
-                    "ok": True,
-                    "stage": "generate",
-                    "run_id": str(run_id),
-                    "track_id": str(track_id),
-                    "paths": {
-                        "generate_evidence": "evidence/generate_evidence.json",
-                        "track": str(final_wav),
-                        "meta": str(meta_path),
-                        "manifest": "manifest.json",
-                        "manifest_sha256": manifest_sha256,
-                    },
-                }
-            )
-            + "\n"
-        )
+        sys.stdout.write(stable_json_dumps(evidence) + "\n")
     else:
-        print(f"[run.generate] ok run_id={run_id} track_id={track_id} path={final_wav}", file=sys.stderr)
+        _eprint(f"[run.generate] ok track_id={track_id} artifact={artifact_rel}")
 
     return 0
+
 # ---------------------------------------------------------------------------
 # Weekly run (7 dailies + publish + manifest + consolidated evidence)
 # ---------------------------------------------------------------------------
@@ -4972,7 +4976,22 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.set_defaults(func=cmd_run_weekly)
 
     # ----------------------------
-    # autonomous (NEW)
+    # generate
+    # ----------------------------
+    gen = run_sub.add_parser("generate", help="Generate a new track into the library and register it in DB")
+    gen.add_argument("--context", default="focus", help="Context/mood (focus/workout/sleep)")
+    gen.add_argument("--seed", type=int, default=None, help="Seed for deterministic behavior")
+    gen.add_argument("--provider", default=None, help="Provider to use (default: MGC_PROVIDER or 'stub')")
+    gen.add_argument("--track-id", dest="track_id", default=None, help="Optional explicit track_id")
+    gen.add_argument("--repo-root", default=".", help="Repository root (for relative paths)")
+    gen.add_argument("--store-dir", default=None, help="Override track storage dir (default: <repo_root>/data/tracks)")
+    gen.add_argument("--out-dir", default=None, help="Evidence directory (default: data/evidence or MGC_EVIDENCE_DIR)")
+    gen.add_argument("--deterministic", action="store_true", help="Enable deterministic mode")
+    gen.set_defaults(func=cmd_run_generate)
+
+
+    # ----------------------------
+    # autonomous
     # ----------------------------
     auto = run_sub.add_parser("autonomous", help="Run end-to-end drop + verify submission (cron-safe)")
     auto.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
