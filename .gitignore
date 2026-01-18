@@ -49,3 +49,4 @@ data/
 # Generated playlists artifacts (committed only when explicitly forced)
 data/playlists/_manifest.playlists.json
 data/playlists/*.json
+tracks/

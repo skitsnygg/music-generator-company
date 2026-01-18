@@ -20,7 +20,6 @@ import struct
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 from mgc.context import build_prompt, get_context_spec
@@ -30,6 +29,35 @@ try:
 except Exception:  # pragma: no cover
     def get_provider(_name: str):  # type: ignore
         raise RuntimeError("Provider API not available (mgc.providers.get_provider missing). Use MusicAgent-based generation.")
+
+from pathlib import Path
+
+def _write_marketing_receipt(
+    *,
+    receipt: Dict[str, Any],
+    stable_json_dumps,
+) -> str:
+    """
+    Append-only receipt writer for marketing publish.
+
+    Location:
+      data/evidence/marketing/receipts/<batch_id>/<platform>/<post_id>.json
+    """
+    base = Path("data/evidence/marketing/receipts")
+    batch_id = receipt.get("batch_id", "unknown")
+    platform = receipt.get("platform", "unknown")
+    post_id = receipt.get("post_id", "unknown")
+
+    out_path = base / batch_id / platform / f"{post_id}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists():
+        return str(out_path)
+
+    tmp = out_path.with_suffix(".tmp")
+    tmp.write_text(stable_json_dumps(receipt) + "\n", encoding="utf-8")
+    tmp.replace(out_path)
+    return str(out_path)
 
 
 @dataclass(frozen=True)
@@ -1563,26 +1591,67 @@ def db_insert_marketing_post(
     if not cols:
         raise sqlite3.OperationalError("table marketing_posts does not exist")
 
+    # Column drift
+    pk_col = _pick_first_existing(cols, ["id", "post_id", "marketing_post_id"]) or "id"
     ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
     platform_col = _pick_first_existing(cols, ["platform", "channel", "destination"])
     status_col = _pick_first_existing(cols, ["status", "state"])
+    track_id_col = _pick_first_existing(cols, ["track_id", "track", "track_uuid"])
 
-    content_col = _detect_marketing_content_col(cols)
+    content_col = _detect_marketing_content_col(cols)  # should pick payload_json if present
     meta_col = _detect_marketing_meta_col(cols)
 
+    # If neither content nor meta columns were detected, fall back to a generic text payload column.
     best_payload = None
     if not content_col and not meta_col:
         best_payload = _best_text_payload_column(
             con,
             "marketing_posts",
-            reserved=["id", "post_id", "ts", "created_at", "platform", "channel", "destination", "status", "state"],
+            reserved=[
+                "id",
+                "post_id",
+                "marketing_post_id",
+                "ts",
+                "created_at",
+                "created_ts",
+                "platform",
+                "channel",
+                "destination",
+                "status",
+                "state",
+                "track_id",
+                "track",
+                "track_uuid",
+            ],
         )
 
-    meta_to_store = dict(meta)
-    if not content_col:
-        meta_to_store["content"] = content
+    # We may need a track_id if schema enforces it (your DB does).
+    # Primary source: meta["track_id"]
+    track_id_val = str((meta or {}).get("track_id") or "")
 
-    data: Dict[str, Any] = {"id": post_id, "post_id": post_id}
+    # Fallback: if content is JSON, try pulling track_id out of it.
+    if not track_id_val:
+        try:
+            obj = json.loads(content) if isinstance(content, str) else None
+            if isinstance(obj, dict):
+                track_id_val = str(obj.get("track_id") or "")
+        except Exception:
+            pass
+
+    data: Dict[str, Any] = {}
+
+    # PK
+    data[pk_col] = post_id
+
+    # Also populate common alias columns if present (harmless, helps drift)
+    if pk_col != "id" and "id" in cols:
+        data["id"] = post_id
+    if pk_col != "post_id" and "post_id" in cols:
+        data["post_id"] = post_id
+    if pk_col != "marketing_post_id" and "marketing_post_id" in cols:
+        data["marketing_post_id"] = post_id
+
+    # Timestamps / platform / status
     if ts_col:
         data[ts_col] = ts
     if platform_col:
@@ -1590,15 +1659,39 @@ def db_insert_marketing_post(
     if status_col:
         data[status_col] = status
 
+    # Track FK if schema has it
+    if track_id_col:
+        if not track_id_val:
+            # If the schema has track_id, we refuse to insert an FK-violating row.
+            # This is what was killing `run autonomous`.
+            raise ValueError(
+                "marketing_posts schema requires track_id, but none was provided. "
+                "Pass meta={'track_id': ...} (or include track_id in JSON content)."
+            )
+        data[track_id_col] = track_id_val
+
+    # Content/meta placement
+    meta_to_store = dict(meta or {})
+    if not content_col:
+        meta_to_store["content"] = content
+
     if content_col:
         data[content_col] = content
+        # If there is also a meta column, store meta separately (nice for debugging)
+        if meta_col:
+            data[meta_col] = stable_json_dumps(meta or {})
     elif meta_col:
         data[meta_col] = stable_json_dumps(meta_to_store)
     elif best_payload:
         data[best_payload] = stable_json_dumps(meta_to_store) if meta_to_store else content
-
-    if meta_col and meta_col not in data:
-        data[meta_col] = stable_json_dumps(meta)
+    else:
+        # Last resort: attempt 'content' if it exists (some schemas use it)
+        if "content" in cols:
+            data["content"] = content
+        else:
+            raise sqlite3.OperationalError(
+                "marketing_posts has no detectable payload/meta column to store content"
+            )
 
     _insert_row(con, "marketing_posts", data)
 
@@ -2401,39 +2494,157 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
     import sys
-
-    from mgc.marketing.publish import PublishDeps, publish_marketing
+    import sqlite3
+    from typing import Any, Dict, List
 
     deterministic = is_deterministic(args)
     db_path = resolve_db_path(args)
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
-    deps = PublishDeps(
-        deterministic_now_iso=deterministic_now_iso,
-        stable_uuid5=stable_uuid5,
-        stable_json_dumps=stable_json_dumps,
-        db_connect=db_connect,
-        ensure_tables_minimal=ensure_tables_minimal,
-        db_marketing_posts_pending=db_marketing_posts_pending,
-        db_marketing_post_set_status=db_marketing_post_set_status,
-        db_drop_mark_published=db_drop_mark_published,
-        db_insert_event=db_insert_event,
-        row_first=lambda r, keys: _row_first(r, list(keys), default=None),
-        marketing_row_meta=_marketing_row_meta,
-        marketing_row_content=_marketing_row_content,
+    ts = deterministic_now_iso(deterministic)
+
+    con = db_connect(db_path)
+    ensure_tables_minimal(con)
+
+    pending = db_marketing_posts_pending(con, limit=limit)
+
+    def _first_id(r: sqlite3.Row) -> str:
+        return str(_row_first(r, ["id", "post_id", "marketing_post_id"], default="") or "")
+
+    def _first_created(r: sqlite3.Row) -> str:
+        return str(_row_first(r, ["created_at", "created_ts", "ts"], default="") or "")
+
+    pending_sorted = sorted(
+        list(pending),
+        key=lambda r: (_first_created(r), _first_id(r)),
     )
 
-    out_obj = publish_marketing(
-        deps=deps,
-        db_path=db_path,
-        limit=limit,
-        dry_run=dry_run,
-        deterministic=deterministic,
+    published: List[Dict[str, Any]] = []
+    skipped_ids: List[str] = []
+    run_ids_touched: List[str] = []
+
+    for row in pending_sorted:
+        meta = _marketing_row_meta(con, row) or {}
+        rid = str(meta.get("run_id") or "")
+        if rid:
+            run_ids_touched.append(rid)
+    run_ids_touched = sorted(set(run_ids_touched))
+
+    batch_id = stable_uuid5(
+        "marketing_publish_batch",
+        (ts if not deterministic else "fixed"),
+        str(limit),
+        ("dry" if dry_run else "live"),
+        ("|".join(run_ids_touched) if run_ids_touched else "no_runs"),
     )
+
+    receipt_paths: List[str] = []
+
+    for row in pending_sorted:
+        post_id = _first_id(row)
+        platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
+        content = _marketing_row_content(con, row) or ""
+
+        if not content.strip():
+            skipped_ids.append(post_id)
+            continue
+
+        meta = _marketing_row_meta(con, row) or {}
+        run_id = str(meta.get("run_id") or "")
+        drop_id = str(meta.get("drop_id") or "")
+        track_id = str(meta.get("track_id") or "")
+
+        publish_id = stable_uuid5("publish", batch_id, post_id, platform)
+
+        if not dry_run:
+            db_marketing_post_set_status(
+                con,
+                post_id=post_id,
+                status="published",
+                ts=ts,
+                meta_patch={
+                    "published_id": publish_id,
+                    "published_ts": ts,
+                    "batch_id": batch_id,
+                },
+            )
+
+        item = {
+            "post_id": post_id,
+            "platform": platform,
+            "published_id": publish_id,
+            "published_ts": ts,
+            "dry_run": dry_run,
+            "content": content,
+            "run_id": run_id,
+            "drop_id": drop_id,
+        }
+        published.append(item)
+
+        receipt = {
+            "receipt_id": stable_uuid5("marketing_receipt", batch_id, post_id, platform),
+            "batch_id": batch_id,
+            "ts": ts,
+            "status": "dry_run" if dry_run else "ok",
+            "post_id": post_id,
+            "platform": platform,
+            "published_id": publish_id,
+            "run_id": run_id,
+            "drop_id": drop_id,
+            "track_id": track_id,
+            "content": content,
+        }
+
+        receipt_paths.append(
+            _write_marketing_receipt(
+                receipt=receipt,
+                stable_json_dumps=stable_json_dumps,
+            )
+        )
+
+    drops_updated: Dict[str, int] = {}
+    if run_ids_touched and not dry_run:
+        for rid in run_ids_touched:
+            drops_updated[rid] = db_drop_mark_published(
+                con,
+                run_id=rid,
+                marketing_batch_id=batch_id,
+                published_ts=ts,
+            )
+
+    db_insert_event(
+        con,
+        event_id=stable_uuid5("event", "marketing.published", batch_id),
+        ts=ts,
+        kind="marketing.published",
+        actor="system",
+        meta={
+            "batch_id": batch_id,
+            "count": len(published),
+            "dry_run": dry_run,
+            "skipped_empty": len(skipped_ids),
+            "run_ids": run_ids_touched,
+            "drops_updated": drops_updated,
+            "receipts_written": len(receipt_paths),
+        },
+    )
+
+    out_obj = {
+        "batch_id": batch_id,
+        "ts": ts,
+        "count": len(published),
+        "skipped_empty": len(skipped_ids),
+        "skipped_ids": skipped_ids,
+        "run_ids": run_ids_touched,
+        "drops_updated": drops_updated,
+        "items": published,
+        "receipts_written": len(receipt_paths),
+    }
 
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
     return 0
+
 
 # ---------------------------------------------------------------------------
 # Drop (daily + publish + manifest) with stages and resume semantics

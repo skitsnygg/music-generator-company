@@ -40,6 +40,25 @@ from typing import Any, Dict, List, Optional, Tuple
 # Small utilities
 # -----------------------------
 
+def _argv_get_flag_value(flag: str) -> str:
+    """Best-effort extraction of a flag value from sys.argv.
+
+    mgc.main defines some global flags (e.g. --db) and may consume them depending on position.
+    Web commands still need to honor `--db ...` even when provided after `web build`.
+    """
+    try:
+        argv = list(sys.argv or [])
+    except Exception:
+        return ""
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            if not str(nxt).startswith("-"):
+                return str(nxt)
+        if str(tok).startswith(flag + "="):
+            return str(tok).split("=", 1)[1]
+    return ""
+
 def _eprint(msg: str) -> None:
     sys.stderr.write(msg.rstrip() + "\n")
 
@@ -57,10 +76,19 @@ def _sha256_hex(s: str) -> str:
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path)
+    # Always resolve to an absolute path (avoid surprises with CWD).
+    p = Path(str(db_path or "")).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        pass
+    con = sqlite3.connect(str(p))
     con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA foreign_keys = ON;")
+    except Exception:
+        pass
     return con
-
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     row = con.execute(
@@ -228,172 +256,165 @@ def _walk_collect_strings(obj: Any, out: List[str]) -> None:
         return
 
 
-def _collect_track_paths_from_playlist(playlist_obj: Any) -> List[str]:
-    """
-    Extract audio file paths from common playlist shapes.
-
-    Supported patterns:
-      - top-level list[str]
-      - {"tracks": [str | dict]}
-      - dict entries containing keys like:
-          artifact_path, audio_path, path, file, uri, src, url
-      - any string anywhere that "looks like" an audio path
-    """
-    out: List[str] = []
-
-    def add_path(v: Any) -> None:
-        if not v:
-            return
-        if isinstance(v, str) and _looks_like_audio_path(v.strip()):
-            out.append(v.strip())
-
-    if isinstance(playlist_obj, list):
-        for it in playlist_obj:
-            if isinstance(it, str):
-                add_path(it)
-            elif isinstance(it, dict):
-                for k in ("artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
-                    if k in it:
-                        add_path(it.get(k))
-                        break
-
-    if isinstance(playlist_obj, dict):
-        tracks = playlist_obj.get("tracks")
-        if isinstance(tracks, list):
-            for it in tracks:
-                if isinstance(it, str):
-                    add_path(it)
-                elif isinstance(it, dict):
-                    for k in ("artifact_path", "audio_path", "path", "file", "uri", "src", "url"):
-                        if k in it:
-                            add_path(it.get(k))
-                            break
-
-    if not out:
-        all_strs: List[str] = []
-        _walk_collect_strings(playlist_obj, all_strs)
-        for s in all_strs:
-            if _looks_like_audio_path(s):
-                out.append(s)
-
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-    return deduped
-
-
-def _collect_track_ids_from_playlist(playlist_obj: Any) -> List[str]:
-    ids: List[str] = []
-
-    def add_id(v: Any) -> None:
-        if not v:
-            return
-        if isinstance(v, str):
-            s = v.strip()
-            if s:
-                ids.append(s)
-
-    if isinstance(playlist_obj, dict):
-        if isinstance(playlist_obj.get("track_ids"), list):
-            for it in playlist_obj["track_ids"]:
-                add_id(it)
-
-        tracks = playlist_obj.get("tracks")
-        if isinstance(tracks, list):
-            for it in tracks:
-                if isinstance(it, dict) and "track_id" in it:
-                    add_id(it.get("track_id"))
-
-    seen: set[str] = set()
-    out: List[str] = []
-    for t in ids:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+def _iter_track_dicts(playlist_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return a flat list of dict-like track entries from multiple playlist schema variants."""
+    candidates: List[Any] = []
+    for k in ("tracks", "items", "entries", "playlist_items"):
+        v = playlist_obj.get(k)
+        if isinstance(v, list):
+            candidates.extend(v)
+    out: List[Dict[str, Any]] = []
+    for x in candidates:
+        if isinstance(x, dict):
+            out.append(x)
     return out
 
 
+def _dig_first_str(obj: Any, keys: List[str]) -> str:
+    """Try keys at this level and common nested shapes."""
+    if not isinstance(obj, dict):
+        return ""
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for nest in ("track", "meta", "payload"):
+        nv = obj.get(nest)
+        if isinstance(nv, dict):
+            for k in keys:
+                v = nv.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+def _collect_track_paths_from_playlist(obj: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for t in _iter_track_dicts(obj):
+        v = _dig_first_str(t, ["web_path", "artifact_path", "repo_artifact_path", "path", "file", "filename"])
+        if v:
+            out.append(v)
+    return out
+
+def _collect_track_ids_from_playlist(obj: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for t in _iter_track_dicts(obj):
+        v = _dig_first_str(t, ["track_id", "trackId", "id", "uuid"])
+        if v:
+            out.append(v)
+    return out
+
 def _resolve_track_paths_from_db(*, db_path: str, track_ids: List[str]) -> Tuple[List[str], Dict[str, Any]]:
-    meta: Dict[str, Any] = {
-        "resolved_from": "db",
-        "db": db_path,
-        "requested_ids": len(track_ids),
-        "resolved": 0,
-        "missing": 0,
-        "reason": None,
-    }
+    db_raw = str(db_path or "").strip()
+    if not db_raw:
+        return [], {"ok": False, "reason": "db_missing", "db": ""}
 
-    if not db_path:
-        meta["reason"] = "db_missing"
-        return [], meta
+    dbp = Path(db_raw).expanduser()
+    try:
+        dbp = dbp.resolve()
+    except Exception:
+        pass
 
-    p = Path(db_path).expanduser()
-    if not p.exists():
-        meta["reason"] = "db_not_found"
-        return [], meta
+    if not dbp.exists():
+        return [], {"ok": False, "reason": "db_not_found", "db": str(dbp)}
 
-    con = _connect(str(p))
+    if not track_ids:
+        return [], {"ok": False, "reason": "no_track_ids", "db": str(dbp)}
+
+    try:
+        con = _connect(str(dbp))
+    except Exception as e:
+        return [], {"ok": False, "reason": "db_open_failed", "db": str(dbp), "error": str(e)}
+
     try:
         if not _table_exists(con, "tracks"):
-            meta["reason"] = "tracks_table_missing"
-            return [], meta
+            return [], {"ok": False, "reason": "tracks_table_missing", "db": str(dbp)}
 
-        cols = [r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()]
-        path_col = None
-        for c in ("artifact_path", "audio_path", "path", "file_path", "uri"):
-            if c in cols:
-                path_col = c
-                break
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()}
 
-        id_col = None
-        for c in ("track_id", "id"):
-            if c in cols:
-                id_col = c
-                break
+        # Determine ID column
+        if "track_id" in cols:
+            id_col = "track_id"
+        elif "id" in cols:
+            id_col = "id"
+        elif "uuid" in cols:
+            id_col = "uuid"
+        else:
+            cand = sorted([c for c in cols if c.endswith("_id")])
+            id_col = cand[0] if cand else None
 
-        if not path_col or not id_col:
-            meta["reason"] = "tracks_schema_unexpected"
-            return [], meta
+        # Determine artifact/path column (schema drift tolerant)
+        if "artifact_path" in cols:
+            path_col = "artifact_path"
+        elif "full_path" in cols:
+            path_col = "full_path"
+        elif "preview_path" in cols:
+            path_col = "preview_path"
+        elif "path" in cols:
+            path_col = "path"
+        elif "file_path" in cols:
+            path_col = "file_path"
+        elif "filename" in cols:
+            path_col = "filename"
+        else:
+            path_col = None
 
-        resolved: List[str] = []
+        if not id_col or not path_col:
+            return [], {
+                "ok": False,
+                "reason": "tracks_schema_unexpected",
+                "db": str(dbp),
+                "id_col": id_col,
+                "path_col": path_col,
+                "cols": sorted(list(cols)),
+            }
+
+        q = f"SELECT {id_col} AS tid, {path_col} AS ap FROM tracks WHERE {id_col} IN ({','.join(['?'] * len(track_ids))})"
+        rows = con.execute(q, tuple(track_ids)).fetchall()
+        found = {str(r["tid"]): str(r["ap"]) for r in rows if r["tid"] is not None}
+
+        out: List[str] = []
         missing = 0
-        CHUNK = 800
+        for tid in track_ids:
+            p = found.get(tid)
+            if p:
+                out.append(p)
+            else:
+                missing += 1
 
-        for i in range(0, len(track_ids), CHUNK):
-            chunk = track_ids[i : i + CHUNK]
-            qmarks = ",".join(["?"] * len(chunk))
-            rows = con.execute(
-                f"SELECT {id_col} AS track_id, {path_col} AS p FROM tracks WHERE {id_col} IN ({qmarks})",
-                tuple(chunk),
-            ).fetchall()
-            got = {str(r["track_id"]): (str(r["p"]) if r["p"] is not None else "") for r in rows}
-
-            for tid in chunk:
-                path = got.get(tid, "").strip()
-                if path:
-                    resolved.append(path)
-                else:
-                    missing += 1
-
-        meta["resolved"] = len(resolved)
-        meta["missing"] = missing
-        return resolved, meta
+        return out, {"ok": True, "found": len(out), "missing": missing, "db": str(dbp), "id_col": id_col, "path_col": path_col}
     finally:
         try:
             con.close()
         except Exception:
             pass
 
-
-def _resolve_input_path(raw: str, *, playlist_dir: Path) -> Path:
-    rp = Path(raw).expanduser()
+def _resolve_input_path(raw: str, *, playlist_dir: Path, repo_root: Path) -> Path:
+    rp = Path(str(raw or "")).expanduser()
     if rp.is_absolute():
         return rp
-    return (playlist_dir / rp).resolve()
 
+    # Prefer repo root for DB-returned relative paths like data/tracks/...
+    cand1 = (repo_root / rp)
+    if cand1.exists():
+        return cand1.resolve()
+
+    # Fallback 1: if DB says data/tracks/<file> but files live in daily folders:
+    # try <repo_root>/data/tracks/*/<file>
+    try:
+        parts = rp.parts
+        if len(parts) >= 3 and parts[0] == "data" and parts[1] == "tracks":
+            needle = parts[-1]
+            base = repo_root / "data" / "tracks"
+            # one directory level deep, deterministic ordering
+            hits = sorted(p for p in base.glob(f"*/{needle}") if p.is_file())
+            if len(hits) == 1:
+                return hits[0].resolve()
+            # if multiple matches, do NOT guess—fall through to playlist_dir behavior
+    except Exception:
+        pass
+
+    # Fallback 2: resolve relative to the playlist directory (older run-bundled playlists)
+    return (playlist_dir / rp).resolve()
 
 def _prefer_mp3_path(p: Path) -> Path:
     if p.suffix.lower() == ".wav":
@@ -473,20 +494,33 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     if not playlist_path.exists():
         sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "playlist_not_found", "playlist": str(playlist_path)}) + "\n")
         return 2
-
-    # Billing gate (strict DB resolution)
-    try:
-        _require_pro_if_token(args)
-    except Exception as e:
-        sys.stdout.write(_stable_json_dumps({
-            "ok": False,
-            "reason": "billing_denied",
-            "error": str(e),
-            "hint": "Pass --billing-db explicitly or set MGC_BILLING_DB (billing will not silently use MGC_DB).",
-        }) + "\n")
-        return 2
+    # Billing gate: only enforce when a token-gated feature is requested.
+    if getattr(args, "token", None):
+        try:
+            _require_pro_if_token(args)
+        except Exception as e:
+            sys.stdout.write(_stable_json_dumps({
+                'ok': False,
+                'reason': 'billing_denied',
+                'error': str(e),
+                'hint': 'If using --token, pass --billing-db or set MGC_BILLING_DB.',
+            }) + '\n')
+            return 2
 
     playlist_dir = playlist_path.parent
+    # Prefer deriving repo_root from the DB path when available (db usually lives at <repo>/data/db.sqlite).
+    repo_root = Path.cwd().resolve()
+    try:
+        _db_raw = str(getattr(args, "db", "") or "").strip() or _argv_get_flag_value("--db").strip() or str(os.environ.get("MGC_DB", "") or "").strip()
+        if _db_raw:
+            _dbp = Path(_db_raw).expanduser().resolve()
+            # If DB is in <repo>/data/, treat <repo> as repo_root.
+            if _dbp.parent.name == "data":
+                repo_root = _dbp.parent.parent
+            else:
+                repo_root = _dbp.parent
+    except Exception:
+        pass
     out_dir = Path(str(args.out_dir)).expanduser().resolve()
     tracks_dir = out_dir / "tracks"
     manifest_path = out_dir / "web_manifest.json"
@@ -515,6 +549,10 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         track_ids = _collect_track_ids_from_playlist(playlist_obj)
         if track_ids:
             db_path = str(getattr(args, "db", "") or "").strip()
+            if not db_path:
+                db_path = _argv_get_flag_value("--db").strip()
+            if not db_path:
+                db_path = str(os.environ.get("MGC_DB", "") or "").strip()
             raw_paths, db_meta = _resolve_track_paths_from_db(db_path=db_path, track_ids=track_ids)
             if raw_paths:
                 resolved_from = "db"
@@ -535,7 +573,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     out_tracks: List[Dict[str, Any]] = []
 
     for i, raw in enumerate(raw_paths):
-        rp = _resolve_input_path(raw, playlist_dir=playlist_dir)
+        rp = _resolve_input_path(raw, playlist_dir=playlist_dir, repo_root=repo_root)
         if prefer_mp3:
             rp = _prefer_mp3_path(rp)
 
@@ -642,16 +680,23 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "dir_not_found", "dir": str(directory)}) + "\n")
         return 2
 
-    try:
-        _require_pro_if_token(args)
-    except Exception as e:
-        sys.stdout.write(_stable_json_dumps({
-            "ok": False,
-            "reason": "billing_denied",
-            "error": str(e),
-            "hint": "Pass --billing-db explicitly or set MGC_BILLING_DB (billing will not silently use MGC_DB).",
-        }) + "\n")
-        return 2
+    # Only require billing if a token-gated feature is used.
+    if getattr(args, "token", None):
+        try:
+            _require_pro_if_token(args)
+        except Exception as e:
+            sys.stdout.write(
+                _stable_json_dumps(
+                    {
+                        "ok": False,
+                        "reason": "billing_denied",
+                        "error": str(e),
+                        "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
+                    }
+                )
+                + "\n"
+            )
+            return 2
 
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
@@ -674,11 +719,6 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
             pass
     return 0
 
-
-# -----------------------------
-# Registrar
-# -----------------------------
-
 def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     web = subparsers.add_parser("web", help="Static web player build/serve")
     ws = web.add_subparsers(dest="web_cmd", required=True)
@@ -689,7 +729,7 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
 
     # Keep --db because builds may need it to resolve track IDs -> paths
     # NOTE: billing DB is resolved STRICTLY and will not silently use env MGC_DB.
-    build.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (used only if playlist contains IDs)")
+    build.add_argument("--db", default="", help="DB path (used only if playlist contains IDs)")
     build.add_argument("--token", default=None, help="Billing access token (requires pro)")
     build.add_argument(
         "--billing-db",
@@ -707,7 +747,7 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
 
     serve = ws.add_parser("serve", help="Serve a built web bundle")
     serve.add_argument("--dir", required=True, help="Directory to serve (output of web build)")
-    serve.add_argument("--db", default=os.environ.get("MGC_DB", ""), help="DB path (required only if --token is used)")
+    serve.add_argument("--db", default="", help="DB path (required only if --token is used)")
     serve.add_argument("--token", default=None, help="Billing access token (requires pro)")
     serve.add_argument(
         "--billing-db",
