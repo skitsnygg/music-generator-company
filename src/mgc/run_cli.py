@@ -198,60 +198,82 @@ def stable_json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _relpath_from_out_dir(out_dir: Path, p: str) -> str:
-    """Return POSIX relative path from out_dir to p.
+def _relpath_smart(*, out_dir: Path, repo_root: Path, p: str) -> str:
+    """Return a POSIX path string with absolute prefixes scrubbed.
+
+    Rules (in priority order):
+      1) If p is already relative -> normalize separators and return as POSIX.
+      2) If p is absolute and is under repo_root -> return path relative to repo_root.
+         (So it can be resolved correctly from the repo working directory.)
+      3) If p is absolute and is under out_dir -> return path relative to out_dir.
+      4) Otherwise -> return path relative to out_dir as a best-effort fallback.
 
     Guarantees:
       - Never returns an absolute path.
-      - Never includes system-specific prefixes like /tmp or /private/tmp.
-      - Stable across runs as long as the on-disk layout relative to out_dir is stable.
-
-    Notes:
-      - If p is already relative, we normalize separators to POSIX.
-      - If p looks like a URL, we leave it untouched.
+      - Never returns a path with a leading slash.
     """
     if not isinstance(p, str):
         return p  # type: ignore[return-value]
+
     s = p.strip()
     if not s:
         return ""
     if s.startswith("http://") or s.startswith("https://"):
         return s
 
-    # Normalize slashes for the relative-path case.
     s_norm = s.replace("\\", "/")
     try:
         pp = Path(s_norm)
     except Exception:
-        return s_norm
+        return s_norm.lstrip("/")
 
     if not pp.is_absolute():
-        return pp.as_posix()
+        return pp.as_posix().lstrip("/")
 
+    # Normalize roots
+    rr = repo_root.resolve()
+    od = out_dir.resolve()
+
+    # Prefer repo_root-relative when possible (portable across invocations)
     try:
-        rel = Path(os.path.relpath(str(pp), start=str(out_dir)))
-        return rel.as_posix()
+        rel_repo = pp.resolve().relative_to(rr)
+        return rel_repo.as_posix().lstrip("/")
     except Exception:
-        # Fallback: last resort, strip leading slash to avoid absolute leakage.
+        pass
+
+    # Next, out_dir-relative
+    try:
+        rel_out = pp.resolve().relative_to(od)
+        return rel_out.as_posix().lstrip("/")
+    except Exception:
+        pass
+
+    # Fallback: best-effort relpath from out_dir
+    try:
+        rel = Path(os.path.relpath(str(pp), start=str(od)))
+        return rel.as_posix().lstrip("/")
+    except Exception:
         return s_norm.lstrip("/")
 
 
-def _scrub_absolute_paths(obj: object, *, out_dir: Path) -> object:
-    """Recursively convert any absolute path strings to paths relative to out_dir."""
+def _scrub_absolute_paths(obj: object, *, out_dir: Path, repo_root: Path) -> object:
+    """Recursively scrub absolute filesystem paths from a JSON-serializable object."""
+
     if isinstance(obj, dict):
-        return {k: _scrub_absolute_paths(v, out_dir=out_dir) for k, v in obj.items()}
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(v, str):
+                out[k] = _relpath_smart(out_dir=out_dir, repo_root=repo_root, p=v)
+            else:
+                out[k] = _scrub_absolute_paths(v, out_dir=out_dir, repo_root=repo_root)
+        return out
+
     if isinstance(obj, list):
-        return [_scrub_absolute_paths(v, out_dir=out_dir) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_scrub_absolute_paths(v, out_dir=out_dir) for v in obj)
+        return [_scrub_absolute_paths(v, out_dir=out_dir, repo_root=repo_root) for v in obj]
+
     if isinstance(obj, str):
-        # Only transform actual absolute filesystem paths.
-        try:
-            if Path(obj.replace("\\", "/")).is_absolute():
-                return _relpath_from_out_dir(out_dir, obj)
-        except Exception:
-            pass
-        return obj.replace("\\", "/")
+        return _relpath_smart(out_dir=out_dir, repo_root=repo_root, p=obj)
+
     return obj
 
 
@@ -602,7 +624,7 @@ def _agents_marketing_plan(
     }
 
     # Final safety: scrub any remaining absolute paths anywhere in the object.
-    out_obj = _scrub_absolute_paths(out_obj, out_dir=out_dir)
+    out_obj = _scrub_absolute_paths(out_obj, out_dir=out_dir, repo_root=Path.cwd())
 
     # receipts + plan file
     with receipts.open("a", encoding="utf-8") as f:
@@ -2342,7 +2364,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             "manifest_sha256": manifest_sha256,
         },
     }
-    drop_evidence = _scrub_absolute_paths(drop_evidence, out_dir=out_dir)
+    drop_evidence = _scrub_absolute_paths(drop_evidence, out_dir=out_dir, repo_root=Path.cwd())
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if json_mode:
@@ -2545,6 +2567,32 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     from typing import Any, Dict, Optional
 
     from mgc.bundle_validate import validate_bundle
+
+    # -------------------------
+    # repo_root resolution (CWD-proof)
+    # -------------------------
+    # CI and local invocations may run from different working directories.
+    # We need a stable repo root to resolve relative paths (especially submissions).
+    def _resolve_repo_root() -> Path:
+        arg = str(getattr(args, "repo_root", "") or "").strip()
+        candidates: list[Path] = []
+        if arg:
+            candidates.append(Path(arg).expanduser())
+        # Fallback: repo containing this file (repo_root/src/mgc/run_cli.py)
+        candidates.append(Path(__file__).resolve().parents[2])
+
+        for cand in candidates:
+            try:
+                rr = cand.resolve()
+            except Exception:
+                continue
+            # Validate by presence of src/mgc (this repo uses src layout)
+            if (rr / "src" / "mgc").is_dir():
+                return rr
+        # Last resort: best-effort
+        return candidates[-1].resolve()
+
+    repo_root = _resolve_repo_root()
 
     # -------------------------
     # tiny deterministic helpers
@@ -2923,7 +2971,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     # Write drop evidence (initial)
     # ---------------------------------------------------------------------
     evidence_path = out_dir / "drop_evidence.json"
-    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir)
+    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir, repo_root=repo_root)
     evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
@@ -2967,7 +3015,51 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             }
 
         drop_id_for_paths = str(evidence_obj.get("drop_id") or stable_uuid5("drop", run_id))
-        submissions_root = (Path("data") / "submissions" / drop_id_for_paths).resolve()
+
+        # ------------------------------------------------------------------
+        # Submission output directory (STRICT + deterministic)
+        #
+        # Resolution order:
+        #   1) MGC_SUBMISSIONS_DIR (absolute or relative to repo-root)
+        #   2) <repo-root>/data/submissions/<drop_id>
+        #
+        # IMPORTANT:
+        # - Never rely on an arbitrary CWD.
+        # - Some CI runners may invoke from a different working directory.
+        # - We validate repo_root and fall back to the on-disk repo containing this file.
+        # - Never write to /data/* (root filesystem).
+        # ------------------------------------------------------------------
+
+        repo_root_arg = str(getattr(args, "repo_root", "") or "").strip()
+        if repo_root_arg:
+            cand = Path(repo_root_arg).expanduser()
+            if cand.is_absolute():
+                repo_root = cand.resolve()
+            else:
+                repo_root = (Path.cwd() / cand).resolve()
+        else:
+            repo_root = Path.cwd().resolve()
+
+        # Validate repo_root looks like a repo checkout (src/mgc exists). If not,
+        # fall back to the repo that contains this file.
+        if not (repo_root / "src" / "mgc").exists():
+            try:
+                repo_root = Path(__file__).resolve().parents[2]
+            except Exception:
+                pass
+
+        sub_root_env = str(os.environ.get("MGC_SUBMISSIONS_DIR", "") or "").strip()
+
+        if sub_root_env:
+            sub_root = Path(sub_root_env).expanduser()
+            if not sub_root.is_absolute():
+                sub_root = (repo_root / sub_root).resolve()
+            else:
+                sub_root = sub_root.resolve()
+        else:
+            sub_root = (repo_root / "data" / "submissions").resolve()
+
+        submissions_root = (sub_root / drop_id_for_paths).resolve()
         _safe_mkdir(submissions_root)
 
         submission_zip_path = (submissions_root / "submission.zip").resolve()
@@ -3083,7 +3175,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 evidence_obj["artifacts"]["web_bundle_tree_sha256"] = web_tree_sha
             evidence_obj["artifacts"]["submission_receipt_json"] = str(receipt_path)
 
-    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir)
+    evidence_obj = _scrub_absolute_paths(evidence_obj, out_dir=out_dir, repo_root=repo_root)
     evidence_path.write_text(stable_json(evidence_obj), encoding="utf-8")
 
     # ---------------------------------------------------------------------
@@ -4410,10 +4502,7 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     drop_id = str(evidence_obj.get("drop_id") or "")
     run_id = str(evidence_obj.get("run_id") or "")
 
-    # Prefer the manifest computed by the drop pipeline (portable path + sha).
-    drop_paths = (evidence_obj.get("paths") if isinstance(evidence_obj, dict) else None) or {}
-    manifest_name = str(drop_paths.get("manifest") or "manifest.json")
-    manifest_sha256 = str(drop_paths.get("manifest_sha256") or "")
+    manifest_sha256 = ""
 
     # IMPORTANT: top-level paths must be portable so runs in different out_dir still diff clean.
     # drop.paths already contains portable paths ("." / manifest.json / drop_evidence.json).
@@ -4426,7 +4515,7 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "evidence_path": "drop_evidence.json",
             # submission.zip lives outside out_dir and is stable; keep absolute for convenience.
             "submission_zip": str(zip_path),
-            "manifest": manifest_name,
+            "manifest": "weekly_manifest.json",
             "manifest_sha256": manifest_sha256,
         },
         "verify": {
