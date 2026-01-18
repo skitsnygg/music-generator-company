@@ -1466,7 +1466,10 @@ def db_insert_track(
         raise sqlite3.OperationalError("table tracks does not exist")
 
     ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
-    path_col = _pick_first_existing(cols, ["artifact_path", "audio_path", "path", "file_path", "uri"])
+    # NOTE: different DB schemas use different column names for the primary audio path.
+    # The canonical schema uses `full_path`.
+    path_col = _pick_first_existing(cols, ["full_path", "artifact_path", "audio_path", "path", "file_path", "uri"])
+    preview_col = _pick_first_existing(cols, ["preview_path", "preview", "teaser_path"])
     bpm_col = _pick_first_existing(cols, ["bpm", "tempo"])
 
     data: Dict[str, Any] = {
@@ -1485,7 +1488,33 @@ def db_insert_track(
     if ts_col:
         data[ts_col] = ts
     if path_col and artifact_path is not None:
+        # Guard: never write a path that doesn't exist on disk.
+        # This prevents late failures (e.g., web build) caused by DB/file drift.
+        ap = Path(str(artifact_path))
+        ap_resolved = ap if ap.is_absolute() else (Path.cwd() / ap)
+        if not ap_resolved.is_file():
+            raise FileNotFoundError(
+                f"Refusing to insert track with missing {path_col}: {artifact_path} (resolved: {ap_resolved}) track_id={track_id}"
+            )
         data[path_col] = artifact_path
+
+        # If the schema requires a preview path, derive a deterministic default.
+        # We only accept a preview if it exists on disk.
+        if preview_col:
+            stem = ap.stem
+            # Preferred: data/previews/<stem>_preview.mp3
+            guess1 = Path("data") / "previews" / f"{stem}_preview.mp3"
+            g1 = guess1 if guess1.is_absolute() else (Path.cwd() / guess1)
+            if g1.is_file():
+                data[preview_col] = str(guess1)
+            else:
+                # Fallback: if the artifact itself is an mp3, it can serve as a preview.
+                if ap_resolved.suffix.lower() == ".mp3" and ap_resolved.is_file():
+                    data[preview_col] = artifact_path
+                else:
+                    raise FileNotFoundError(
+                        f"Refusing to insert track: missing required {preview_col}. Tried {guess1} (resolved: {g1}) for track_id={track_id}"
+                    )
     if bpm_col:
         data[bpm_col] = _stable_int_from_key(f"{track_id}|{title}|{provider}|{bpm_col}", 60, 140)
 
