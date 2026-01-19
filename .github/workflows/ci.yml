@@ -292,6 +292,47 @@ jobs:
 
           diff -ru "${OUT1}" "${OUT2}"
 
+      - name: Weekly marketing receipts + submission determinism (file mode)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_FIXED_TIME: ${{ env.MGC_FIXED_TIME }}
+          MGC_DETERMINISTIC: ${{ env.MGC_DETERMINISTIC }}
+        run: |
+          set -euxo pipefail
+
+          OUT1="${RUNNER_TEMP}/mgc_weekly_marketing_1"
+          OUT2="${RUNNER_TEMP}/mgc_weekly_marketing_2"
+          rm -rf "${OUT1}" "${OUT2}"
+          mkdir -p "${OUT1}" "${OUT2}"
+
+          # Build the same weekly bundle twice
+          python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
+            --context focus --out-dir "${OUT1}" --deterministic --period-key 2020-W01
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
+            --context focus --out-dir "${OUT2}" --deterministic --period-key 2020-W01
+
+          # Write receipts into each out_dir (dry-run but writes deterministic receipts)
+          python -m mgc.main --db "${MGC_DB}" run publish-marketing \
+            --bundle-dir "${OUT1}/drop_bundle" --deterministic --dry-run --out-dir "${OUT1}" \
+            | python -m json.tool
+
+          python -m mgc.main --db "${MGC_DB}" run publish-marketing \
+            --bundle-dir "${OUT2}/drop_bundle" --deterministic --dry-run --out-dir "${OUT2}" \
+            | python -m json.tool
+
+          # Build submission zips
+          python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip" | python -m json.tool
+          python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip" | python -m json.tool
+
+          # Determinism: receipts trees and zips must match
+          diff -ru "${OUT1}/marketing/receipts" "${OUT2}/marketing/receipts"
+          sha256sum "${OUT1}/submission.zip" "${OUT2}/submission.zip"
+          test "$(sha256sum "${OUT1}/submission.zip" | awk '{print $1}')" = "$(sha256sum "${OUT2}/submission.zip" | awk '{print $1}')"
+
+
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash

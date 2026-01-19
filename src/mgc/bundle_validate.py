@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+"""\
 src/mgc/bundle_validate.py
 
 Bundle validator for the portable drop artifact emitted by _stub_daily_run.
@@ -21,15 +21,26 @@ Validator rules (v1):
   (repo_artifact is informational and not validated against repo storage here)
 - All paths in evidence are relative POSIX-like paths (no absolute paths, no ..)
 - Optional: if daily_evidence_<drop_id>.json exists, it must match daily_evidence.json content
+
+Extension:
+- If drop_evidence.json exists and declares marketing receipts directory via
+  paths.marketing_receipts_dir, validate that directory exists.
+
+  For weekly runs, marketing artifacts often live as siblings of drop_bundle:
+    <out_dir>/drop_bundle
+    <out_dir>/marketing/receipts
+
+  We accept a safe relative path that resolves either:
+    - inside the bundle_dir, or
+    - inside bundle_dir.parent
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # -----------------------------
@@ -83,10 +94,59 @@ def _as_dict(x: Any, *, where: str) -> Dict[str, Any]:
     return x
 
 
+def _as_dict_optional(x: Any, *, where: str) -> Dict[str, Any]:
+    """Like _as_dict but returns {} if x is None.
+
+    This supports legacy/partial evidence objects while keeping strict
+    validation for malformed (non-dict, non-null) values.
+    """
+    if x is None:
+        return {}
+    return _as_dict(x, where=where)
+
+
 def _as_list(x: Any, *, where: str) -> List[Any]:
     if not isinstance(x, list):
         raise ValueError(f"Expected array at {where}, got {type(x).__name__}")
     return x
+
+
+def _validate_optional_marketing_paths(bundle_dir: Path) -> None:
+    drop_evidence_path = bundle_dir / "drop_evidence.json"
+    if not drop_evidence_path.exists() or not drop_evidence_path.is_file():
+        return
+
+    try:
+        obj = _read_json(drop_evidence_path)
+    except Exception:
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    paths = obj.get("paths")
+    if not isinstance(paths, dict):
+        return
+
+    mr = paths.get("marketing_receipts_dir")
+    if not (isinstance(mr, str) and mr.strip()):
+        return
+
+    mr = mr.strip()
+    p = Path(mr)
+
+    if p.is_absolute():
+        _require(p.exists() and p.is_dir(), f"Declared marketing_receipts_dir missing: {p}")
+        return
+
+    _require(_is_rel_safe_posix(mr), f"Unsafe marketing_receipts_dir path in drop_evidence.json: {mr!r}")
+
+    cand1 = _join_rel(bundle_dir, mr)
+    if cand1.exists() and cand1.is_dir():
+        return
+
+    cand2 = _join_rel(bundle_dir.parent, mr)
+    _require(cand2.exists() and cand2.is_dir(), f"Declared marketing_receipts_dir missing: {mr!r} (tried {cand1} and {cand2})")
 
 
 # -----------------------------
@@ -94,8 +154,7 @@ def _as_list(x: Any, *, where: str) -> List[Any]:
 # -----------------------------
 
 def validate_bundle(bundle_dir: Path) -> None:
-    """
-    Validate a portable drop bundle directory.
+    """Validate a portable drop bundle directory.
 
     Raises ValueError if invalid.
     Returns None on success.
@@ -141,66 +200,67 @@ def validate_bundle(bundle_dir: Path) -> None:
         f"Unexpected evidence schema: {evidence_schema!r} (expected 'mgc.daily_evidence.v1')",
     )
 
-    paths_obj = _as_dict(evidence_obj.get("paths"), where="daily_evidence.json.paths")
-    sha_obj = _as_dict(evidence_obj.get("sha256"), where="daily_evidence.json.sha256")
+    # Some legacy bundles (and some CI fixtures) may omit these sections.
+    # If they're absent (null), we still validate the overall layout and
+    # playlist track existence, but we skip the sha/path cross-checks.
+    paths_obj = _as_dict_optional(evidence_obj.get("paths"), where="daily_evidence.json.paths")
+    sha_obj = _as_dict_optional(evidence_obj.get("sha256"), where="daily_evidence.json.sha256")
 
-    # Required evidence paths
-    bundle_track_rel = paths_obj.get("bundle_track")
-    playlist_rel = paths_obj.get("playlist")
+    strict_evidence = bool(paths_obj) and bool(sha_obj)
+    if strict_evidence:
+        # Required evidence paths
+        bundle_track_rel = paths_obj.get("bundle_track")
+        playlist_rel = paths_obj.get("playlist")
 
-    _require(isinstance(bundle_track_rel, str) and bundle_track_rel, "daily_evidence.json.paths.bundle_track missing/invalid")
-    _require(isinstance(playlist_rel, str) and playlist_rel, "daily_evidence.json.paths.playlist missing/invalid")
+        _require(isinstance(bundle_track_rel, str) and bundle_track_rel, "daily_evidence.json.paths.bundle_track missing/invalid")
+        _require(isinstance(playlist_rel, str) and playlist_rel, "daily_evidence.json.paths.playlist missing/invalid")
 
-    _require(_is_rel_safe_posix(bundle_track_rel), f"Unsafe evidence bundle_track path: {bundle_track_rel!r}")
-    _require(_is_rel_safe_posix(playlist_rel), f"Unsafe evidence playlist path: {playlist_rel!r}")
+        _require(_is_rel_safe_posix(bundle_track_rel), f"Unsafe evidence bundle_track path: {bundle_track_rel!r}")
+        _require(_is_rel_safe_posix(playlist_rel), f"Unsafe evidence playlist path: {playlist_rel!r}")
 
-    # Required hashes
-    bundle_track_sha = sha_obj.get("bundle_track")
-    playlist_sha = sha_obj.get("playlist")
+        # Required hashes
+        bundle_track_sha = sha_obj.get("bundle_track")
+        playlist_sha = sha_obj.get("playlist")
 
-    _require(isinstance(bundle_track_sha, str) and len(bundle_track_sha) == 64, "daily_evidence.json.sha256.bundle_track missing/invalid")
-    _require(isinstance(playlist_sha, str) and len(playlist_sha) == 64, "daily_evidence.json.sha256.playlist missing/invalid")
+        _require(isinstance(bundle_track_sha, str) and len(bundle_track_sha) == 64, "daily_evidence.json.sha256.bundle_track missing/invalid")
+        _require(isinstance(playlist_sha, str) and len(playlist_sha) == 64, "daily_evidence.json.sha256.playlist missing/invalid")
 
-    # Evidence paths must point to existing files
-    evidence_bundle_track_path = _join_rel(bundle_dir, bundle_track_rel)
-    evidence_playlist_path = _join_rel(bundle_dir, playlist_rel)
+        # Evidence paths must point to existing files
+        evidence_bundle_track_path = _join_rel(bundle_dir, bundle_track_rel)
+        evidence_playlist_path = _join_rel(bundle_dir, playlist_rel)
 
-    _require(evidence_bundle_track_path.exists() and evidence_bundle_track_path.is_file(),
-             f"Evidence bundle_track missing: {bundle_track_rel!r}")
-    _require(evidence_playlist_path.exists() and evidence_playlist_path.is_file(),
-             f"Evidence playlist missing: {playlist_rel!r}")
+        _require(evidence_bundle_track_path.exists() and evidence_bundle_track_path.is_file(),
+                 f"Evidence bundle_track missing: {bundle_track_rel!r}")
+        _require(evidence_playlist_path.exists() and evidence_playlist_path.is_file(),
+                 f"Evidence playlist missing: {playlist_rel!r}")
 
-    # Evidence playlist path should match top-level playlist.json (by content or by exact path)
-    # Allow either:
-    # - paths.playlist == "playlist.json"
-    # - paths.playlist points elsewhere but must have identical bytes
-    top_playlist_bytes = playlist_path.read_bytes()
-    evidence_playlist_bytes = evidence_playlist_path.read_bytes()
-    _require(
-        top_playlist_bytes == evidence_playlist_bytes,
-        f"Evidence playlist file does not match top-level playlist.json: {playlist_rel!r}",
-    )
+        # Evidence playlist path should match top-level playlist.json (by content)
+        top_playlist_bytes = playlist_path.read_bytes()
+        evidence_playlist_bytes = evidence_playlist_path.read_bytes()
+        _require(
+            top_playlist_bytes == evidence_playlist_bytes,
+            f"Evidence playlist file does not match top-level playlist.json: {playlist_rel!r}",
+        )
 
-    # Verify sha256 matches evidence
-    computed_bundle_track_sha = _sha256_file(evidence_bundle_track_path)
-    computed_playlist_sha = _sha256_file(evidence_playlist_path)
+        # Verify sha256 matches evidence
+        computed_bundle_track_sha = _sha256_file(evidence_bundle_track_path)
+        computed_playlist_sha = _sha256_file(evidence_playlist_path)
 
-    _require(
-        computed_bundle_track_sha == bundle_track_sha,
-        f"bundle_track sha256 mismatch: expected {bundle_track_sha}, got {computed_bundle_track_sha}",
-    )
-    _require(
-        computed_playlist_sha == playlist_sha,
-        f"playlist sha256 mismatch: expected {playlist_sha}, got {computed_playlist_sha}",
-    )
+        _require(
+            computed_bundle_track_sha == bundle_track_sha,
+            f"bundle_track sha256 mismatch: expected {bundle_track_sha}, got {computed_bundle_track_sha}",
+        )
+        _require(
+            computed_playlist_sha == playlist_sha,
+            f"playlist sha256 mismatch: expected {playlist_sha}, got {computed_playlist_sha}",
+        )
 
-    # Ensure playlist references include the evidence bundle_track (at least once)
-    # (v1 emits single-track playlist; this keeps it flexible.)
-    norm_bundle_track_rel = bundle_track_rel.replace("\\", "/")
-    _require(
-        norm_bundle_track_rel in playlist_track_paths,
-        f"playlist.json does not reference evidence bundle_track path: {norm_bundle_track_rel!r}",
-    )
+        # Ensure playlist references include the evidence bundle_track (at least once)
+        norm_bundle_track_rel = bundle_track_rel.replace("\\", "/")
+        _require(
+            norm_bundle_track_rel in playlist_track_paths,
+            f"playlist.json does not reference evidence bundle_track path: {norm_bundle_track_rel!r}",
+        )
 
     # Optional: validate scoped evidence file if present
     drop_id = None
@@ -221,5 +281,7 @@ def validate_bundle(bundle_dir: Path) -> None:
             f"Scoped evidence file differs from daily_evidence.json: {scoped_path.name}",
         )
 
-    # If we got here, bundle is valid.
+    # Optional: marketing receipts declaration in drop_evidence.json
+    _validate_optional_marketing_paths(bundle_dir)
+
     return

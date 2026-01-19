@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+"""\
 src/mgc/submission_cli.py
 
 Deterministic submission bundle packaging.
@@ -14,6 +14,17 @@ Design goals:
 - No DB mutation.
 - Deterministic ZIP output: stable ordering + stable timestamps + stable manifest bytes.
 - Validate bundle schema before packaging (mgc.bundle_validate.validate_bundle).
+
+Extension:
+- If marketing receipts exist for the bundle, include them deterministically under:
+    marketing/receipts/...
+
+  Resolution order:
+  1) If drop_evidence.json exists and declares paths.marketing_receipts_dir, use it.
+  2) Otherwise, infer sibling directory <bundle_dir_parent>/marketing/receipts if present.
+
+This keeps older bundles working while allowing "release package" submission zips to
+carry promotion artifacts.
 """
 
 from __future__ import annotations
@@ -25,7 +36,7 @@ import sqlite3
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from mgc.bundle_validate import validate_bundle
 
@@ -58,12 +69,13 @@ def _write_json_bytes(obj: Any) -> bytes:
     return (json.dumps(obj, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
 
-def _snapshot_bundle_bytes(bundle_dir: Path) -> Dict[str, bytes]:
-    bundle_dir = bundle_dir.resolve()
-    files = _sorted_files(bundle_dir)
+def _snapshot_dir_bytes(root: Path) -> Dict[str, bytes]:
+    """Return a mapping of relative-posix-path -> file bytes for a directory."""
+    root = root.resolve()
+    files = _sorted_files(root)
     snap: Dict[str, bytes] = {}
     for f in files:
-        rel = f.relative_to(bundle_dir).as_posix()
+        rel = f.relative_to(root).as_posix()
         snap[rel] = f.read_bytes()
     return snap
 
@@ -74,6 +86,54 @@ def _validate_bundle_without_mutating(bundle_dir: Path) -> None:
         tmp_bundle = Path(td) / "drop_bundle"
         shutil.copytree(bundle_dir, tmp_bundle)
         validate_bundle(str(tmp_bundle))
+
+
+def _resolve_marketing_receipts_root(bundle_dir: Path) -> Tuple[Optional[Path], bool, Optional[str]]:
+    """Return (receipts_root, inferred, source).
+
+    inferred=True means we did not find an explicit declaration in drop_evidence.json.
+    source is a short string for the manifest.
+    """
+    bundle_dir = bundle_dir.resolve()
+
+    declared: Optional[str] = None
+    drop_evidence = bundle_dir / "drop_evidence.json"
+    if drop_evidence.exists() and drop_evidence.is_file():
+        try:
+            obj = json.loads(drop_evidence.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                paths = obj.get("paths")
+                if isinstance(paths, dict):
+                    v = paths.get("marketing_receipts_dir")
+                    if isinstance(v, str) and v.strip():
+                        declared = v.strip()
+        except Exception:
+            declared = None
+
+    # 1) declared path
+    if declared:
+        p = Path(declared)
+        if p.is_absolute():
+            cand = p
+            if cand.exists() and cand.is_dir():
+                return (cand.resolve(), False, "drop_evidence.paths.marketing_receipts_dir")
+            return (None, False, "drop_evidence.paths.marketing_receipts_dir")
+
+        # Try relative to bundle_dir first, then bundle_dir.parent (weekly layout)
+        cand1 = (bundle_dir / p).resolve()
+        if cand1.exists() and cand1.is_dir():
+            return (cand1, False, "drop_evidence.paths.marketing_receipts_dir")
+        cand2 = (bundle_dir.parent / p).resolve()
+        if cand2.exists() and cand2.is_dir():
+            return (cand2, False, "drop_evidence.paths.marketing_receipts_dir")
+        return (None, False, "drop_evidence.paths.marketing_receipts_dir")
+
+    # 2) inferred sibling default
+    inferred_root = (bundle_dir.parent / "marketing" / "receipts").resolve()
+    if inferred_root.exists() and inferred_root.is_dir():
+        return (inferred_root, True, "sibling:marketing/receipts")
+
+    return (None, True, None)
 
 
 # -----------------------------
@@ -136,8 +196,15 @@ def build_submission_zip(bundle_dir: Path, out_zip: Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"bundle_dir not found: {bundle_dir}")
 
     # Snapshot before any validation/side effects
-    snap = _snapshot_bundle_bytes(bundle_dir)
-    rels = sorted(snap.keys())
+    bundle_snap = _snapshot_dir_bytes(bundle_dir)
+    bundle_rels = sorted(bundle_snap.keys())
+
+    receipts_root, receipts_inferred, receipts_source = _resolve_marketing_receipts_root(bundle_dir)
+    receipts_snap: Dict[str, bytes] = {}
+    receipts_rels: list[str] = []
+    if receipts_root is not None:
+        receipts_snap = _snapshot_dir_bytes(receipts_root)
+        receipts_rels = sorted(receipts_snap.keys())
 
     # Validate on a temp copy (prevent mutations of real bundle)
     _validate_bundle_without_mutating(bundle_dir)
@@ -145,23 +212,50 @@ def build_submission_zip(bundle_dir: Path, out_zip: Path) -> Dict[str, Any]:
     # Deterministic manifest:
     # - no timestamps
     # - no absolute paths
-    # - no output-zip name (because CI builds submission.zip and submission_2.zip)
+    # - no output-zip name
     manifest: Dict[str, Any] = {
         "format": "mgc_submission_manifest_v1",
         "bundle_root": "drop_bundle",
-        "files": rels,
+        "files": bundle_rels,
     }
+
+    if receipts_root is not None:
+        manifest["extra_roots"] = {
+            "marketing_receipts": {
+                "root": "marketing/receipts",
+                "files": receipts_rels,
+                "inferred": bool(receipts_inferred),
+                "source": receipts_source,
+            }
+        }
 
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     if out_zip.exists():
         out_zip.unlink()
 
     with zipfile.ZipFile(out_zip, "w") as zf:
-        for rel in rels:
-            _stable_zip_write(zf, rel, snap[rel])
+        # Bundle files at zip root (existing behavior)
+        for rel in bundle_rels:
+            _stable_zip_write(zf, rel, bundle_snap[rel])
+
+        # Optional marketing receipts under marketing/receipts
+        if receipts_root is not None:
+            for rel in receipts_rels:
+                arc = f"marketing/receipts/{rel}"
+                _stable_zip_write(zf, arc, receipts_snap[rel])
+
         _stable_zip_write(zf, "submission_manifest.json", _write_json_bytes(manifest))
 
-    return {"ok": True, "out": str(out_zip), "file_count": len(rels)}
+    res: Dict[str, Any] = {"ok": True, "out": str(out_zip), "file_count": len(bundle_rels)}
+    if receipts_root is not None:
+        res["marketing_receipts"] = {
+            "included": True,
+            "count": len(receipts_rels),
+            "inferred": bool(receipts_inferred),
+        }
+    else:
+        res["marketing_receipts"] = {"included": False, "count": 0, "inferred": True}
+    return res
 
 
 def verify_submission_zip(zip_path: Path) -> Dict[str, Any]:
