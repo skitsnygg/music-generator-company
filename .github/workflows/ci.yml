@@ -208,7 +208,6 @@ jobs:
             --db "${MGC_DB}" \
             --repo-root .
 
-
       # -----------------------------
       # FULL gate: only on main pushes
       # -----------------------------
@@ -237,6 +236,56 @@ jobs:
         run: |
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
+
+      - name: Publish-marketing determinism (weekly; DB mode; dry-run)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+        run: |
+          set -euxo pipefail
+
+          DB1="${RUNNER_TEMP}/ci_db_pub_1.sqlite"
+          DB2="${RUNNER_TEMP}/ci_db_pub_2.sqlite"
+          cp -f "${MGC_DB}" "${DB1}"
+          cp -f "${MGC_DB}" "${DB2}"
+
+          DB1="${DB1}" DB2="${DB2}" python - <<'PY'
+          import os, sqlite3
+
+          def reset(db_path: str) -> None:
+              con = sqlite3.connect(db_path)
+              try:
+                  con.execute(
+                      "UPDATE marketing_posts SET status='planned' "
+                      "WHERE json_extract(meta,'$.schedule')='weekly' "
+                      "AND json_extract(meta,'$.period_key')='2020-W01'"
+                  )
+                  con.commit()
+              finally:
+                  con.close()
+
+          reset(os.environ["DB1"])
+          reset(os.environ["DB2"])
+          PY
+
+          OUT1="${MGC_ARTIFACTS_DIR}/publish_weekly_1"
+          OUT2="${MGC_ARTIFACTS_DIR}/publish_weekly_2"
+          rm -rf "${OUT1}" "${OUT2}"
+          mkdir -p "${OUT1}" "${OUT2}"
+
+          python -m mgc.main --db "${DB1}" run publish-marketing \
+            --schedule weekly --period-key 2020-W01 --deterministic --dry-run \
+            --out-dir "${OUT1}" \
+            | python -m json.tool
+
+          python -m mgc.main --db "${DB2}" run publish-marketing \
+            --schedule weekly --period-key 2020-W01 --deterministic --dry-run \
+            --out-dir "${OUT2}" \
+            | python -m json.tool
+
+          diff -ru "${OUT1}" "${OUT2}"
 
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -315,7 +364,6 @@ jobs:
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
-      
 
       - name: Submission artifact check (reads drop_evidence.json safely)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
