@@ -7,6 +7,7 @@ import hashlib
 import random
 import io
 import json
+import re
 import os
 import shutil
 import socket
@@ -36,6 +37,7 @@ def _write_marketing_receipt(
     *,
     receipt: Dict[str, Any],
     stable_json_dumps,
+    base_dir: Optional[Path] = None,
 ) -> str:
     """
     Append-only receipt writer for marketing publish.
@@ -43,7 +45,9 @@ def _write_marketing_receipt(
     Location:
       data/evidence/marketing/receipts/<batch_id>/<platform>/<post_id>.json
     """
-    base = Path("data/evidence/marketing/receipts")
+    # Allow callers (e.g. publish-marketing --out-dir) to redirect receipts
+    # for determinism comparisons without touching repo state.
+    base = base_dir if base_dir is not None else Path("data/evidence/marketing/receipts")
     batch_id = receipt.get("batch_id", "unknown")
     platform = receipt.get("platform", "unknown")
     post_id = receipt.get("post_id", "unknown")
@@ -708,17 +712,6 @@ class RunKey:
 def _now_iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def write_sha256_sidecar(path: Path) -> str:
-    """Write <file>.<ext>.sha256 containing the sha256 hex of the file + newline.
-    Returns the hex digest.
-    """
-    import hashlib
-
-    data = path.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    sidecar = path.with_suffix(path.suffix + ".sha256")
-    sidecar.write_text(digest + "\n", encoding="utf-8")
-    return digest
 
 def db_get_or_create_run_id(
     con: sqlite3.Connection,
@@ -1754,57 +1747,79 @@ def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> L
     Return publishable (pending) marketing posts with schema drift tolerance.
 
     Key behaviors:
-    - Prefers publishable states like 'planned' (NOT 'draft').
-      Drafts are placeholders and may have empty payload_json, so they must not be published.
-    - Tolerates PK drift: id / post_id / marketing_post_id
+    - Publishes planned/pending/ready (case-insensitive).
+    - Also allows 'draft' ONLY if it contains non-empty payload/content (avoids placeholder drafts).
+    - Tolerates PK drift: id / post_id / marketing_post_id / *_id
     - Tolerates created timestamp drift: created_at / created_ts / ts
     - Tolerates status column drift: status / state
+    - Tolerates payload drift: payload_json / content / payload / text
     - Deterministic ordering: created ASC, pk ASC
     """
-    cols = {r["name"] for r in con.execute("PRAGMA table_info(marketing_posts)").fetchall()}
+    # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(marketing_posts)").fetchall()]
+    colset = set(cols)
 
     # Pick PK column
-    if "id" in cols:
-        pk = "id"
-    elif "post_id" in cols:
+    if "post_id" in colset:
         pk = "post_id"
-    elif "marketing_post_id" in cols:
+    elif "id" in colset:
+        pk = "id"
+    elif "marketing_post_id" in colset:
         pk = "marketing_post_id"
     else:
-        pk_candidates = sorted([c for c in cols if c.endswith("_id")])
+        pk_candidates = sorted([c for c in colset if c.endswith("_id")])
         pk = pk_candidates[0] if pk_candidates else "rowid"
 
     # Pick created timestamp column for ordering
-    if "created_at" in cols:
+    if "created_at" in colset:
         created_col = "created_at"
-    elif "created_ts" in cols:
+    elif "created_ts" in colset:
         created_col = "created_ts"
-    elif "ts" in cols:
+    elif "ts" in colset:
         created_col = "ts"
     else:
         created_col = pk  # last resort ordering
 
     # Status column name drift
-    status_col = "status" if "status" in cols else ("state" if "state" in cols else None)
+    status_col = "status" if "status" in colset else ("state" if "state" in colset else None)
     if status_col is None:
-        # Can't determine publishable items safely; return empty rather than crashing CI
         return []
 
-    # Publishable statuses (draft is intentionally excluded)
-    # Keep this list small + explicit to avoid accidentally publishing placeholders.
-    publishable_statuses = ("planned", "pending", "ready")
+    # Payload/content column drift: used only to decide whether a 'draft' is publishable.
+    # (If none exist, drafts will be excluded.)
+    payload_cols: List[str] = []
+    for c in ("payload_json", "content", "payload", "text"):
+        if c in colset:
+            payload_cols.append(c)
 
-    # Deterministic ordering + stable limit
+    # Case-insensitive statuses.
+    publishable_statuses = ("planned", "pending", "ready")
+    draft_status = "draft"
+
+    # Build SQL
+    # - Always allow planned/pending/ready
+    # - Allow draft only if any payload/content column is non-empty after trim
     placeholders = ",".join(["?"] * len(publishable_statuses))
+    params: List[object] = list(publishable_statuses)
+
+    draft_clause = ""
+    if payload_cols:
+        non_empty_checks = " OR ".join([f"(COALESCE(TRIM({c}), '') <> '')" for c in payload_cols])
+        draft_clause = f" OR (LOWER({status_col}) = ? AND ({non_empty_checks}))"
+        params.append(draft_status)
+    # else: no payload columns -> drafts are excluded (safe)
+
     sql = f"""
     SELECT *
     FROM marketing_posts
-    WHERE {status_col} IN ({placeholders})
+    WHERE LOWER({status_col}) IN ({placeholders})
+    {draft_clause}
     ORDER BY {created_col} ASC, {pk} ASC
     LIMIT ?
     """
 
-    cur = con.execute(sql, tuple(publishable_statuses) + (int(limit),))
+    params.append(int(limit))
+    cur = con.execute(sql, tuple(params))
     return list(cur.fetchall())
 
 def db_marketing_post_set_status(
@@ -1815,9 +1830,23 @@ def db_marketing_post_set_status(
     ts: str,
     meta_patch: Dict[str, Any],
 ) -> None:
+    """Update a marketing_posts row status + timestamp + meta JSON (schema tolerant).
+
+    Historical schema drift:
+      - identifier column may be `post_id` (fixtures) or `id` (older dev DBs)
+      - status column may be `status` or `state`
+      - timestamp column may be `ts` / `created_at` / `created_ts`
+      - meta JSON column may be `meta` / `meta_json` / etc.
+
+    We detect columns at runtime and update safely.
+    """
     cols = db_table_columns(con, "marketing_posts")
     if not cols:
         raise sqlite3.OperationalError("table marketing_posts does not exist")
+
+    cols_set = set(cols)
+
+    where_col = "post_id" if "post_id" in cols_set else ("id" if "id" in cols_set else (_pick_first_existing(cols, ["marketing_post_id"]) or "id"))
 
     status_col = _pick_first_existing(cols, ["status", "state"])
     ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
@@ -1825,10 +1854,11 @@ def db_marketing_post_set_status(
 
     existing_meta: Dict[str, Any] = {}
     if meta_col:
-        row = con.execute(f"SELECT {meta_col} FROM marketing_posts WHERE id = ?", (post_id,)).fetchone()
+        row = con.execute(f"SELECT {meta_col} FROM marketing_posts WHERE {where_col} = ?", (post_id,)).fetchone()
         if row:
             existing_meta = _load_json_maybe(row[0])
-    existing_meta.update(meta_patch)
+    if meta_patch:
+        existing_meta.update(meta_patch)
 
     patch: Dict[str, Any] = {}
     if status_col:
@@ -1838,21 +1868,7 @@ def db_marketing_post_set_status(
     if meta_col:
         patch[meta_col] = stable_json_dumps(existing_meta)
 
-    where_col = "id" if "id" in set(cols) else (_pick_first_existing(cols, ["post_id"]) or "id")
     _update_row(con, "marketing_posts", where_col, post_id, patch)
-
-
-# ---------------------------------------------------------------------------
-# Manifest (deterministic)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ManifestEntry:
-    path: str
-    sha256: str
-    size: int
-
-
 def iter_repo_files(
     repo_root: Path,
     include_globs: Optional[Sequence[str]] = None,
@@ -1930,6 +1946,12 @@ def iter_repo_files(
     all_files.sort(key=lambda x: str(x.relative_to(repo_root)).replace("\\", "/"))
     for p in all_files:
         yield p
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    path: str
+    sha256: str
+    size: int
 
 
 def compute_manifest(
@@ -2295,6 +2317,7 @@ def _stub_daily_run(
             "playlist": _posix(playlist_rel),
             "manifest": "manifest.json",
             "manifest_sha256": manifest_sha256,
+            "marketing_publish_dir": "marketing/publish",
         },
         "sha256": {
             "repo_artifact": repo_artifact_sha256,
@@ -2546,17 +2569,221 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_publish_marketing(args: argparse.Namespace) -> int:
+    """
+    Publish marketing posts.
+
+    Modes:
+      - DB mode (default): publishes pending rows from marketing_posts, filtered by meta fields.
+      - File mode (when --publish-dir/--marketing-dir/--bundle-dir is provided): publishes JSON posts from disk.
+        No DB fallback. Useful for deterministic gates and artifact-only pipelines.
+
+    Receipts:
+      - If --out-dir is provided: <out_dir>/marketing/receipts/<batch_id>/<platform>/<post_id>.json
+      - Else: data/evidence/marketing/receipts/<batch_id>/<platform>/<post_id>.json
+    """
     import sys
     import sqlite3
-    from typing import Any, Dict, List
+    from typing import Any, Dict, List, Optional
 
     deterministic = is_deterministic(args)
-    db_path = resolve_db_path(args)
+    ts = deterministic_now_iso(deterministic)
+
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
-    ts = deterministic_now_iso(deterministic)
+    filter_run_id = str(getattr(args, "run_id", "") or "").strip() or None
+    filter_drop_id = str(getattr(args, "drop_id", "") or "").strip() or None
+    filter_schedule = str(getattr(args, "schedule", "") or "").strip() or None
+    filter_period_key = str(getattr(args, "period_key", "") or "").strip() or None
 
+    out_dir_raw = getattr(args, "out_dir", None)
+    out_dir: Optional[Path] = Path(out_dir_raw).expanduser().resolve() if isinstance(out_dir_raw, str) and out_dir_raw.strip() else None
+
+    publish_dir_raw = getattr(args, "publish_dir", None)
+    marketing_dir_raw = getattr(args, "marketing_dir", None)
+    bundle_dir_raw = getattr(args, "bundle_dir", None)
+
+    # ----------------------------
+    # FILE MODE
+    # ----------------------------
+    if (publish_dir_raw or marketing_dir_raw or bundle_dir_raw):
+        if publish_dir_raw:
+            publish_dir = Path(str(publish_dir_raw)).expanduser().resolve()
+        elif marketing_dir_raw:
+            publish_dir = (Path(str(marketing_dir_raw)).expanduser().resolve() / "publish")
+        else:
+            # bundle_dir is typically <out_dir>/drop_bundle; publish dir is <out_dir>/marketing/publish
+            bd = Path(str(bundle_dir_raw)).expanduser().resolve()
+            publish_dir = (bd.parent / "marketing" / "publish")
+
+        if not publish_dir.exists() or not publish_dir.is_dir():
+            sys.stdout.write(stable_json_dumps({
+                "mode": "file",
+                "ok": False,
+                "reason": "publish_dir_missing",
+                "publish_dir": str(publish_dir),
+            }) + "\n")
+            return 2
+
+        # stable ordering for determinism
+        files = sorted([p for p in publish_dir.glob("*.json") if p.is_file()], key=lambda p: p.name)
+        items: List[Dict[str, Any]] = []
+        skipped_ids: List[str] = []
+
+        # Gather candidate posts
+        posts: List[Dict[str, Any]] = []
+        for p in files:
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                # Skip invalid JSON deterministically (record)
+                skipped_ids.append(p.name)
+                continue
+            if not isinstance(obj, dict):
+                skipped_ids.append(p.name)
+                continue
+
+            # normalize
+            post_id = str(obj.get("post_id") or obj.get("id") or "")
+            platform = str(obj.get("platform") or obj.get("channel") or "unknown")
+            status = str(obj.get("status") or "planned").lower().strip()
+            run_id = str(obj.get("run_id") or "")
+            drop_id = str(obj.get("drop_id") or "")
+            schedule = str(obj.get("schedule") or "")
+            period_key = str(obj.get("period_key") or "")
+            # tolerate nested period key
+            if not period_key:
+                period_key = str(((obj.get("period") or {}) if isinstance(obj.get("period"), dict) else {}).get("key") or "")
+
+            # Filters (only apply if filter provided)
+            if filter_run_id and run_id != filter_run_id:
+                continue
+            if filter_drop_id and drop_id != filter_drop_id:
+                continue
+            if filter_schedule and schedule != filter_schedule:
+                continue
+            if filter_period_key and period_key != filter_period_key:
+                continue
+
+            # publishable statuses
+            if status not in ("planned", "pending", "ready", "draft"):
+                continue
+
+            # require platform + id
+            if not post_id:
+                # deterministic fallback from filename
+                post_id = p.stem
+            posts.append({
+                "post_id": post_id,
+                "platform": platform,
+                "status": status,
+                "content_obj": obj,
+                "run_id": run_id,
+                "drop_id": drop_id,
+                "schedule": schedule,
+                "period_key": period_key,
+            })
+
+        # deterministic sorting
+        posts_sorted = sorted(posts, key=lambda d: (d.get("period_key") or "", d.get("platform") or "", d.get("post_id") or ""))
+
+        # Batch ID incorporates filters + deterministic knob
+        batch_id = stable_uuid5(
+            "marketing_publish_batch",
+            (ts if not deterministic else "fixed"),
+            ("file"),
+            str(limit),
+            ("dry" if dry_run else "live"),
+            (filter_schedule or "any"),
+            (filter_period_key or "any"),
+            (filter_run_id or "any"),
+            (filter_drop_id or "any"),
+        )
+
+        receipt_paths: List[str] = []
+        base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
+
+        for d in posts_sorted[:limit]:
+            post_id = str(d["post_id"])
+            platform = str(d["platform"])
+            obj = d["content_obj"]
+            run_id = str(d.get("run_id") or obj.get("run_id") or "")
+            drop_id = str(d.get("drop_id") or obj.get("drop_id") or "")
+            schedule = str(d.get("schedule") or obj.get("schedule") or "")
+            period_key = str(d.get("period_key") or obj.get("period_key") or "")
+            track_id = str(obj.get("track_id") or "")
+
+            # store the full original post payload as canonical content
+            content = stable_json_dumps(obj)
+
+            publish_id = stable_uuid5("publish", batch_id, post_id, platform)
+
+            item = {
+                "post_id": post_id,
+                "platform": platform,
+                "schedule": schedule or None,
+                "period_key": period_key or None,
+                "run_id": run_id or None,
+                "drop_id": drop_id or None,
+                "published_id": publish_id,
+                "published_ts": ts,
+                "dry_run": dry_run,
+                "content": content,
+            }
+            items.append(item)
+
+            receipt = {
+                "receipt_id": stable_uuid5("marketing_receipt", batch_id, post_id, platform),
+                "batch_id": batch_id,
+                "ts": ts,
+                "status": "dry_run" if dry_run else "ok",
+                "mode": "file",
+                "post_id": post_id,
+                "platform": platform,
+                "published_id": publish_id,
+                "published_ts": ts,
+                "run_id": run_id,
+                "drop_id": drop_id,
+                "track_id": track_id,
+                "schedule": schedule,
+                "period_key": period_key,
+                "content": content,
+            }
+
+            receipt_paths.append(
+                _write_marketing_receipt(
+                    receipt=receipt,
+                    stable_json_dumps=stable_json_dumps,
+                    base_dir=base_receipts,
+                )
+            )
+
+        out_obj = {
+            "mode": "file",
+            "ok": True,
+            "batch_id": batch_id,
+            "ts": ts,
+            "count": len(items),
+            "limit": limit,
+            "dry_run": dry_run,
+            "filters": {
+                "run_id": filter_run_id,
+                "drop_id": filter_drop_id,
+                "schedule": filter_schedule,
+                "period_key": filter_period_key,
+            },
+            "items": items,
+            "receipts_written": len(receipt_paths),
+            "skipped_ids": skipped_ids,
+        }
+
+        sys.stdout.write(stable_json_dumps(out_obj) + "\n")
+        return 0
+
+    # ----------------------------
+    # DB MODE (default)
+    # ----------------------------
+    db_path = resolve_db_path(args)
     con = db_connect(db_path)
     ensure_tables_minimal(con)
 
@@ -2568,15 +2795,13 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     def _first_created(r: sqlite3.Row) -> str:
         return str(_row_first(r, ["created_at", "created_ts", "ts"], default="") or "")
 
-    pending_sorted = sorted(
-        list(pending),
-        key=lambda r: (_first_created(r), _first_id(r)),
-    )
+    pending_sorted = sorted(list(pending), key=lambda r: (_first_created(r), _first_id(r)))
 
     published: List[Dict[str, Any]] = []
     skipped_ids: List[str] = []
     run_ids_touched: List[str] = []
 
+    # Batch ID in DB mode includes filters + set of run_ids (stable)
     for row in pending_sorted:
         meta = _marketing_row_meta(con, row) or {}
         rid = str(meta.get("run_id") or "")
@@ -2587,23 +2812,50 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     batch_id = stable_uuid5(
         "marketing_publish_batch",
         (ts if not deterministic else "fixed"),
+        "db",
         str(limit),
         ("dry" if dry_run else "live"),
+        (filter_schedule or "any"),
+        (filter_period_key or "any"),
+        (filter_run_id or "any"),
+        (filter_drop_id or "any"),
         ("|".join(run_ids_touched) if run_ids_touched else "no_runs"),
     )
 
     receipt_paths: List[str] = []
+    base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
+
+    def _meta_matches(meta: Dict[str, Any]) -> bool:
+        if filter_run_id and str(meta.get("run_id") or "") != filter_run_id:
+            return False
+        if filter_drop_id and str(meta.get("drop_id") or "") != filter_drop_id:
+            return False
+        if filter_schedule and str(meta.get("schedule") or "") != filter_schedule:
+            return False
+
+        if filter_period_key:
+            pk = str(meta.get("period_key") or "")
+            if not pk:
+                period = meta.get("period")
+                if isinstance(period, dict):
+                    pk = str(period.get("key") or "")
+            if pk != filter_period_key:
+                return False
+        return True
 
     for row in pending_sorted:
         post_id = _first_id(row)
         platform = str(_row_first(row, ["platform", "channel", "destination"], default="unknown"))
         content = _marketing_row_content(con, row) or ""
 
+        meta = _marketing_row_meta(con, row) or {}
+        if not _meta_matches(meta):
+            continue
+
         if not content.strip():
             skipped_ids.append(post_id)
             continue
 
-        meta = _marketing_row_meta(con, row) or {}
         run_id = str(meta.get("run_id") or "")
         drop_id = str(meta.get("drop_id") or "")
         track_id = str(meta.get("track_id") or "")
@@ -2632,6 +2884,8 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "content": content,
             "run_id": run_id,
             "drop_id": drop_id,
+            "schedule": str(meta.get("schedule") or ""),
+            "period_key": str(meta.get("period_key") or "") or (str(meta.get("period", {}).get("key") or "") if isinstance(meta.get("period"), dict) else ""),
         }
         published.append(item)
 
@@ -2640,9 +2894,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "batch_id": batch_id,
             "ts": ts,
             "status": "dry_run" if dry_run else "ok",
+            "mode": "db",
             "post_id": post_id,
             "platform": platform,
             "published_id": publish_id,
+            "published_ts": ts,
             "run_id": run_id,
             "drop_id": drop_id,
             "track_id": track_id,
@@ -2653,6 +2909,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             _write_marketing_receipt(
                 receipt=receipt,
                 stable_json_dumps=stable_json_dumps,
+                base_dir=base_receipts,
             )
         )
 
@@ -2684,6 +2941,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     )
 
     out_obj = {
+        "mode": "db",
         "batch_id": batch_id,
         "ts": ts,
         "count": len(published),
@@ -2693,6 +2951,12 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "drops_updated": drops_updated,
         "items": published,
         "receipts_written": len(receipt_paths),
+        "filters": {
+            "run_id": filter_run_id,
+            "drop_id": filter_drop_id,
+            "schedule": filter_schedule,
+            "period_key": filter_period_key,
+        },
     }
 
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
@@ -3660,170 +3924,254 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_run_weekly(args: argparse.Namespace) -> int:
-    """
-    Minimal deterministic weekly pipeline.
+    """Build a weekly drop bundle from the library DB using the deterministic playlist builder.
 
     Outputs (under out_dir):
       - drop_bundle/playlist.json
-      - drop_bundle/weekly_evidence.json
-      - drop_bundle/weekly_evidence.json.sha256
-      - drop_bundle/playlist.json.sha256
+      - drop_bundle/daily_evidence.json
+      - drop_bundle/tracks/<track_id>.wav   (copied from library)
+      - evidence/daily_evidence.json        (lead track only; used by publish-marketing)
+      - drop_evidence.json                  (summary)
 
     Determinism:
-      - period_key is Monday 00:00 UTC (ISO week start)
-      - under --deterministic, ts is derived from period_key (not wall clock)
-      - stable_json_dumps for all JSON
-      - sha256 sidecars written for compared artifacts
+      - Uses period_key (ISO week label) + seed + context for IDs.
+      - Uses deterministic_now_iso() when deterministic.
+      - Evidence uses relative paths (no absolute out_dir leakage).
     """
-    import hashlib
-    from datetime import datetime, timedelta, timezone
-    from pathlib import Path
-
-    # These should already exist in run_cli.py
     deterministic = is_deterministic(args)
+    json_mode = bool(getattr(args, "json", False))
+
     db_path = resolve_db_path(args)
     context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
 
     seed_val = getattr(args, "seed", None)
     seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
 
-    out_dir = Path(
-        getattr(args, "out_dir", None)
-        or os.environ.get("MGC_EVIDENCE_DIR")
-        or "data/evidence"
-    ).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
     bundle_dir = out_dir / "drop_bundle"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
+    bundle_tracks_dir = bundle_dir / "tracks"
+    evidence_dir = out_dir / "evidence"
 
-    # ---- period_key (UTC week start)
-    if deterministic:
-        # Use your deterministic clock helper if present; otherwise fall back to real time.
-        try:
-            now_iso_wall = deterministic_now_iso(False)
-            now_dt = datetime.fromisoformat(now_iso_wall.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            now_dt = datetime.now(timezone.utc)
-    else:
-        now_dt = datetime.now(timezone.utc)
+    bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    week_start = (now_dt - timedelta(days=(now_dt.isoweekday() - 1))).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-    )
-    period_key = week_start.date().isoformat()  # e.g. "2026-01-12"
+    # Determine ISO week label
+    now_iso = deterministic_now_iso(deterministic)
+    today = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).date() if "T" in now_iso else datetime.now(timezone.utc).date()
+    iso_year, iso_week, _ = today.isocalendar()
+    period_key = f"{iso_year}-W{iso_week:02d}"
 
-    if deterministic:
-        ts = week_start.isoformat().replace("+00:00", "Z")
-    else:
-        ts = now_dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    # Allow explicit override for deterministic CI / backfills
+    override_pk = str(getattr(args, 'period_key', None) or '').strip()
+    if override_pk:
+        if not re.match(r'^\d{4}-W\d{2}$', override_pk):
+            raise SystemExit(f'Invalid --period-key: {override_pk} (expected YYYY-Www)')
+        period_key = override_pk
 
-    # ---- build weekly playlist (pure builder in playlist.py)
-    # NOTE: build_weekly_playlist is defined in your uploaded playlist.py.
+    # Optional: generate new tracks into the library before building the weekly playlist
+    gen_count = int(getattr(args, "generate_count", 0) or 0)
+    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
+    gen_prompt = getattr(args, "prompt", None) or None
+    if gen_count > 0:
+        _agents_generate_and_ingest(
+            db_path=db_path,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            context=context,
+            schedule="weekly",
+            period_key=period_key,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            count=int(gen_count),
+            provider_name=str(gen_provider) if gen_provider else None,
+            prompt=str(gen_prompt) if gen_prompt else None,
+            now_iso=now_iso,
+        )
+
+    # Playlist builder knobs
+    target_minutes = getattr(args, "target_minutes", None)
+    if target_minutes is None:
+        target_minutes = int(os.environ.get("MGC_WEEKLY_TARGET_MINUTES") or "20")
+
+    lookback_playlists = getattr(args, "lookback_playlists", None)
+    if lookback_playlists is None:
+        lookback_playlists = int(os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3")
+
     pl = build_weekly_playlist(
         db_path=Path(db_path),
         context=context,
         period_key=period_key,
         base_seed=int(seed),
-        target_minutes=int(getattr(args, "target_minutes", None) or os.environ.get("MGC_WEEKLY_TARGET_MINUTES") or "60"),
-        lookback_playlists=int(getattr(args, "lookback_playlists", None) or os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3"),
+        target_minutes=int(target_minutes),
+        lookback_playlists=int(lookback_playlists),
     )
 
     items = pl.get("items") if isinstance(pl, dict) else None
     if not items:
         raise SystemExit("weekly playlist builder produced no items")
 
-    # ---- write playlist.json (bundle-relative paths only; playlist builder may provide absolute/full paths)
-    tracks = []
+    # Copy tracks into bundle
+    copied: List[Dict[str, Any]] = []
     for it in items:
         track_id = str(it.get("track_id"))
-        src_path = it.get("artifact_path") or it.get("path") or it.get("full_path")
-        # Playlist should not embed absolute paths in bundle artifacts; keep only IDs here.
-        repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+        full_path = it.get("full_path") or it.get("artifact_path")
+        if not full_path:
+            raise SystemExit(f"playlist item missing full_path for track_id={track_id}")
 
-        src_path = it.get("artifact_path") or it.get("path") or it.get("full_path")
-        if not src_path:
-            raise SystemExit(f"weekly item missing path for track_id={track_id}")
-
-        src = Path(str(src_path))
+        src = Path(str(full_path))
+        # Allow relative paths stored in DB (repo-relative)
         if not src.is_absolute():
-            src = repo_root / src
+            src = Path(getattr(args, "repo_root", ".")).expanduser().resolve() / src
 
         if not src.exists():
             raise SystemExit(f"[run.weekly] missing source track file: {src}")
 
-        dst = (bundle_dir / "tracks" / f"{track_id}{src.suffix or '.wav'}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst = bundle_tracks_dir / f"{track_id}{src.suffix or '.wav'}"
         shutil.copy2(src, dst)
+        copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
-        tracks.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
+    lead_track_id = str(items[0].get("track_id"))
 
+    ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    if deterministic:
+        drop_id = stable_uuid5(f"drop:weekly:{period_key}:{context}:{seed}", namespace=ns)
+        playlist_id = stable_uuid5(f"playlist:weekly:{period_key}:{context}:{seed}", namespace=ns)
+        run_id = stable_uuid5(f"run:weekly:{period_key}:{context}:{seed}", namespace=ns)
+    else:
+        drop_id = str(uuid.uuid4())
+        playlist_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+
+    # Write bundle playlist.json (schema mgc.playlist.v1)
     playlist_obj = {
         "schema": "mgc.playlist.v1",
         "version": 1,
         "schedule": "weekly",
+        "ts": now_iso,
+        "playlist_id": str(playlist_id),
         "context": context,
-        "period_key": period_key,
-        "seed": int(seed),
-        "deterministic": bool(deterministic),
-        "ts": ts,
-        "tracks": tracks,
+        "period": {"label": period_key},
+        "tracks": copied,
     }
+    (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    playlist_path = bundle_dir / "playlist.json"
-    playlist_path.write_text(stable_json_dumps(playlist_obj) + "\n", encoding="utf-8")
-
-    # ---- weekly evidence
-    weekly_ev = {
-        "schema": "mgc.weekly_evidence.v1",
+    # Write evidence/daily_evidence.json for the LEAD track (marketing contract)
+    lead_path = next((c["path"] for c in copied if c["track_id"] == lead_track_id), copied[0]["path"])
+    daily_ev = {
+        "schema": "mgc.daily_evidence.v1",
         "version": 1,
+        "run_id": str(run_id),
+        "stage": "daily",
+        "context": context,
+        "deterministic": bool(deterministic),
+        "ts": now_iso,
+        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub"),
+        "schedule": "weekly",
+        "track": {"track_id": lead_track_id, "path": lead_path},
+        "sha256": {
+            "playlist": sha256_file(bundle_dir / "playlist.json"),
+            "track": sha256_file(bundle_dir / lead_path),
+        },
+        "period": {"label": period_key},
+    }
+    (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (bundle_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Emit planned marketing posts for file-mode publishing (weekly)
+    # Writes: <out_dir>/marketing/publish/<post_id>.json
+    # ------------------------------------------------------------------
+    marketing_dir = out_dir / 'marketing'
+    publish_dir = marketing_dir / 'publish'
+    publish_dir.mkdir(parents=True, exist_ok=True)
+
+    platforms_raw = os.environ.get('MGC_MARKETING_PLATFORMS', 'x,tiktok,instagram_reels,youtube_shorts')
+    platforms = [p.strip() for p in platforms_raw.split(',') if p.strip()]
+    # stable ordering
+    platforms = sorted(dict.fromkeys(platforms))
+
+    title = f'Weekly Drop {period_key} ({context})'
+    hook = f'New weekly {context} drop is ready.'
+    cta = 'Listen now.'
+
+    for platform in platforms:
+        post_id = stable_uuid5('marketing_post', 'weekly', period_key, str(drop_id), platform)
+        payload = {
+            'schema': 'mgc.marketing_post.v1',
+            'version': 1,
+            'post_id': post_id,
+            'status': 'planned',
+            'platform': platform,
+            'schedule': 'weekly',
+            'period_key': period_key,
+            'created_at': now_iso,
+            'run_id': str(run_id),
+            'drop_id': str(drop_id),
+            'track_id': lead_track_id,
+            'title': title,
+            'hook': hook,
+            'cta': cta,
+            'context': context,
+        }
+        (publish_dir / f'{post_id}.json').write_text(stable_json_dumps(payload) + '\n', encoding='utf-8')
+
+    # Compute deterministic repo manifest alongside playlist (helps CI provenance)
+    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+    include = getattr(args, "include", None) or None
+    exclude_dirs = getattr(args, "exclude_dir", None) or None
+    exclude_globs = getattr(args, "exclude_glob", None) or None
+
+    manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
+    manifest_path = out_dir / "weekly_manifest.json"
+    manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
+    manifest_sha256 = sha256_file(manifest_path)
+
+    marketing_obj: Optional[Dict[str, Any]] = None
+    if bool(getattr(args, "marketing", False)):
+        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
+        marketing_obj = _agents_marketing_plan(
+            drop_dir=bundle_dir,
+            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            out_dir=marketing_out,
+            seed=int(seed),
+            teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
+            ts=now_iso,
+        )
+
+    drop_evidence = {
         "ok": True,
         "schedule": "weekly",
         "context": context,
         "period_key": period_key,
-        "seed": int(seed),
-        "deterministic": bool(deterministic),
-        "ts": ts,
-        "track_count": len(tracks),
-        "sha256": {
-            "playlist": sha256_file(playlist_path) if "sha256_file" in globals() else hashlib.sha256(playlist_path.read_bytes()).hexdigest(),
-        },
+        "drop_id": str(drop_id),
+        "lead_track_id": lead_track_id,
+        "playlist_tracks": int(len(copied)),
+        "marketing": marketing_obj,
         "paths": {
             "bundle_dir": "drop_bundle",
-            "playlist": "drop_bundle/playlist.json",
-            "weekly_evidence": "drop_bundle/weekly_evidence.json",
+            "bundle_playlist": "drop_bundle/playlist.json",
+
+            # Weekly runs still emit a lead-track evidence file using the daily schema
+            # (marketing contract). We expose semantically-correct keys while keeping
+            # legacy names for backward compatibility.
+            "bundle_weekly_evidence": "drop_bundle/daily_evidence.json",
+            "weekly_evidence": "evidence/daily_evidence.json",
+            "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
+            "daily_evidence": "evidence/daily_evidence.json",
+
+            "drop_evidence": "drop_evidence.json",
+            "manifest": "weekly_manifest.json",
+            "manifest_sha256": manifest_sha256,
+            "marketing_publish_dir": "marketing/publish",
+            "marketing_receipts_dir": "marketing/receipts",
         },
     }
-
-    weekly_path = bundle_dir / "weekly_evidence.json"
-    weekly_path.write_text(stable_json_dumps(weekly_ev) + "\n", encoding="utf-8")
-
-    # ---- sha256 sidecars (local helper)
-    def _write_sidecar(p: Path) -> None:
-        digest = hashlib.sha256(p.read_bytes()).hexdigest()
-        p.with_suffix(p.suffix + ".sha256").write_text(digest + "\n", encoding="utf-8")
-
-    _write_sidecar(playlist_path)
-    _write_sidecar(weekly_path)
-
-    if bool(getattr(args, "json", False)):
-        sys.stdout.write(
-            stable_json_dumps(
-                {
-                    "ok": True,
-                    "out_dir": str(out_dir),
-                    "bundle_dir": str(bundle_dir),
-                    "period_key": period_key,
-                    "track_count": len(tracks),
-                }
-            )
-            + "\n"
-        )
+    (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if json_mode:
+        sys.stdout.write(stable_json_dumps(drop_evidence) + "\n")
     else:
-        print(f"[run.weekly] ok out_dir={out_dir} period_key={period_key} track_count={len(tracks)}")
+        print(f"[run.weekly] ok period={period_key} tracks={len(copied)} out_dir={out_dir}", file=sys.stderr)
 
     return 0
-
 
 
 def cmd_run_stage_set(args: argparse.Namespace) -> int:
@@ -4653,6 +5001,8 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "submission_zip": str(zip_path),
             "manifest": "weekly_manifest.json",
             "manifest_sha256": manifest_sha256,
+            "marketing_publish_dir": "marketing/publish",
+            "marketing_receipts_dir": "marketing/receipts",
         },
         "verify": {
             "skipped": verify_skipped,
@@ -4842,6 +5192,15 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pub = run_sub.add_parser("publish-marketing", help="Publish pending marketing drafts (draft -> published)")
     pub.add_argument("--limit", type=int, default=50, help="Max number of drafts to publish")
     pub.add_argument("--dry-run", action="store_true", help="Do not update DB; just print what would publish")
+
+    pub.add_argument("--run-id", default=None, help="Only publish posts whose meta.run_id matches (DB mode)")
+    pub.add_argument("--drop-id", default=None, help="Only publish posts whose meta.drop_id matches (DB mode)")
+    pub.add_argument("--schedule", default=None, choices=["daily", "weekly"], help="Only publish posts whose meta.schedule matches (DB mode)")
+    pub.add_argument("--period-key", default=None, help="Only publish posts whose meta.period.key or meta.period_key matches (DB mode)")
+    pub.add_argument("--publish-dir", default=None, help="Publish posts from JSON files in this directory (file mode; no DB fallback)")
+    pub.add_argument("--marketing-dir", default=None, help="Marketing directory containing publish/ (file mode; no DB fallback)")
+    pub.add_argument("--bundle-dir", default=None, help="Bundle dir (e.g. <out_dir>/drop_bundle); infers <out_dir>/marketing/publish (file mode; no DB fallback)")
+    pub.add_argument("--out-dir", default=None, help="Where to write receipts/artifacts (optional; default evidence dir)")
     pub.add_argument(
         "--deterministic",
         action="store_true",
@@ -4896,6 +5255,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly = run_sub.add_parser("weekly", help="Build weekly drop bundle from DB playlist (no fresh generation)")
     weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    weekly.add_argument("--period-key", default=None, help="Override ISO week label for this weekly run (e.g. 2020-W01)")
     weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
     weekly.add_argument(
