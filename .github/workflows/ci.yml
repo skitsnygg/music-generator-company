@@ -237,7 +237,7 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
-      - name: Publish-marketing determinism (weekly; DB mode; dry-run)
+      - name: Publish-marketing determinism (weekly; file mode; dry-run)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
@@ -249,16 +249,11 @@ jobs:
 
           PERIOD_KEY="$(python - <<'PY'
           from datetime import datetime, timezone
-
-          # Derive from MGC_FIXED_TIME if present; fall back to 2020-01-01Z
           import os
-          raw = os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z"
-          raw = raw.strip()
 
-          # Accept "Z" suffix
+          raw = (os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z").strip()
           if raw.endswith("Z"):
               raw = raw[:-1] + "+00:00"
-
           dt = datetime.fromisoformat(raw)
           if dt.tzinfo is None:
               dt = dt.replace(tzinfo=timezone.utc)
@@ -271,45 +266,27 @@ jobs:
           )"
           echo "PERIOD_KEY=${PERIOD_KEY}"
 
-          DB1="${RUNNER_TEMP}/ci_db_pub_1.sqlite"
-          DB2="${RUNNER_TEMP}/ci_db_pub_2.sqlite"
-          cp -f "${MGC_DB}" "${DB1}"
-          cp -f "${MGC_DB}" "${DB2}"
-
-          DB1="${DB1}" DB2="${DB2}" PERIOD_KEY="${PERIOD_KEY}" python - <<'PY'
-          import os, sqlite3
-
-          period_key = os.environ["PERIOD_KEY"]
-
-          def reset(db_path: str) -> None:
-              con = sqlite3.connect(db_path)
-              try:
-                  con.execute(
-                      "UPDATE marketing_posts SET status='planned' "
-                      "WHERE json_extract(meta,'$.schedule')='weekly' "
-                      "AND json_extract(meta,'$.period_key')=?",
-                      (period_key,),
-                  )
-                  con.commit()
-              finally:
-                  con.close()
-
-          reset(os.environ["DB1"])
-          reset(os.environ["DB2"])
-          PY
-
+          WEEKLY1="${MGC_ARTIFACTS_DIR}/weekly_pub_1"
+          WEEKLY2="${MGC_ARTIFACTS_DIR}/weekly_pub_2"
           OUT1="${MGC_ARTIFACTS_DIR}/publish_weekly_1"
           OUT2="${MGC_ARTIFACTS_DIR}/publish_weekly_2"
-          rm -rf "${OUT1}" "${OUT2}"
-          mkdir -p "${OUT1}" "${OUT2}"
 
-          python -m mgc.main --db "${DB1}" run publish-marketing \
-            --schedule weekly --period-key "${PERIOD_KEY}" --deterministic --dry-run \
+          rm -rf "${WEEKLY1}" "${WEEKLY2}" "${OUT1}" "${OUT2}"
+          mkdir -p "${WEEKLY1}" "${WEEKLY2}" "${OUT1}" "${OUT2}"
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
+            --context focus --out-dir "${WEEKLY1}" --deterministic --period-key "${PERIOD_KEY}"
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
+            --context focus --out-dir "${WEEKLY2}" --deterministic --period-key "${PERIOD_KEY}"
+
+          python -m mgc.main --db "${MGC_DB}" run publish-marketing \
+            --bundle-dir "${WEEKLY1}/drop_bundle" --deterministic --dry-run \
             --out-dir "${OUT1}" \
             | python -m json.tool
 
-          python -m mgc.main --db "${DB2}" run publish-marketing \
-            --schedule weekly --period-key "${PERIOD_KEY}" --deterministic --dry-run \
+          python -m mgc.main --db "${MGC_DB}" run publish-marketing \
+            --bundle-dir "${WEEKLY2}/drop_bundle" --deterministic --dry-run \
             --out-dir "${OUT2}" \
             | python -m json.tool
 
@@ -329,10 +306,6 @@ jobs:
 
           test -s "${EVIDENCE}"
 
-          # Resolve playlist path:
-          # - If evidence gives an absolute path, use it.
-          # - If evidence gives a relative path (e.g., "playlist.json"),
-          #   resolve it relative to the evidence file directory.
           PLAYLIST_PATH="$(python - <<'PY'
           import json, os, sys
           from pathlib import Path
