@@ -243,16 +243,43 @@ jobs:
         env:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_FIXED_TIME: ${{ env.MGC_FIXED_TIME }}
         run: |
           set -euxo pipefail
+
+          PERIOD_KEY="$(python - <<'PY'
+          from datetime import datetime, timezone
+
+          # Derive from MGC_FIXED_TIME if present; fall back to 2020-01-01Z
+          import os
+          raw = os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z"
+          raw = raw.strip()
+
+          # Accept "Z" suffix
+          if raw.endswith("Z"):
+              raw = raw[:-1] + "+00:00"
+
+          dt = datetime.fromisoformat(raw)
+          if dt.tzinfo is None:
+              dt = dt.replace(tzinfo=timezone.utc)
+          else:
+              dt = dt.astimezone(timezone.utc)
+
+          y, w, _ = dt.isocalendar()
+          print(f"{y}-W{w:02d}")
+          PY
+          )"
+          echo "PERIOD_KEY=${PERIOD_KEY}"
 
           DB1="${RUNNER_TEMP}/ci_db_pub_1.sqlite"
           DB2="${RUNNER_TEMP}/ci_db_pub_2.sqlite"
           cp -f "${MGC_DB}" "${DB1}"
           cp -f "${MGC_DB}" "${DB2}"
 
-          DB1="${DB1}" DB2="${DB2}" python - <<'PY'
+          DB1="${DB1}" DB2="${DB2}" PERIOD_KEY="${PERIOD_KEY}" python - <<'PY'
           import os, sqlite3
+
+          period_key = os.environ["PERIOD_KEY"]
 
           def reset(db_path: str) -> None:
               con = sqlite3.connect(db_path)
@@ -260,7 +287,8 @@ jobs:
                   con.execute(
                       "UPDATE marketing_posts SET status='planned' "
                       "WHERE json_extract(meta,'$.schedule')='weekly' "
-                      "AND json_extract(meta,'$.period_key')='2020-W01'"
+                      "AND json_extract(meta,'$.period_key')=?",
+                      (period_key,),
                   )
                   con.commit()
               finally:
@@ -276,12 +304,12 @@ jobs:
           mkdir -p "${OUT1}" "${OUT2}"
 
           python -m mgc.main --db "${DB1}" run publish-marketing \
-            --schedule weekly --period-key 2020-W01 --deterministic --dry-run \
+            --schedule weekly --period-key "${PERIOD_KEY}" --deterministic --dry-run \
             --out-dir "${OUT1}" \
             | python -m json.tool
 
           python -m mgc.main --db "${DB2}" run publish-marketing \
-            --schedule weekly --period-key 2020-W01 --deterministic --dry-run \
+            --schedule weekly --period-key "${PERIOD_KEY}" --deterministic --dry-run \
             --out-dir "${OUT2}" \
             | python -m json.tool
 
