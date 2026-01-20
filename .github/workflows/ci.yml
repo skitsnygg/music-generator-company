@@ -416,6 +416,7 @@ jobs:
                   cur = cur[k]
               return cur
 
+          # Primary: playlist path embedded in evidence (daily/autonomous style)
           candidates = [
               dig(obj, "paths", "playlist_path"),
               dig(obj, "paths", "playlist"),
@@ -433,15 +434,44 @@ jobs:
                   raw = c.strip()
                   break
 
-          if not raw:
-              print("ERROR: Could not find playlist path in evidence.", file=sys.stderr)
-              sys.exit(2)
+          if raw:
+              p = Path(raw)
+              if not p.is_absolute():
+                  p = (evidence_path.parent / p).resolve()
+              if p.exists() and p.stat().st_size > 0:
+                  print(str(p))
+                  raise SystemExit(0)
 
-          p = Path(raw)
-          if not p.is_absolute():
-              p = (evidence_path.parent / p).resolve()
+          # Fallback: weekly evidence may not include a playlist path.
+          # Search for playlist json near the evidence file.
+          root = evidence_path.parent
+          near = [
+              root / "playlist.json",
+              root / "drop_bundle" / "playlist.json",
+              root.parent / "playlist.json",
+              root.parent / "drop_bundle" / "playlist.json",
+          ]
+          for p in near:
+              if p.exists() and p.stat().st_size > 0:
+                  print(str(p.resolve()))
+                  raise SystemExit(0)
 
-          print(str(p))
+          # Last resort: bounded search for playlist*.json near evidence root.
+          search_roots = [root, root.parent]
+          for sr in search_roots:
+              if not sr.exists():
+                  continue
+              for p in sr.rglob("playlist*.json"):
+                  try:
+                      if p.is_file() and p.stat().st_size > 0:
+                          print(str(p.resolve()))
+                          raise SystemExit(0)
+                  except OSError:
+                      continue
+
+          print("ERROR: Could not find playlist path in evidence or nearby files.", file=sys.stderr)
+          print(f"evidence_path={evidence_path}", file=sys.stderr)
+          raise SystemExit(2)
           PY
           )"
 
