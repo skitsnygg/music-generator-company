@@ -374,6 +374,31 @@ jobs:
           sha256sum "${OUT1}/submission.zip" "${OUT2}/submission.zip"
           test "$(sha256sum "${OUT1}/submission.zip" | awk '{print $1}')" = "$(sha256sum "${OUT2}/submission.zip" | awk '{print $1}')"
 
+      - name: Verify drop output contract (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+        run: |
+          set -euxo pipefail
+
+          # Verify any drop outputs that CI produced
+          if test -d "${MGC_ARTIFACTS_DIR}/auto"; then
+            python scripts/verify_drop_contract.py \
+              --out-dir "${MGC_ARTIFACTS_DIR}/auto"
+          fi
+
+          if test -d "${MGC_ARTIFACTS_DIR}/weekly_pub_1"; then
+            python scripts/verify_drop_contract.py \
+              --out-dir "${MGC_ARTIFACTS_DIR}/weekly_pub_1"
+          fi
+
+          if test -d "${MGC_ARTIFACTS_DIR}/weekly_pub_2"; then
+            python scripts/verify_drop_contract.py \
+              --out-dir "${MGC_ARTIFACTS_DIR}/weekly_pub_2"
+          fi
+
+
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
