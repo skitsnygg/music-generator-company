@@ -301,12 +301,12 @@ jobs:
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${WEEKLY1}/drop_bundle" --deterministic --dry-run \
             --out-dir "${OUT1}" \
-            | python -m json.tool
+            --json
 
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${WEEKLY2}/drop_bundle" --deterministic --dry-run \
             --out-dir "${OUT2}" \
-            | python -m json.tool
+            --json
 
           diff -ru "${OUT1}" "${OUT2}"
 
@@ -335,45 +335,77 @@ jobs:
           # Write receipts into each out_dir (dry-run but writes deterministic receipts)
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${OUT1}/drop_bundle" --deterministic --dry-run --out-dir "${OUT1}" \
-            | python -m json.tool
+            --json
 
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${OUT2}/drop_bundle" --deterministic --dry-run --out-dir "${OUT2}" \
-            | python -m json.tool
+            --json
 
           # Build submission zips
           python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip"
           python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip"
-          
+
           test -s "${OUT1}/submission.zip"
           test -s "${OUT2}/submission.zip"
-
 
           # Determinism: receipts trees and zips must match
           diff -ru "${OUT1}/marketing/receipts" "${OUT2}/marketing/receipts"
           sha256sum "${OUT1}/submission.zip" "${OUT2}/submission.zip"
           test "$(sha256sum "${OUT1}/submission.zip" | awk '{print $1}')" = "$(sha256sum "${OUT2}/submission.zip" | awk '{print $1}')"
 
-
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           WEB_DIR: ${{ env.MGC_WEB_DIR }}
-          EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
         run: |
           set -euxo pipefail
 
           rm -rf "${WEB_DIR}"
           mkdir -p "${WEB_DIR}"
 
-          test -s "${EVIDENCE}"
+          # Evidence may be written to different roots depending on CI mode; locate it robustly.
+          EVIDENCE_PATH=""
+          for p in \
+            "${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json" \
+            "${MGC_EVIDENCE_DIR}/drop_evidence.json" \
+            "${MGC_EVIDENCE_DIR}/auto/drop_evidence.json"
+          do
+            if test -s "${p}"; then
+              EVIDENCE_PATH="${p}"
+              break
+            fi
+          done
+
+          if test -z "${EVIDENCE_PATH}"; then
+            # As a last resort, search (bounded) for drop_evidence.json in runner temp.
+            EVIDENCE_PATH="$(find "${RUNNER_TEMP}" -maxdepth 6 -type f -name 'drop_evidence.json' -size +0c 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if test -z "${EVIDENCE_PATH}"; then
+            echo "ERROR: drop_evidence.json not found. Looked in:"
+            echo "  ${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json"
+            echo "  ${MGC_EVIDENCE_DIR}/drop_evidence.json"
+            echo "  ${MGC_EVIDENCE_DIR}/auto/drop_evidence.json"
+            echo "and searched under RUNNER_TEMP."
+            echo "Debug listing:"
+            ls -la "${MGC_ARTIFACTS_DIR}" || true
+            find "${MGC_ARTIFACTS_DIR}" -maxdepth 4 -type f -name '*evidence*.json' -print || true
+            ls -la "${MGC_EVIDENCE_DIR}" || true
+            find "${MGC_EVIDENCE_DIR}" -maxdepth 4 -type f -name '*evidence*.json' -print || true
+            exit 1
+          fi
+
+          echo "EVIDENCE_PATH=${EVIDENCE_PATH}"
+          export EVIDENCE_PATH
 
           PLAYLIST_PATH="$(python - <<'PY'
           import json, os, sys
           from pathlib import Path
 
-          evidence_path = Path(os.environ["EVIDENCE"]).resolve()
+          evidence_path = Path(os.environ["EVIDENCE_PATH"]).resolve()
           obj = json.loads(evidence_path.read_text(encoding="utf-8"))
 
           def dig(d, *keys):
@@ -423,8 +455,7 @@ jobs:
             --prefer-mp3 \
             --clean \
             --fail-if-empty \
-            --json \
-            | python -m json.tool
+            --json
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
@@ -433,17 +464,41 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
-          EVIDENCE: ${{ env.MGC_ARTIFACTS_DIR }}/auto/drop_evidence.json
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
         run: |
           set -euxo pipefail
 
-          test -s "${EVIDENCE}"
+          # Find evidence (same logic as web build)
+          EVIDENCE_PATH=""
+          for p in \
+            "${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json" \
+            "${MGC_EVIDENCE_DIR}/drop_evidence.json" \
+            "${MGC_EVIDENCE_DIR}/auto/drop_evidence.json"
+          do
+            if test -s "${p}"; then
+              EVIDENCE_PATH="${p}"
+              break
+            fi
+          done
+
+          if test -z "${EVIDENCE_PATH}"; then
+            EVIDENCE_PATH="$(find "${RUNNER_TEMP}" -maxdepth 6 -type f -name 'drop_evidence.json' -size +0c 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if test -z "${EVIDENCE_PATH}"; then
+            echo "ERROR: drop_evidence.json not found for submission check."
+            exit 1
+          fi
+
+          echo "EVIDENCE_PATH=${EVIDENCE_PATH}"
+          export EVIDENCE_PATH
 
           SUB_ZIP="$(python - <<'PY'
           import json, os, sys
           from pathlib import Path
 
-          evidence_path = Path(os.environ["EVIDENCE"]).resolve()
+          evidence_path = Path(os.environ["EVIDENCE_PATH"]).resolve()
           obj = json.loads(evidence_path.read_text(encoding="utf-8"))
 
           paths = obj.get("paths") if isinstance(obj.get("paths"), dict) else {}
