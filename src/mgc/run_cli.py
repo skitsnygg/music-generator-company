@@ -2489,6 +2489,10 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     }
     (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    # Also write a top-level playlist.json for web build + tooling convenience
+    # (kept identical to drop_bundle/playlist.json for determinism).
+    (out_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     lead_rel_path = copied[0]["path"]
     daily_ev = {
         "schema": "mgc.daily_evidence.v1",
@@ -2546,6 +2550,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
+            "playlist_path": "playlist.json",
+            "playlist": "playlist.json",
             "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
             "daily_evidence": "evidence/daily_evidence.json",
             "drop_evidence": "drop_evidence.json",
@@ -4054,6 +4060,10 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     }
     (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    # Also write a top-level playlist.json for web build + tooling convenience
+    # (kept identical to drop_bundle/playlist.json for determinism).
+    (out_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     # Write evidence/daily_evidence.json for the LEAD track (marketing contract)
     lead_path = next((c["path"] for c in copied if c["track_id"] == lead_track_id), copied[0]["path"])
     daily_ev = {
@@ -4149,6 +4159,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
+            "playlist_path": "playlist.json",
+            "playlist": "playlist.json",
 
             # Weekly runs still emit a lead-track evidence file using the daily schema
             # (marketing contract). We expose semantically-correct keys while keeping
