@@ -2,8 +2,9 @@ name: Deploy GitHub Pages
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch: {}
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,7 +12,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
 
 jobs:
@@ -34,7 +35,7 @@ jobs:
           python -m pip install -U pip
           pip install -e .
 
-      - name: Build release bundle + web (deterministic publish contract)
+      - name: Build release bundle + web (publish contract)
         shell: bash
         run: |
           set -euxo pipefail
@@ -43,13 +44,10 @@ jobs:
           rm -rf "${OUT}"
           mkdir -p "${OUT}"
 
-          # Use a throwaway CI DB copy so the repo doesn't get dirtied.
           DB="${RUNNER_TEMP}/ci_db.sqlite"
           cp fixtures/ci_db.sqlite "${DB}"
 
-          # IMPORTANT:
-          # run autonomous --contract publish stages receipts ONLY from repo-relative candidates,
-          # e.g. artifacts/run/marketing/receipts.jsonl (not from $RUNNER_TEMP env vars).
+          # Publish contract stages receipts only from repo-relative candidates.
           mkdir -p artifacts/run/marketing
           cat > artifacts/run/marketing/receipts.jsonl <<'JSONL'
 {"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}
@@ -68,10 +66,12 @@ JSONL
           test -s "${OUT}/web/web_manifest.json"
           test -s "${OUT}/web/playlist.json"
 
+          echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ${{ runner.temp }}/mgc_release/web
+          path: ${{ env.RELEASE_OUT }}/web
 
   deploy:
     runs-on: ubuntu-latest
