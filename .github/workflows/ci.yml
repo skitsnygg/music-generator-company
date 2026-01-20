@@ -127,66 +127,28 @@ jobs:
           fi
 
       - name: Ensure DB schema has required tables (CI bootstrap)
-        shell: bash
-        env:
-          MGC_DB: ${{ env.MGC_DB }}
-        run: |
-          set -euxo pipefail
+          shell: bash
+          env:
+            MGC_DB: ${{ env.MGC_DB }}
+          run: |
+            set -euxo pipefail
+            python -c "import os,sqlite3; p=os.environ['MGC_DB']; con=sqlite3.connect(p); con.execute('PRAGMA foreign_keys=ON'); stmts=[ \
+      'CREATE TABLE IF NOT EXISTS tracks (track_id TEXT PRIMARY KEY, ts TEXT NOT NULL, title TEXT, provider TEXT, mood TEXT, genre TEXT, artifact_path TEXT, meta TEXT)', \
+      'CREATE TABLE IF NOT EXISTS drops (drop_id TEXT PRIMARY KEY, ts TEXT NOT NULL, context TEXT, seed TEXT, run_id TEXT, track_id TEXT, meta TEXT)', \
+      'CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, ts TEXT NOT NULL, kind TEXT, actor TEXT, meta TEXT)', \
+      'CREATE TABLE IF NOT EXISTS marketing_posts (post_id TEXT PRIMARY KEY, ts TEXT NOT NULL, platform TEXT, status TEXT, content TEXT, meta TEXT)', \
+      'CREATE TABLE IF NOT EXISTS playlists (playlist_id TEXT PRIMARY KEY, ts TEXT, context TEXT, payload TEXT, meta TEXT)' \
+  ]; \
+    [ con.execute(s) for s in stmts ]; con.commit(); \
+    tables=[r[0] for r in con.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\").fetchall()]; \
+    print('tables:', tables); \
+    required=set(['tracks','drops','events','marketing_posts','playlists']); \
+    missing=sorted(required-set(tables)); \
+    assert not missing, 'missing tables: %s' % missing; \
+    con.close()"
 
-          python -c "import os,sqlite3; p=os.environ['MGC_DB']; con=sqlite3.connect(p); \
-con.execute('PRAGMA foreign_keys = ON'); \
-con.executescript('''\
-CREATE TABLE IF NOT EXISTS tracks (
-  track_id TEXT PRIMARY KEY,
-  ts TEXT NOT NULL,
-  title TEXT,
-  provider TEXT,
-  mood TEXT,
-  genre TEXT,
-  artifact_path TEXT,
-  meta TEXT
-);
-CREATE TABLE IF NOT EXISTS drops (
-  drop_id TEXT PRIMARY KEY,
-  ts TEXT NOT NULL,
-  context TEXT,
-  seed TEXT,
-  run_id TEXT,
-  track_id TEXT,
-  meta TEXT
-);
-CREATE TABLE IF NOT EXISTS events (
-  event_id TEXT PRIMARY KEY,
-  ts TEXT NOT NULL,
-  kind TEXT,
-  actor TEXT,
-  meta TEXT
-);
-CREATE TABLE IF NOT EXISTS marketing_posts (
-  post_id TEXT PRIMARY KEY,
-  ts TEXT NOT NULL,
-  platform TEXT,
-  status TEXT,
-  content TEXT,
-  meta TEXT
-);
-CREATE TABLE IF NOT EXISTS playlists (
-  playlist_id TEXT PRIMARY KEY,
-  ts TEXT,
-  context TEXT,
-  payload TEXT,
-  meta TEXT
-);
-'''); \
-con.commit(); \
-tables=[r[0] for r in con.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\").fetchall()]; \
-print('tables:', tables); \
-required=set(['tracks','drops','events','marketing_posts','playlists']); \
-missing=sorted(required-set(tables)); \
-assert not missing, 'missing tables: %s' % missing; \
-con.close()"
 
-      - name: Preflight DB (must pass)
+    - name: Preflight DB (must pass)
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
