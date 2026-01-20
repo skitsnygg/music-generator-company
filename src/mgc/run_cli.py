@@ -4168,8 +4168,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
             "drop_evidence": "drop_evidence.json",
             "manifest": "weekly_manifest.json",
             "manifest_sha256": manifest_sha256,
-            "marketing_publish_dir": "marketing/publish",
-            "marketing_receipts_dir": "marketing/receipts",
+            "marketing_publish_dir": contract_report["paths"].get("marketing_publish_dir"),
+            "marketing_receipts_dir": contract_report["paths"].get("marketing_receipts_dir"),
         },
     }
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -4873,20 +4873,35 @@ def cmd_run_diff(args: argparse.Namespace) -> int:
 
 def cmd_run_autonomous(args: argparse.Namespace) -> int:
     """
-    End-to-end autonomous run:
+    End-to-end autonomous run.
 
-    - executes `run drop` (daily + publish-marketing + manifest + evidence + submission zip)
-    - verifies the produced submission.zip by:
-        * unzip to temp dir
-        * validate_bundle(submission/drop_bundle)
-    - prints a single JSON summary to stdout
+    Today this command is a thin orchestration wrapper around `run drop`, plus
+    release-contract validation.
+
+    Pipeline:
+      1) executes `run drop` (daily + publish-marketing + manifest + evidence + submission zip)
+      2) (optional) build web bundle into out_dir/web when required (publish contract)
+      3) (optional) stage marketing receipts into out_dir/marketing/receipts when required
+      4) verify the produced submission.zip by unzip+validate (unless skipped)
+      5) emit exactly one JSON summary to stdout
 
     Flags:
-      --no-verify-submission  skip unzip+validate
-      --dry-run              will skip zip verification automatically (no zip expected)
+      --no-verify-submission     skip unzip+validate
+      --dry-run                  skip zip verification automatically
+      --contract {local,publish} contract strictness (publish requires web+marketing artifacts)
+      --require-web              require web bundle and build it
+      --require-marketing        require marketing receipts and stage them
+      --deterministic            expect deterministic evidence fields to be true
+
+    IMPORTANT:
+      - This command MUST emit exactly one JSON object to stdout.
+      - Any invoked subcommands must have their stdout JSON suppressed or captured.
     """
+
     import json
     import os
+    import shutil
+    import subprocess
     import tempfile
     import zipfile
     from pathlib import Path
@@ -4900,24 +4915,27 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     def _read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _env_truthy(name: str) -> bool:
+        v = os.environ.get(name)
+        if v is None:
+            return False
+        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
     dry_run = bool(getattr(args, "dry_run", False))
     no_verify = bool(getattr(args, "no_verify_submission", False))
     json_mode = bool(getattr(args, "json", False))
 
     # IMPORTANT: ensure cmd_run_drop does NOT print its own summary JSON.
-    # We want exactly one JSON object from this command.
     setattr(args, "_suppress_stdout_json", True)
 
-    # 1) Run drop (canonical pipeline). Any logs should be on stderr via logging config.
+    # 1) Run drop (canonical pipeline)
     rc = int(cmd_run_drop(args))
     if rc != 0:
         if json_mode:
-            sys.stdout.write(
-                _stable_json({"ok": False, "cmd": "run.autonomous", "stage": "drop", "rc": rc})
-            )
+            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "drop", "rc": rc}))
         return rc
 
-    # 2) Determine out_dir + evidence path (execution-specific; do NOT emit as absolute in final JSON)
+    # 2) Determine out_dir + evidence
     out_dir = Path(
         getattr(args, "out_dir", None)
         or os.environ.get("MGC_EVIDENCE_DIR")
@@ -4952,12 +4970,6 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
         raise SystemExit(f"[run autonomous] {msg}")
 
     zip_path = Path(str(submission_zip)).expanduser().resolve()
-    if not zip_path.exists():
-        msg = f"submission_zip missing on disk: {zip_path}"
-        if json_mode:
-            sys.stdout.write(_stable_json({"ok": False, "cmd": "run.autonomous", "stage": "submission_zip", "error": msg}))
-            return 2
-        raise SystemExit(f"[run autonomous] {msg}")
 
     # 4) Verify zip unless skipped / dry-run
     verify_skipped = bool(dry_run or no_verify)
@@ -4967,61 +4979,250 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     if verify_skipped:
         verify_ok = None
     else:
-        try:
-            with zipfile.ZipFile(str(zip_path), "r") as zf:
-                names = zf.namelist()
-                expected_prefix = "submission/drop_bundle/"
-                if not any(n.startswith(expected_prefix) for n in names):
-                    raise ValueError("invalid submission.zip layout: expected submission/drop_bundle/")
-
-                with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
-                    td_path = Path(td).resolve()
-                    zf.extractall(td_path)
-
-                    bundle_dir = td_path / "submission" / "drop_bundle"
-                    if not bundle_dir.exists() or not bundle_dir.is_dir():
-                        raise FileNotFoundError(f"extracted bundle missing: {bundle_dir}")
-
-                    validate_bundle(bundle_dir)
-
-            verify_ok = True
-        except Exception as e:
+        if not zip_path.exists():
             verify_ok = False
-            verify_error = str(e)
+            verify_error = f"submission_zip missing on disk: {zip_path}"
+        else:
+            try:
+                with zipfile.ZipFile(str(zip_path), "r") as zf:
+                    names = zf.namelist()
+                    expected_prefix = "submission/drop_bundle/"
+                    if not any(n.startswith(expected_prefix) for n in names):
+                        raise ValueError("invalid submission.zip layout: expected submission/drop_bundle/")
 
-    # 5) Emit exactly one JSON object
+                    with tempfile.TemporaryDirectory(prefix="mgc_autonomous_verify_") as td:
+                        td_path = Path(td).resolve()
+                        zf.extractall(td_path)
+
+                        bundle_dir = td_path / "submission" / "drop_bundle"
+                        if not bundle_dir.exists() or not bundle_dir.is_dir():
+                            raise FileNotFoundError(f"extracted bundle missing: {bundle_dir}")
+
+                        validate_bundle(bundle_dir)
+
+                verify_ok = True
+            except Exception as e:
+                verify_ok = False
+                verify_error = str(e)
+
+    # Stable IDs
     drop_id = str(evidence_obj.get("drop_id") or "")
     run_id = str(evidence_obj.get("run_id") or "")
 
-    manifest_sha256 = ""
+    # Compute manifest sha256 if present
+    def _sha256_file(path: Path) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
-    # IMPORTANT: top-level paths must be portable so runs in different out_dir still diff clean.
-    # drop.paths already contains portable paths ("." / manifest.json / drop_evidence.json).
+    manifest_rel = "manifest.json"
+    manifest_path = (out_dir / manifest_rel).resolve()
+    manifest_sha256 = _sha256_file(manifest_path) if manifest_path.exists() else ""
+
+    # 5) Contract requirements + (optional) artifact production into out_dir
+    deterministic_expected = bool(getattr(args, "deterministic", False)) or _env_truthy("MGC_DETERMINISTIC")
+
+    contract_mode = str(getattr(args, "contract", "local") or "local")
+    require_marketing = bool(getattr(args, "require_marketing", False)) or (contract_mode == "publish")
+    require_web = bool(getattr(args, "require_web", False)) or (contract_mode == "publish")
+
+    web_build_ok: Optional[bool] = None
+    web_build_error: Optional[str] = None
+    staged_receipts_ok: Optional[bool] = None
+    staged_receipts_error: Optional[str] = None
+
+    # If web is required, build web bundle into out_dir/web, capturing stdout.
+    # We intentionally do NOT surface the web.build JSON on stdout here.
+    web_dir = out_dir / "web"
+    web_manifest = web_dir / "web_manifest.json"
+    if require_web:
+        try:
+            web_dir.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                sys.executable,
+                "-m",
+                "mgc.main",
+                "web",
+                "build",
+                "--playlist",
+                str((out_dir / "playlist.json").resolve()),
+                "--out-dir",
+                str(web_dir.resolve()),
+                "--clean",
+                "--fail-on-missing",
+                "--fail-if-empty",
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode != 0:
+                web_build_ok = False
+                web_build_error = (p.stderr or p.stdout or "web build failed").strip()[:2000]
+            else:
+                web_build_ok = True
+        except Exception as e:
+            web_build_ok = False
+            web_build_error = str(e)
+
+    # If marketing is required, stage/copy receipts into out_dir/marketing/receipts.
+    marketing_receipts_dir = out_dir / "marketing" / "receipts"
+    marketing_publish_dir = out_dir / "marketing" / "publish"
+    if require_marketing:
+        try:
+            marketing_receipts_dir.mkdir(parents=True, exist_ok=True)
+            # Candidate canonical receipts.jsonl paths (repo-relative). We copy the newest if present.
+            repo_root = Path(getattr(args, "repo_root", None) or os.environ.get("MGC_REPO_ROOT") or os.getcwd()).resolve()
+            candidates = [
+                repo_root / "artifacts" / "run" / "marketing" / "receipts.jsonl",
+                repo_root / "data" / "receipts" / "receipts.jsonl",
+                repo_root / "artifacts" / "run" / "agents" / "music" / "receipts.jsonl",
+            ]
+            src_receipts: Optional[Path] = None
+            for c in candidates:
+                if c.exists() and c.is_file() and c.stat().st_size > 0:
+                    src_receipts = c
+                    break
+            if src_receipts is None:
+                staged_receipts_ok = False
+                staged_receipts_error = "no receipts.jsonl found to stage"
+            else:
+                # Copy deterministically to a stable filename.
+                dst = marketing_receipts_dir / "receipts.jsonl"
+                shutil.copyfile(src_receipts, dst)
+                staged_receipts_ok = True
+        except Exception as e:
+            staged_receipts_ok = False
+            staged_receipts_error = str(e)
+
+    # 6) Release contract validation (hard gate)
+    required_files = [
+        "drop_evidence.json",
+        "playlist.json",
+        "manifest.json",
+    ]
+
+    missing: list[str] = []
+    present: list[str] = []
+
+    for rel in required_files:
+        p = out_dir / rel
+        if p.exists() and p.is_file():
+            present.append(rel)
+        else:
+            missing.append(rel)
+
+    # Tracks: at least one bundle track in out_dir/tracks/*.wav
+    tracks_dir = out_dir / "tracks"
+    track_files: list[str] = []
+    if tracks_dir.exists() and tracks_dir.is_dir():
+        track_files = sorted([str(p.relative_to(out_dir)) for p in tracks_dir.glob("*.wav") if p.is_file()])
+    if track_files:
+        present.append("tracks/*.wav")
+    else:
+        missing.append("tracks/*.wav")
+
+    # Submission zip must exist unless dry-run
+    submission_ok = True
+    if not dry_run:
+        submission_ok = zip_path.exists() and zip_path.is_file()
+        if not submission_ok:
+            missing.append("submission_zip")
+
+    # Determinism expectations
+    deterministic_actual = bool(evidence_obj.get("deterministic", False))
+    daily_obj = evidence_obj.get("daily") if isinstance(evidence_obj.get("daily"), dict) else {}
+    daily_det_actual = bool(daily_obj.get("deterministic", False)) if isinstance(daily_obj, dict) else False
+
+    determinism_ok = True
+    if deterministic_expected:
+        if not deterministic_actual:
+            determinism_ok = False
+        if not daily_det_actual:
+            determinism_ok = False
+
+    # Marketing required?
+    if require_marketing:
+        if not (marketing_receipts_dir.exists() and marketing_receipts_dir.is_dir()):
+            missing.append("marketing/receipts")
+        else:
+            receipts = [p for p in marketing_receipts_dir.glob("*") if p.is_file()]
+            if not receipts:
+                missing.append("marketing/receipts/*")
+
+    # Web required?
+    if require_web:
+        if not (web_manifest.exists() and web_manifest.is_file()):
+            missing.append("web/web_manifest.json")
+
+    contract_ok = (not missing) and submission_ok and determinism_ok
+
+    contract_report: Dict[str, Any] = {
+        "ok": contract_ok,
+        "schema": "mgc.release_contract.v3",
+        "mode": contract_mode,
+        "requirements": {"marketing": require_marketing, "web": require_web},
+        "expected": {
+            "deterministic": deterministic_expected,
+            "required": (
+                required_files
+                + ["tracks/*.wav", "submission_zip"]
+                + (["marketing/receipts"] if require_marketing else [])
+                + (["web/web_manifest.json"] if require_web else [])
+            ),
+        },
+        "actual": {
+            "deterministic": deterministic_actual,
+            "daily_deterministic": daily_det_actual,
+            "present": present,
+            "missing": missing,
+            "track_files": track_files,
+        },
+        "actions": {
+            "web_build": {"ok": web_build_ok, "error": web_build_error},
+            "stage_marketing_receipts": {"ok": staged_receipts_ok, "error": staged_receipts_error},
+        },
+        "paths": {
+            "out_dir": ".",
+            "evidence_path": "drop_evidence.json",
+            "playlist": "playlist.json",
+            "manifest": manifest_rel,
+            "submission_zip": str(zip_path),
+            "marketing_publish_dir": "marketing/publish" if marketing_publish_dir.exists() else None,
+            "marketing_receipts_dir": "marketing/receipts" if marketing_receipts_dir.exists() else None,
+            "web_manifest": "web/web_manifest.json" if web_manifest.exists() else None,
+        },
+        "sha256": {"manifest": manifest_sha256},
+        "ids": {"drop_id": drop_id, "run_id": run_id},
+    }
+
+    try:
+        (out_dir / "contract_report.json").write_text(_stable_json(contract_report), encoding="utf-8")
+    except Exception:
+        pass
+
     out: Dict[str, Any] = {
-        "ok": (verify_ok in (None, True)),
+        "ok": (verify_ok in (None, True)) and contract_ok,
         "cmd": "run.autonomous",
         "ids": {"drop_id": drop_id, "run_id": run_id},
         "paths": {
             "out_dir": ".",
             "evidence_path": "drop_evidence.json",
-            # submission.zip lives outside out_dir and is stable; keep absolute for convenience.
             "submission_zip": str(zip_path),
-            "manifest": "weekly_manifest.json",
+            "manifest": manifest_rel,
             "manifest_sha256": manifest_sha256,
-            "marketing_publish_dir": "marketing/publish",
-            "marketing_receipts_dir": "marketing/receipts",
+            "contract_report": "contract_report.json",
+            "marketing_publish_dir": contract_report["paths"].get("marketing_publish_dir"),
+            "marketing_receipts_dir": contract_report["paths"].get("marketing_receipts_dir"),
+            "web_manifest": contract_report["paths"].get("web_manifest"),
         },
-        "verify": {
-            "skipped": verify_skipped,
-            "ok": verify_ok,
-            "error": verify_error,
-        },
-        # Include the full drop evidence so this command is self-contained.
+        "verify": {"skipped": verify_skipped, "ok": verify_ok, "error": verify_error},
+        "contract": contract_report,
         "drop": evidence_obj,
     }
 
     sys.stdout.write(_stable_json(out))
-    return 0 if (verify_ok in (None, True)) else 2
+    return 0 if ((verify_ok in (None, True)) and contract_ok) else 2
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestration (one command to run the whole chain)
@@ -5147,6 +5348,133 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
+
+
+
+def cmd_run_publish(args: argparse.Namespace) -> int:
+    """Publish a validated release bundle (consumer-only).
+
+    Design goals:
+    - Never rebuild artifacts. Only consumes an existing bundle-dir.
+    - Refuse to run unless contract_report.json exists and indicates:
+        - schema mgc.release_contract.v3 (or newer)
+        - mode == publish
+        - ok == true
+    - Default safety gate requires an APPROVED file in the bundle-dir.
+
+    Today (v1): this command performs *safe* publish steps only:
+    - verifies web bundle is present
+    - verifies marketing receipts are present (if required)
+    - writes publish_summary.json as a durable audit marker
+
+    Future: integrate platform APIs and web deployment behind explicit flags.
+    """
+
+    import json
+    from datetime import datetime, timezone
+
+    def _stable_json(obj: Any) -> str:
+        return stable_json_dumps(obj) + "\n"
+
+    bundle_dir = Path(str(getattr(args, 'bundle_dir', ''))).expanduser().resolve()
+    dry_run = bool(getattr(args, 'dry_run', False))
+    force = bool(getattr(args, 'force', False))
+    allow_unapproved = bool(getattr(args, 'allow_unapproved', False))
+
+    if not bundle_dir.is_dir():
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "bundle_dir_not_found", "bundle_dir": str(bundle_dir)}))
+        return 2
+
+    contract_path = bundle_dir / 'contract_report.json'
+    if not contract_path.exists():
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "missing_contract_report", "path": str(contract_path)}))
+        return 2
+
+    try:
+        contract = json.loads(contract_path.read_text(encoding='utf-8'))
+    except Exception as e:
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "invalid_contract_json", "path": str(contract_path), "detail": str(e)}))
+        return 2
+
+    schema = str(contract.get('schema') or '')
+    mode = str(contract.get('mode') or '')
+    ok = bool(contract.get('ok', False))
+
+    # Accept v3 and newer (lexicographic is fine given our naming pattern)
+    if not schema.startswith('mgc.release_contract.v'):
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "unsupported_contract_schema", "schema": schema}))
+        return 2
+
+    if mode != 'publish':
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "contract_not_publish_mode", "mode": mode}))
+        return 2
+
+    if not ok:
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "contract_failed"}))
+        return 2
+
+    if not (force or allow_unapproved):
+        approved = bundle_dir / 'APPROVED'
+        if not approved.exists():
+            sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "missing_approved_file", "path": str(approved)}))
+            return 2
+
+    # Verify required staged artifacts
+    paths = contract.get('paths') if isinstance(contract.get('paths'), dict) else {}
+
+    web_manifest_rel = (paths.get('web_manifest') if isinstance(paths, dict) else None) or 'web/web_manifest.json'
+    web_manifest = (bundle_dir / str(web_manifest_rel)).resolve()
+    if not web_manifest.exists():
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "missing_web_manifest", "path": str(web_manifest)}))
+        return 2
+
+    marketing_receipts_rel = (paths.get('marketing_receipts_dir') if isinstance(paths, dict) else None)
+    receipts_dir = (bundle_dir / str(marketing_receipts_rel)).resolve() if marketing_receipts_rel else (bundle_dir / 'marketing' / 'receipts').resolve()
+    receipts_path = receipts_dir / 'receipts.jsonl'
+
+    # Marketing may be required by contract, but we still validate presence to match that contract.
+    reqs = contract.get('requirements') if isinstance(contract.get('requirements'), dict) else {}
+    marketing_required = bool(reqs.get('marketing', True))  # publish mode normally requires marketing
+
+    receipts_present = receipts_path.exists()
+    if marketing_required and not receipts_present:
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "missing_marketing_receipts", "path": str(receipts_path)}))
+        return 2
+
+    # Write publish summary marker
+    summary = {
+        'cmd': 'run.publish',
+        'ok': True,
+        'bundle_dir': str(bundle_dir),
+        'dry_run': dry_run,
+        'force': force,
+        'ts': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'inputs': {
+            'contract_report': str(contract_path),
+            'web_manifest': str(web_manifest),
+            'marketing_receipts': str(receipts_path) if receipts_present else None,
+        },
+        'actions': {
+            'marketing': 'dry_run' if dry_run else 'no_op_v1',
+            'web': 'dry_run' if dry_run else 'no_op_v1',
+        },
+    }
+
+    out_path = bundle_dir / 'publish_summary.json'
+    try:
+        out_path.write_text(stable_json_dumps(summary) + "\n", encoding='utf-8')
+    except Exception as e:
+        sys.stdout.write(_stable_json({"cmd": "run.publish", "ok": False, "error": "failed_to_write_publish_summary", "path": str(out_path), "detail": str(e)}))
+        return 2
+
+    sys.stdout.write(_stable_json({
+        'cmd': 'run.publish',
+        'ok': True,
+        'dry_run': dry_run,
+        'bundle_dir': str(bundle_dir),
+        'publish_summary': str(out_path),
+    }))
+    return 0
 
 def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     """
@@ -5475,6 +5803,22 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     auto.add_argument("--no-resume", action="store_true", help="Disable resume behavior; always run all stages")
     auto.add_argument("--deterministic", action="store_true", help="Deterministic mode (also via MGC_DETERMINISTIC=1)")
     auto.add_argument("--no-verify-submission", action="store_true", help="Skip verifying submission.zip after drop")
+    auto.add_argument(
+        "--contract",
+        choices=["local", "publish"],
+        default="local",
+        help="Release contract strictness: local (default) or publish (requires marketing+web artifacts)",
+    )
+    auto.add_argument(
+        "--require-marketing",
+        action="store_true",
+        help="Require marketing outputs in out_dir (stronger than local contract)",
+    )
+    auto.add_argument(
+        "--require-web",
+        action="store_true",
+        help="Require web build outputs in out_dir (stronger than local contract)",
+    )
 
     # NEW: pass-through to drop
     auto.add_argument(
@@ -5489,6 +5833,33 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     )
 
     auto.set_defaults(func=cmd_run_autonomous)
+
+
+    publish = run_sub.add_parser(
+        "publish",
+        help="Publish a validated release bundle (consumer-only; requires contract_report.json)",
+    )
+    publish.add_argument(
+        "--bundle-dir",
+        required=True,
+        help="Path to a release bundle directory previously produced by `mgc run autonomous --contract publish`",
+    )
+    publish.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not contact external systems (today: always safe; kept for forward compat)",
+    )
+    publish.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass APPROVED gate (use sparingly)",
+    )
+    publish.add_argument(
+        "--allow-unapproved",
+        action="store_true",
+        help="Alias for bypassing APPROVED gate (backward-compatible naming)",
+    )
+    publish.set_defaults(func=cmd_run_publish)
 
     # ----------------------------
     # pipeline

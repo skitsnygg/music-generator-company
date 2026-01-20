@@ -2,99 +2,161 @@
 
 ## Overview
 
-**Music Generator Company (MGC)** is an autonomous, reproducible pipeline that demonstrates how multiple agents collaborate to generate music, manage metadata, build playlists, and simulate promotion — with full traceability and auditability.
+**Music Generator Company (MGC)** is a deterministic, autonomous release pipeline that demonstrates how generated media can be safely built, validated, approved, and published using modern CI/CD and release-engineering practices.
 
-The system focuses on:
-
-- End-to-end automation (generation → storage → playlist → promotion)
-- Deterministic, CI-friendly behavior
-- Clear observability through logs, JSON artifacts, and receipts
-- Clean architecture with explicit agent responsibilities
-
-No paid APIs are required to run the system.
+The project is intentionally designed with clear contracts, reproducible artifacts, explicit approval gates, and auditable outputs — without relying on paid APIs or external infrastructure.
+**Live Demo (GitHub Pages):**  
+https://skitsnygg.github.io/music-generator-company/
 
 ---
 
 ## System Goals
 
-- Automated pipeline from **generation → storage → playlist → promotion**
-- Context-based music generation (focus / workout / sleep)
-- Deterministic outputs suitable for CI verification
-- Recurring daily or scheduled music drops
-- Clear, auditable proof of promotion via artifacts and receipts
+- End-to-end automation from **generation → release bundle → publish**
+- Deterministic, CI-verifiable outputs (byte-for-byte)
+- Explicit separation between **build** and **publish**
+- Approval-gated releases to prevent accidental shipping
+- Fully auditable artifacts, receipts, and manifests
+- No required paid APIs or cloud services
+
+---
+
+## Autonomous Release Pipeline
+
+This project demonstrates a **full release lifecycle**, not just task automation.
+
+### High-Level Flow
+
+mgc run autonomous  
+↓  
+release bundle (audio + metadata)  
+↓  
+release contract (local / publish)  
+↓  
+CI determinism verification  
+↓  
+APPROVED (manual gate)  
+↓  
+mgc run publish  
+↓  
+GitHub Pages deploy
+
+### What This Proves
+
+- Deterministic builds suitable for CI
+- Explicit contracts defining what “done” means
+- Safe automation that cannot publish without approval
+- Clear artifact boundaries between build and ship
+- Real-world release discipline applied to generated media
+
+---
+
+## Key Concepts
+
+### Release Bundles
+
+A release bundle is a **self-contained directory** produced by `mgc run autonomous`.
+
+It includes:
+- Generated audio
+- Playlist JSON
+- Release manifest
+- Evidence and receipts
+- Optional static web player
+
+Everything needed to inspect, verify, or publish the release lives in one folder.
+
+---
+
+### Release Contracts
+
+Release contracts define **required artifacts** and **constraints**.
+
+Supported modes:
+- `local` — build-only validation
+- `publish` — requires marketing receipts and web bundle
+
+Contracts are validated automatically and written to `contract_report.json`.  
+CI fails if a contract fails.
+
+---
+
+### Determinism
+
+Determinism is enforced across:
+- Audio generation (stub provider)
+- JSON manifests
+- Web bundles
+- Submission archives
+
+CI verifies identical inputs produce identical outputs across full directory trees.
+
+---
+
+### Approval Gating
+
+Publishing is blocked unless explicitly approved.
+
+Approval mechanism:
+touch <bundle-dir>/APPROVED
+
+Without this file, publishing is refused.
+
+---
+
+### Publish vs Build (Strict Separation)
+
+- `run autonomous` builds a release
+- `run publish` ships an already-built release
+
+Publishing never rebuilds or mutates artifacts.
 
 ---
 
 ## Architecture
 
-The system is organized around **agents**, **orchestration**, and **artifacts**.
-
-### High-Level Architecture Diagram
-
-```
-                ┌───────────────────┐
-                │  Scheduler / CLI  │
-                │ (cron / GH Action │
-                │  / manual run)    │
-                └─────────┬─────────┘
-                          │
-                          ▼
-                ┌───────────────────┐
-                │   Orchestrator    │
-                │  mgc run daily    │
-                └─────────┬─────────┘
-                          │
-        ┌─────────────────┼─────────────────┐
-        ▼                 ▼                 ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ Music Agent  │   │ Playlist     │   │ Marketing    │
-│              │   │ Builder      │   │ Agent        │
-│ - generate   │   │ - filter     │   │ - plan posts │
-│ - preview    │   │ - shuffle    │   │ - draft JSON │
-└──────┬───────┘   │ - dedupe     │   └──────┬───────┘
-       │           └──────┬───────┘          │
-       ▼                  ▼                  ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ Audio Files  │   │ Playlist     │   │ Marketing    │
-│ data/tracks  │   │ JSON         │   │ Drafts       │
-│ data/previews│   │ data/playlists│  │ data/posts   │
-└──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-       │                  │                  │
-       └──────────────┬───┴──────────────┬───┘
-                      ▼                  ▼
-              ┌────────────────────────────────┐
-              │ Publish Simulation              │
-              │ - select DB rows                │
-              │ - emit receipts                 │
-              └──────────────┬─────────────────┘
-                             ▼
-                  ┌────────────────────────┐
-                  │ Evidence Artifacts      │
-                  │ artifacts/runs/         │
-                  │ artifacts/receipts/     │
-                  └────────────────────────┘
-```
-
 ### Core Components
 
-#### Agents
-- **Music Agent**
-  - Generates one track per run (stub or provider-backed)
-  - Produces full audio, preview clip, and metadata
-- **Marketing Agent**
-  - Plans posts for multiple platforms
-  - Writes drafts and database rows
-- **Billing Agent**
-  - MVP stub (included for architectural completeness)
+**CLI / Orchestration**
+- Single entrypoint (`mgc`)
+- Explicit lifecycle subcommands
+- JSON-first outputs
 
-#### Orchestration
-- `mgc run daily` coordinates the full pipeline
-- CLI subcommands expose each stage independently
+**Music Generation**
+- Stub provider (default, deterministic)
+- Optional Riffusion provider (local service)
 
-#### Storage
-- SQLite database (portable, reproducible)
-- JSON artifacts written to disk
-- Receipts generated for publish simulation
+**Playlist Builder**
+- Deterministic selection and ordering
+- Stable playlist JSON
+
+**Marketing System**
+- Plans posts and records receipts
+- No live APIs required
+- Receipts staged and auditable
+
+**Web Player**
+- Static HTML + JS
+- Built from playlist JSON
+- Deployed via GitHub Pages
+
+---
+
+## Release Bundle Layout
+
+out_dir/
+- contract_report.json
+- drop_evidence.json
+- manifest.json
+- playlist.json
+- tracks/<track_id>.wav
+- marketing/receipts/receipts.jsonl
+- web/index.html
+- web/playlist.json
+- web/web_manifest.json
+- web/tracks/<track_id>.wav
+
+The bundle is portable, auditable, deployable, and deterministic.
 
 ---
 
@@ -102,237 +164,93 @@ The system is organized around **agents**, **orchestration**, and **artifacts**.
 
 ### Local Setup
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
+python -m venv .venv  
+source .venv/bin/activate  
+pip install -U pip  
 pip install -e .
-```
 
 No API keys are required for the default stub provider.
 
 ---
 
-## Demo Guide (End-to-End Flow)
+## End-to-End Demo
 
-### 1. Run the Full Pipeline
+### Build a Publish-Ready Release
 
-```bash
-python -m mgc.main run daily --db data/db.sqlite --context focus --json
-```
-
-This performs:
-
-- Track generation
-- Metadata storage
-- Playlist building
-- Marketing post planning
-- Evidence bundle creation
-
-### 2. Simulate Publishing (Promotion Step)
-
-```bash
-python -m mgc.main publish marketing --status published --json
-```
-
-This simulates publishing planned posts and generates receipts.
+MGC_PROVIDER=stub python -m mgc.main  
+--db fixtures/ci_db.sqlite  
+--seed 1  
+run autonomous  
+--context focus  
+--out-dir /tmp/mgc_release  
+--deterministic  
+--contract publish
 
 ---
 
-## Outputs & Evidence
+### Approve the Release
 
-### Data Outputs (`data/`)
-
-- `data/tracks/` — full audio files
-- `data/previews/` — 20-second preview clips
-- `data/posts/` — marketing draft payloads
-- `data/playlists/<context>_radio.json` — playlist output
-
-### Evidence Bundle (`artifacts/`)
-
-```text
-artifacts/
-├── runs/<YYYY-MM-DD>/
-│   ├── run.json
-│   ├── track.json
-│   ├── playlist.json
-│   └── marketing_posts/
-│       ├── <track_id>_x.json
-│       ├── <track_id>_tiktok.json
-│       └── ...
-└── receipts/<YYYY-MM-DD>/marketing/
-    ├── x/
-    ├── youtube_shorts/
-    ├── instagram_reels/
-    └── tiktok/
-```
-
-These artifacts provide a complete, auditable record of system behavior.
+touch /tmp/mgc_release/APPROVED
 
 ---
 
-## Publish Simulation & Receipts
+### Publish (Dry Run)
 
-Publishing is simulated to avoid reliance on live social media APIs.
-
-### What Happens on Publish
-- Posts are selected from the database
-- Each post is “published” per platform (simulated)
-- A receipt JSON is written to disk
-
-Each receipt includes:
-- platform
-- track_id
-- published_at (UTC)
-- payload snapshot
-- final status
-- simulated permalink
-
-This provides reproducible, auditable proof of promotion.
+python -m mgc.main run publish  
+--bundle-dir /tmp/mgc_release  
+--dry-run
 
 ---
 
-## Debug / Trace Mode (Observability)
+### Publish (Live)
 
-The system supports **traceable execution** via structured logs and artifacts.
-
-### Logging
-- Deterministic UTC timestamps
-- No duplicate log handlers
-- Log level configurable via CLI or environment variable
-
-```bash
-python -m mgc.main run daily --log-level DEBUG --json
-```
-
-### Trace Artifacts
-During a run, the system emits intermediate artifacts:
-- `run.json` — run metadata and configuration
-- `track.json` — generated track details
-- `playlist.json` — playlist composition
-- marketing post drafts
-- publish receipts
-
-These allow step-by-step inspection of:
-- agent decisions
-- intermediate results
-- final outputs
-
-### Debug Use Cases
-- Inspect why a track was selected for a playlist
-- Verify deduplication logic
-- Trace marketing payloads before publish
-- Compare deterministic rebuilds in CI
+python -m mgc.main run publish  
+--bundle-dir /tmp/mgc_release
 
 ---
 
-## Analytics & Observability (Optional)
+## CI & GitHub Pages
 
-Analytics are intentionally lightweight.
+- CI enforces determinism and contract validation
+- Publish bundles are built on `main`
+- Static web output is deployed to GitHub Pages
+- No secrets or cloud accounts required
 
-### What’s Included
-- Structured event logging
-- CLI-accessible queries (`mgc analytics ...`)
-- Deterministic outputs suitable for CI
-
-### Design Intent
-- Analytics are **not required** for the core pipeline
-- The autonomous pipeline works without analytics enabled
-- Analytics support debugging, inspection, and future extensions
-
-Example:
-```bash
-python -m mgc.main analytics events --limit 20
-```
-
----
-
-## Reproducibility & CI
-
-- Deterministic logging (UTC timestamps)
-- Fixture database generator for CI
-- Strict rebuild + verify gate
-
-### Run CI Gate Locally
-
-```bash
-MGC_DB=fixtures/ci_db.sqlite bash scripts/ci_gate.sh
-```
-
-This verifies:
-- Python compilation
-- Deterministic rebuilds
-- Strict output matching
-
----
-
-## Scheduling (Autonomy)
-
-The project supports recurring autonomous runs.
-
-### GitHub Actions
-A scheduled workflow runs:
-- `mgc run daily`
-- uploads `artifacts/runs/` as build artifacts
-
-### Local Cron Example
-```bash
-0 6 * * * cd /path/to/repo && . .venv/bin/activate && python -m mgc.main run daily --context focus
-```
+Everything is reviewable directly from GitHub.
 
 ---
 
 ## Providers
 
-### Stub Provider (Default)
-- Deterministic
-- No external dependencies
+**Stub Provider (Default)**
+- Fully deterministic
+- Offline
+- CI-safe
 
-```bash
 export MGC_PROVIDER=stub
-python -m mgc.main run daily --context workout --json
-```
 
-### Optional: Riffusion
-Requires a running service.
+**Optional: Riffusion**
+Requires a local inference server.
 
-```bash
-export MGC_PROVIDER=riffusion
-export RIFFUSION_URL="http://127.0.0.1:3013/run_inference"
-python -m mgc.main run daily --context sleep --json
-```
+export MGC_PROVIDER=riffusion  
+export RIFFUSION_URL=http://127.0.0.1:3013/run_inference
 
 ---
 
-## Database
+## Why This Project Exists
 
-- SQLite for portability and reproducibility
-
-### Default Paths
-- Local: `data/db.sqlite`
-- CI: `fixtures/ci_db.sqlite`
-
-### Core Tables
-- `tracks`
-- `marketing_posts`
-- `playlists`
-- `playlist_items`
-
-(CI fixtures also include `events`, `playlist_runs`, etc.)
+This repository demonstrates:
+- Release engineering discipline
+- CI-safe automation
+- Deterministic system design
+- Explicit approval gates
+- Clear separation of concerns
+- Auditable, production-grade workflows
 
 ---
 
-## Useful Commands
+## Summary
 
-```bash
-# Tracks
-python -m mgc.main tracks stats
-python -m mgc.main tracks list --limit 10
+This is not a demo script — it is a **release pipeline**.
 
-# Playlists
-python -m mgc.main playlists list --limit 10
-python -m mgc.main playlists reveal <PLAYLIST_ID>
-
-# Marketing
-python -m mgc.main marketing posts list --limit 10
-```
+If you can build it, validate it, approve it, and publish it reproducibly, you can ship anything.
