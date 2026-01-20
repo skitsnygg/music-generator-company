@@ -109,6 +109,10 @@ def main() -> int:
         post_id = "40000000-0000-0000-0000-000000000001"
         playlist_id = "50000000-0000-0000-0000-000000000001"
 
+        # IMPORTANT:
+        # data/ is ignored in this repo. Seed track must live in a tracked location.
+        seed_track_path = "fixtures/audio/ci_seed_track.wav"
+
         # Track seed row
         cur.execute(
             """
@@ -123,7 +127,7 @@ def main() -> int:
                 "stub",
                 "focus",
                 "ci_genre",
-                "data/tracks/ci_seed_track.wav",
+                seed_track_path,
                 stable_json({"fixture": True}),
             ),
         )
@@ -199,7 +203,11 @@ def main() -> int:
                         "context": "focus",
                         "track_count": 1,
                         "tracks": [
-                            {"id": track_id, "title": "CI Seed Track", "artifact_path": "data/tracks/ci_seed_track.wav"}
+                            {
+                                "id": track_id,
+                                "title": "CI Seed Track",
+                                "artifact_path": seed_track_path,
+                            }
                         ],
                     }
                 ),
