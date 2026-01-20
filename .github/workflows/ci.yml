@@ -262,9 +262,8 @@ jobs:
 
           # Ensure the publish contract can stage receipts from the repo-relative default path.
           mkdir -p artifacts/run/marketing
-          cat > artifacts/run/marketing/receipts.jsonl <<'JSONL'
-{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}
-JSONL
+          printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
+            > artifacts/run/marketing/receipts.jsonl
           test -s artifacts/run/marketing/receipts.jsonl
 
           OUT1="${MGC_ARTIFACTS_DIR}/auto_publish_1"
@@ -285,7 +284,6 @@ JSONL
           (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
           (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
           diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
-
 
       - name: Autonomous contract (publish; main only; twice + determinism diff)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
