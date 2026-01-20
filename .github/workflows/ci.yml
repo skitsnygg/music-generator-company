@@ -1,4 +1,3 @@
-# .github/workflows/ci.yml
 name: CI
 
 on:
@@ -117,11 +116,12 @@ jobs:
           TOKEN="$(python -m mgc.main --db "${MGC_DB}" billing tokens mint ci_user --show-token | tail -n 1)"
           test -n "${TOKEN}"
 
-          python -m mgc.main --db "${MGC_DB}" billing whoami --token "${TOKEN}" >/dev/null
-          python -m mgc.main --db "${MGC_DB}" billing tokens revoke --token "${TOKEN}" >/dev/null
+          # IMPORTANT: token may begin with '-' so pass as --token="..."
+          python -m mgc.main --db "${MGC_DB}" billing whoami --token="${TOKEN}" >/dev/null
+          python -m mgc.main --db "${MGC_DB}" billing tokens revoke --token="${TOKEN}" >/dev/null
 
           # must deny now
-          if python -m mgc.main --db "${MGC_DB}" billing whoami --token "${TOKEN}"; then
+          if python -m mgc.main --db "${MGC_DB}" billing whoami --token="${TOKEN}"; then
             echo "ERROR: expected whoami to deny revoked token"
             exit 1
           fi
@@ -447,7 +447,6 @@ jobs:
             python scripts/verify_drop_contract.py \
               --out-dir "${MGC_ARTIFACTS_DIR}/weekly_pub_2"
           fi
-
 
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
