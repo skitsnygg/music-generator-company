@@ -49,9 +49,8 @@ jobs:
 
           # Publish contract stages receipts only from repo-relative candidates.
           mkdir -p artifacts/run/marketing
-          cat > artifacts/run/marketing/receipts.jsonl <<'JSONL'
-{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}
-JSONL
+          printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
+            > artifacts/run/marketing/receipts.jsonl
 
           MGC_PROVIDER=stub python -m mgc.main \
             --db "${DB}" \
