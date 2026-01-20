@@ -1,9 +1,9 @@
-name: Deploy Web (GitHub Pages)
+name: Deploy GitHub Pages
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches: ["main"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -11,87 +11,67 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages-deploy
-  cancel-in-progress: true
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: "3.12"
 
       - name: Install
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install -U pip
-          python -m pip install -e .
+          pip install -e .
 
-      - name: Install ffmpeg
+      - name: Build release bundle + web (deterministic publish contract)
         shell: bash
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
 
-      - name: Build fixture DB
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python scripts/make_fixture_db.py
-          cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
-          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
-
-      - name: Migrate DB (deterministic)
-        shell: bash
-        env:
-          MGC_MIGRATE_NOW: "2020-01-01T00:00:00Z"
-        run: |
-          set -euxo pipefail
-          python scripts/migrate_db.py
-
-      - name: Build publish bundle (contract must pass)
-        shell: bash
-        env:
-          MGC_PROVIDER: stub
-        run: |
-          set -euxo pipefail
           OUT="${RUNNER_TEMP}/mgc_release"
           rm -rf "${OUT}"
           mkdir -p "${OUT}"
 
-          # Deterministic CI placeholder receipts so publish contract can stage marketing receipts
-          RECEIPTS="${RUNNER_TEMP}/receipts.jsonl"
-          printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' > "${RECEIPTS}"
-          export MGC_MARKETING_RECEIPTS_PATH="${RECEIPTS}"
+          # Use a throwaway CI DB copy so the repo doesn't get dirtied.
+          DB="${RUNNER_TEMP}/ci_db.sqlite"
+          cp fixtures/ci_db.sqlite "${DB}"
 
-          python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT}" --deterministic --contract publish
+          # IMPORTANT:
+          # run autonomous --contract publish stages receipts ONLY from repo-relative candidates,
+          # e.g. artifacts/run/marketing/receipts.jsonl (not from $RUNNER_TEMP env vars).
+          mkdir -p artifacts/run/marketing
+          cat > artifacts/run/marketing/receipts.jsonl <<'JSONL'
+{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}
+JSONL
 
-          test -s "${OUT}/contract_report.json"
+          MGC_PROVIDER=stub python -m mgc.main \
+            --db "${DB}" \
+            --seed 1 \
+            run autonomous \
+            --context focus \
+            --out-dir "${OUT}" \
+            --deterministic \
+            --contract publish
+
           test -s "${OUT}/web/index.html"
           test -s "${OUT}/web/web_manifest.json"
-          test -s "${OUT}/marketing/receipts/receipts.jsonl"
-
-          echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
-
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
+          test -s "${OUT}/web/playlist.json"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ${{ env.RELEASE_OUT }}/web
+          path: ${{ runner.temp }}/mgc_release/web
 
   deploy:
     runs-on: ubuntu-latest
