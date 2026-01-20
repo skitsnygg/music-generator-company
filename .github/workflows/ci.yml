@@ -19,6 +19,8 @@ jobs:
       # Determinism knobs for everything in this workflow
       MGC_DETERMINISTIC: "1"
       MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+      # Deterministic migrations
+      MGC_MIGRATE_NOW: "2020-01-01T00:00:00Z"
       PYTHON: python
 
     steps:
@@ -86,6 +88,22 @@ jobs:
 
           ls -la "${RUNNER_TEMP}/ci_db.sqlite"
           sha256sum "${RUNNER_TEMP}/ci_db.sqlite"
+
+      - name: Run DB migrations on temp DB (deterministic)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_MIGRATE_NOW: ${{ env.MGC_MIGRATE_NOW }}
+        run: |
+          set -euxo pipefail
+
+          test -n "${MGC_DB}"
+          test -f "${MGC_DB}"
+
+          python scripts/migrate_db.py
+
+          # Sanity: billing revocations table should exist once migrations run
+          sqlite3 "${MGC_DB}" ".schema billing_token_revocations" >/dev/null
 
       - name: Ensure DB schema has required tables (CI bootstrap)
         shell: bash
