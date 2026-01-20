@@ -105,6 +105,27 @@ jobs:
           # Sanity: billing revocations table should exist once migrations run
           sqlite3 "${MGC_DB}" ".schema billing_token_revocations" >/dev/null
 
+      - name: Billing smoke (mint -> whoami -> revoke -> deny)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+        run: |
+          set -euxo pipefail
+
+          python -m mgc.main --db "${MGC_DB}" billing users add ci_user --email ci@example.com >/dev/null
+
+          TOKEN="$(python -m mgc.main --db "${MGC_DB}" billing tokens mint ci_user --show-token | tail -n 1)"
+          test -n "${TOKEN}"
+
+          python -m mgc.main --db "${MGC_DB}" billing whoami --token "${TOKEN}" >/dev/null
+          python -m mgc.main --db "${MGC_DB}" billing tokens revoke --token "${TOKEN}" >/dev/null
+
+          # must deny now
+          if python -m mgc.main --db "${MGC_DB}" billing whoami --token "${TOKEN}"; then
+            echo "ERROR: expected whoami to deny revoked token"
+            exit 1
+          fi
+
       - name: Ensure DB schema has required tables (CI bootstrap)
         shell: bash
         run: |
@@ -366,116 +387,12 @@ jobs:
           rm -rf "${WEB_DIR}"
           mkdir -p "${WEB_DIR}"
 
-          # Evidence may be written to different roots depending on CI mode; locate it robustly.
-          EVIDENCE_PATH=""
-          for p in \
-            "${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json" \
-            "${MGC_EVIDENCE_DIR}/drop_evidence.json" \
-            "${MGC_EVIDENCE_DIR}/auto/drop_evidence.json"
-          do
-            if test -s "${p}"; then
-              EVIDENCE_PATH="${p}"
-              break
-            fi
-          done
-
-          if test -z "${EVIDENCE_PATH}"; then
-            # As a last resort, search (bounded) for drop_evidence.json in runner temp.
-            EVIDENCE_PATH="$(find "${RUNNER_TEMP}" -maxdepth 6 -type f -name 'drop_evidence.json' -size +0c 2>/dev/null | head -n 1 || true)"
-          fi
-
-          if test -z "${EVIDENCE_PATH}"; then
-            echo "ERROR: drop_evidence.json not found. Looked in:"
-            echo "  ${MGC_ARTIFACTS_DIR}/auto/drop_evidence.json"
-            echo "  ${MGC_EVIDENCE_DIR}/drop_evidence.json"
-            echo "  ${MGC_EVIDENCE_DIR}/auto/drop_evidence.json"
-            echo "and searched under RUNNER_TEMP."
-            echo "Debug listing:"
-            ls -la "${MGC_ARTIFACTS_DIR}" || true
-            find "${MGC_ARTIFACTS_DIR}" -maxdepth 4 -type f -name '*evidence*.json' -print || true
-            ls -la "${MGC_EVIDENCE_DIR}" || true
-            find "${MGC_EVIDENCE_DIR}" -maxdepth 4 -type f -name '*evidence*.json' -print || true
-            exit 1
-          fi
-
+          EVIDENCE_PATH="$(python scripts/find_artifacts.py --mode find_evidence)"
           echo "EVIDENCE_PATH=${EVIDENCE_PATH}"
-          export EVIDENCE_PATH
 
-          PLAYLIST_PATH="$(python - <<'PY'
-          import json, os, sys
-          from pathlib import Path
-
-          evidence_path = Path(os.environ["EVIDENCE_PATH"]).resolve()
-          obj = json.loads(evidence_path.read_text(encoding="utf-8"))
-
-          def dig(d, *keys):
-              cur = d
-              for k in keys:
-                  if not isinstance(cur, dict) or k not in cur:
-                      return None
-                  cur = cur[k]
-              return cur
-
-          # Primary: playlist path embedded in evidence (daily/autonomous style)
-          candidates = [
-              dig(obj, "paths", "playlist_path"),
-              dig(obj, "paths", "playlist"),
-              dig(obj, "paths", "playlist_json"),
-              dig(obj, "paths", "playlist_file"),
-              dig(obj, "drop", "paths", "playlist_path"),
-              dig(obj, "drop", "paths", "playlist"),
-              obj.get("playlist_path") if isinstance(obj, dict) else None,
-              obj.get("playlist") if isinstance(obj, dict) else None,
-          ]
-
-          raw = None
-          for c in candidates:
-              if isinstance(c, str) and c.strip():
-                  raw = c.strip()
-                  break
-
-          if raw:
-              p = Path(raw)
-              if not p.is_absolute():
-                  p = (evidence_path.parent / p).resolve()
-              if p.exists() and p.stat().st_size > 0:
-                  print(str(p))
-                  raise SystemExit(0)
-
-          # Fallback: weekly evidence may not include a playlist path.
-          # Search for playlist json near the evidence file.
-          root = evidence_path.parent
-          near = [
-              root / "playlist.json",
-              root / "drop_bundle" / "playlist.json",
-              root.parent / "playlist.json",
-              root.parent / "drop_bundle" / "playlist.json",
-          ]
-          for p in near:
-              if p.exists() and p.stat().st_size > 0:
-                  print(str(p.resolve()))
-                  raise SystemExit(0)
-
-          # Last resort: bounded search for playlist*.json near evidence root.
-          search_roots = [root, root.parent]
-          for sr in search_roots:
-              if not sr.exists():
-                  continue
-              for p in sr.rglob("playlist*.json"):
-                  try:
-                      if p.is_file() and p.stat().st_size > 0:
-                          print(str(p.resolve()))
-                          raise SystemExit(0)
-                  except OSError:
-                      continue
-
-          print("ERROR: Could not find playlist path in evidence or nearby files.", file=sys.stderr)
-          print(f"evidence_path={evidence_path}", file=sys.stderr)
-          raise SystemExit(2)
-          PY
-          )"
-
+          PLAYLIST_PATH="$(python scripts/find_artifacts.py --mode find_playlist --evidence-path "${EVIDENCE_PATH}")"
           echo "PLAYLIST_PATH=${PLAYLIST_PATH}"
+
           test -n "${PLAYLIST_PATH}"
           test -s "${PLAYLIST_PATH}"
 
