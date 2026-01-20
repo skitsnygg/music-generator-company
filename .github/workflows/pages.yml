@@ -1,0 +1,100 @@
+name: Deploy Web (GitHub Pages)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip
+          python -m pip install -e .
+
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Build fixture DB
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python scripts/make_fixture_db.py
+          cp -f fixtures/ci_db.sqlite "${RUNNER_TEMP}/ci_db.sqlite"
+          echo "MGC_DB=${RUNNER_TEMP}/ci_db.sqlite" >> "$GITHUB_ENV"
+
+      - name: Migrate DB (deterministic)
+        shell: bash
+        env:
+          MGC_MIGRATE_NOW: "2020-01-01T00:00:00Z"
+        run: |
+          set -euxo pipefail
+          python scripts/migrate_db.py
+
+      - name: Build publish bundle (contract must pass)
+        shell: bash
+        env:
+          MGC_PROVIDER: stub
+        run: |
+          set -euxo pipefail
+          OUT="${RUNNER_TEMP}/mgc_release"
+          rm -rf "${OUT}"
+          mkdir -p "${OUT}"
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 \
+            run autonomous --context focus --out-dir "${OUT}" --deterministic --contract publish
+
+          test -s "${OUT}/contract_report.json"
+          test -s "${OUT}/web/index.html"
+          test -s "${OUT}/web/web_manifest.json"
+
+          echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.RELEASE_OUT }}/web
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
