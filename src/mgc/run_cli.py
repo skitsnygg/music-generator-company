@@ -13,6 +13,7 @@ import shutil
 import socket
 import sqlite3
 import sys
+import subprocess
 import time
 import uuid
 import math
@@ -2487,11 +2488,10 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "period": {"label": period_key},
         "tracks": copied,
     }
-    (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    # Also write a top-level playlist.json for web build + tooling convenience
-    # (kept identical to drop_bundle/playlist.json for determinism).
-    (out_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    playlist_json = json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n"
+    (bundle_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
+    # Pipeline contract: always expose top-level playlist.json as well
+    (out_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
 
     lead_rel_path = copied[0]["path"]
     daily_ev = {
@@ -2550,8 +2550,6 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
-            "playlist_path": "playlist.json",
-            "playlist": "playlist.json",
             "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
             "daily_evidence": "evidence/daily_evidence.json",
             "drop_evidence": "drop_evidence.json",
@@ -4058,11 +4056,10 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "period": {"label": period_key},
         "tracks": copied,
     }
-    (bundle_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    # Also write a top-level playlist.json for web build + tooling convenience
-    # (kept identical to drop_bundle/playlist.json for determinism).
-    (out_dir / "playlist.json").write_text(json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    playlist_json = json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n"
+    (bundle_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
+    # Pipeline contract: always expose top-level playlist.json as well
+    (out_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
 
     # Write evidence/daily_evidence.json for the LEAD track (marketing contract)
     lead_path = next((c["path"] for c in copied if c["track_id"] == lead_track_id), copied[0]["path"])
@@ -4159,8 +4156,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
-            "playlist_path": "playlist.json",
-            "playlist": "playlist.json",
 
             # Weekly runs still emit a lead-track evidence file using the daily schema
             # (marketing contract). We expose semantically-correct keys while keeping
@@ -5029,6 +5024,127 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     return 0 if (verify_ok in (None, True)) else 2
 
 # ---------------------------------------------------------------------------
+# Pipeline orchestration (one command to run the whole chain)
+# ---------------------------------------------------------------------------
+
+def cmd_run_pipeline(args: argparse.Namespace) -> int:
+    """
+    Orchestrate the full autonomous pipeline using existing CLI subcommands.
+
+    This is intentionally orchestration-only (no business logic):
+      1) run daily/weekly
+      2) verify drop contract (playlist.json + drop_bundle + evidence)
+      3) optional: web build
+      4) optional: submission build
+      5) publish-marketing (dry-run unless --publish)
+
+    Design goals:
+    - keep existing commands stable
+    - keep determinism guarantees (pass through --deterministic when requested)
+    - avoid importing internal modules from other CLIs (use subprocess to call mgc.main)
+    """
+
+    db_path = resolve_db_path(args)
+    out_dir = str(Path(getattr(args, 'out_dir')).resolve())
+
+    base = [sys.executable, '-m', 'mgc.main', '--db', db_path]
+
+    def run_cmd(cmd: list[str]) -> None:
+        # Keep output visible; CI relies on logs.
+        subprocess.run(cmd, check=True)
+
+    det = bool(getattr(args, 'deterministic', False))
+
+    # 1) Generate the drop bundle + playlist
+    if args.schedule == 'daily':
+        cmd = base + [
+            'run', 'daily',
+            '--context', args.context,
+            '--seed', str(args.seed),
+            '--out-dir', out_dir,
+        ]
+        if det:
+            cmd.append('--deterministic')
+        run_cmd(cmd)
+    else:
+        cmd = base + [
+            'run', 'weekly',
+            '--context', args.context,
+            '--seed', str(args.seed),
+            '--out-dir', out_dir,
+            '--period-key', args.period_key,
+        ]
+        if det:
+            cmd.append('--deterministic')
+        run_cmd(cmd)
+
+    # 2) Verify output contract (hard gate)
+    run_cmd([sys.executable, 'scripts/verify_drop_contract.py', '--out-dir', out_dir])
+
+    # Ensure web builder can resolve playlist-relative audio paths.
+    # web.build resolves "tracks/<file>" relative to the playlist.json directory, so we stage
+    # bundle tracks into <out_dir>/tracks when present.
+    try:
+        import shutil
+        top_tracks = Path(out_dir) / 'tracks'
+        bundle_tracks = Path(out_dir) / 'drop_bundle' / 'tracks'
+        if bundle_tracks.is_dir():
+            need_copy = (not top_tracks.exists())
+            if top_tracks.is_dir():
+                # treat empty dir as missing
+                try:
+                    need_copy = next(top_tracks.iterdir(), None) is None
+                except Exception:
+                    need_copy = True
+            if need_copy:
+                top_tracks.parent.mkdir(parents=True, exist_ok=True)
+                # Copy deterministically (same filenames/bytes).
+                shutil.copytree(bundle_tracks, top_tracks, dirs_exist_ok=True)
+    except Exception:
+        # Best-effort: if this fails, web.build will raise a clear missing_tracks error.
+        pass
+
+    # 3) Optional: web build
+    if getattr(args, 'web', False):
+        web_cmd = base + [
+            'web', 'build',
+            '--playlist', str(Path(out_dir) / 'playlist.json'),
+            '--out-dir', str(Path(out_dir) / 'web'),
+            '--clean',
+            '--fail-if-empty',
+        ]
+        run_cmd(web_cmd)
+
+    # 4) Optional: deterministic submission bundle
+    if getattr(args, 'submission', False):
+        sub_cmd = base + [
+            'submission', 'build',
+            '--bundle-dir', str(Path(out_dir) / 'drop_bundle'),
+            '--out', str(Path(out_dir) / 'submission.zip'),
+        ]
+        run_cmd(sub_cmd)
+
+    # Ensure publish directory exists (publish-marketing expects it even in dry-run file mode).
+    try:
+        (Path(out_dir) / 'marketing' / 'publish').mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # 5) Marketing publish (dry-run unless --publish)
+    pub_cmd = base + [
+        'run', 'publish-marketing',
+        '--bundle-dir', str(Path(out_dir) / 'drop_bundle'),
+        '--out-dir', out_dir,
+    ]
+    if det:
+        pub_cmd.append('--deterministic')
+    if not getattr(args, 'publish', False):
+        pub_cmd.append('--dry-run')
+    run_cmd(pub_cmd)
+
+    return 0
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -5373,6 +5489,24 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     )
 
     auto.set_defaults(func=cmd_run_autonomous)
+
+    # ----------------------------
+    # pipeline
+    # ----------------------------
+    pipe = run_sub.add_parser(
+        'pipeline',
+        help='Run end-to-end pipeline (daily/weekly → verify → optional web/submission → publish-marketing)',
+    )
+    pipe.add_argument('--schedule', choices=['daily', 'weekly'], required=True, help='Which schedule to run')
+    pipe.add_argument('--context', default=os.environ.get('MGC_CONTEXT', 'focus'), help='Context/mood')
+    pipe.add_argument('--seed', default=os.environ.get('MGC_SEED', '1'), help='Seed')
+    pipe.add_argument('--period-key', default='2020-W01', help='Weekly period key when --schedule weekly')
+    pipe.add_argument('--out-dir', default=os.environ.get('MGC_EVIDENCE_DIR', 'data/evidence'), help='Output directory')
+    pipe.add_argument('--deterministic', action='store_true', help='Pass through deterministic mode to subcommands')
+    pipe.add_argument('--web', action='store_true', help='Build web player into <out_dir>/web')
+    pipe.add_argument('--submission', action='store_true', help='Build submission.zip into <out_dir>/submission.zip')
+    pipe.add_argument('--publish', action='store_true', help='Publish marketing for real (default: dry-run)')
+    pipe.set_defaults(func=cmd_run_pipeline)
 
     # ----------------------------
     # manifest
