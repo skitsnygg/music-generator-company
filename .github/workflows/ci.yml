@@ -50,7 +50,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
@@ -128,99 +128,80 @@ jobs:
 
       - name: Ensure DB schema has required tables (CI bootstrap)
         shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
         run: |
           set -euxo pipefail
-          python - <<'PY'
-          import os, sqlite3
 
-          p = os.environ["MGC_DB"]
-          con = sqlite3.connect(p)
-          try:
-              con.execute("PRAGMA foreign_keys = ON")
-              con.executescript("""
-              CREATE TABLE IF NOT EXISTS tracks (
-                track_id TEXT PRIMARY KEY,
-                ts TEXT NOT NULL,
-                title TEXT,
-                provider TEXT,
-                mood TEXT,
-                genre TEXT,
-                artifact_path TEXT,
-                meta TEXT
-              );
-
-              CREATE TABLE IF NOT EXISTS drops (
-                drop_id TEXT PRIMARY KEY,
-                ts TEXT NOT NULL,
-                context TEXT,
-                seed TEXT,
-                run_id TEXT,
-                track_id TEXT,
-                meta TEXT
-              );
-
-              CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                ts TEXT NOT NULL,
-                kind TEXT,
-                actor TEXT,
-                meta TEXT
-              );
-
-              CREATE TABLE IF NOT EXISTS marketing_posts (
-                post_id TEXT PRIMARY KEY,
-                ts TEXT NOT NULL,
-                platform TEXT,
-                status TEXT,
-                content TEXT,
-                meta TEXT
-              );
-
-              CREATE TABLE IF NOT EXISTS playlists (
-                playlist_id TEXT PRIMARY KEY,
-                ts TEXT,
-                context TEXT,
-                payload TEXT,
-                meta TEXT
-              );
-              """)
-              con.commit()
-
-              tables = [r[0] for r in con.execute(
-                  "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-              ).fetchall()]
-              print("tables:", tables)
-              required = {"tracks", "drops", "events", "marketing_posts", "playlists"}
-              missing = sorted(required - set(tables))
-              assert not missing, f"missing tables: {missing}"
-          finally:
-              con.close()
-          PY
+          python -c "import os,sqlite3; p=os.environ['MGC_DB']; con=sqlite3.connect(p); \
+con.execute('PRAGMA foreign_keys = ON'); \
+con.executescript('''\
+CREATE TABLE IF NOT EXISTS tracks (
+  track_id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  title TEXT,
+  provider TEXT,
+  mood TEXT,
+  genre TEXT,
+  artifact_path TEXT,
+  meta TEXT
+);
+CREATE TABLE IF NOT EXISTS drops (
+  drop_id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  context TEXT,
+  seed TEXT,
+  run_id TEXT,
+  track_id TEXT,
+  meta TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+  event_id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT,
+  actor TEXT,
+  meta TEXT
+);
+CREATE TABLE IF NOT EXISTS marketing_posts (
+  post_id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  platform TEXT,
+  status TEXT,
+  content TEXT,
+  meta TEXT
+);
+CREATE TABLE IF NOT EXISTS playlists (
+  playlist_id TEXT PRIMARY KEY,
+  ts TEXT,
+  context TEXT,
+  payload TEXT,
+  meta TEXT
+);
+'''); \
+con.commit(); \
+tables=[r[0] for r in con.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\").fetchall()]; \
+print('tables:', tables); \
+required=set(['tracks','drops','events','marketing_posts','playlists']); \
+missing=sorted(required-set(tables)); \
+assert not missing, 'missing tables: %s' % missing; \
+con.close()"
 
       - name: Preflight DB (must pass)
         shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
         run: |
           set -euxo pipefail
           echo "HEAD=$(git rev-parse HEAD)"
           echo "MGC_DB=$MGC_DB"
 
-          python - <<'PY'
-          import os, sqlite3, sys
-          p = os.environ["MGC_DB"]
-          con = sqlite3.connect(p)
-          try:
-              tables = [r[0] for r in con.execute(
-                  "select name from sqlite_master where type='table' order by name"
-              ).fetchall()]
-              print("tables:", tables)
-              required = {"tracks", "drops", "events", "marketing_posts", "playlists"}
-              missing = sorted(required - set(tables))
-              if missing:
-                  print(f"ERROR: {p} missing tables: {missing}", file=sys.stderr)
-                  sys.exit(1)
-          finally:
-              con.close()
-          PY
+          python -c "import os,sqlite3,sys; p=os.environ['MGC_DB']; con=sqlite3.connect(p); \
+tables=[r[0] for r in con.execute(\"select name from sqlite_master where type='table' order by name\").fetchall()]; \
+print('tables:', tables); \
+required=set(['tracks','drops','events','marketing_posts','playlists']); \
+missing=sorted(required-set(tables)); \
+con.close(); \
+sys.exit(0 if not missing else (print('ERROR: %s missing tables: %s' % (p, missing), file=sys.stderr) or 1))"
 
       # -----------------------------
       # FAST gate: PRs and main
@@ -248,19 +229,21 @@ jobs:
             --repo-root .
 
       # -----------------------------
-      # Release contract gate
+      # Publish contract determinism: main pushes only
       # -----------------------------
-      - name: Autonomous contract (publish; main only; twice + determinism diff)
+      - name: Publish contract determinism (autonomous --contract publish; twice + sha256 diff)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_PROVIDER: "stub"
+          # Allow autonomous to stage receipts into out_dir when needed.
+          MGC_MARKETING_RECEIPTS_PATH: ${{ env.MGC_ARTIFACTS_DIR }}/run/marketing/receipts.jsonl
         run: |
           set -euxo pipefail
 
-          # Ensure the publish contract can stage receipts from the repo-relative default path.
+          # Ensure receipts path exists (repo-relative fallback some code may use)
           mkdir -p artifacts/run/marketing
           printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
             > artifacts/run/marketing/receipts.jsonl
@@ -280,39 +263,6 @@ jobs:
           test -s "${OUT1}/contract_report.json"
           test -s "${OUT2}/contract_report.json"
 
-          # Determinism: whole publish bundle tree must match
-          (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
-          (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
-          diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
-
-      - name: Autonomous contract (publish; main only; twice + determinism diff)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          MGC_DB: ${{ env.MGC_DB }}
-          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
-          MGC_PROVIDER: "stub"
-          # Allow autonomous to stage receipts into out_dir.
-          # ci_gate.sh typically writes receipts under ${MGC_ARTIFACTS_DIR}/run/marketing/receipts.jsonl
-          MGC_MARKETING_RECEIPTS_PATH: ${{ env.MGC_ARTIFACTS_DIR }}/run/marketing/receipts.jsonl
-        run: |
-          set -euxo pipefail
-
-          OUT1="${MGC_ARTIFACTS_DIR}/auto_publish_1"
-          OUT2="${MGC_ARTIFACTS_DIR}/auto_publish_2"
-          rm -rf "${OUT1}" "${OUT2}"
-          mkdir -p "${OUT1}" "${OUT2}"
-
-          python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT1}" --deterministic --contract publish
-
-          python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT2}" --deterministic --contract publish
-
-          test -s "${OUT1}/contract_report.json"
-          test -s "${OUT2}/contract_report.json"
-
-          # Determinism: whole publish bundle tree must match
           (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
           (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
           diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
@@ -333,7 +283,7 @@ jobs:
           bash scripts/ci_gate.sh
 
       # -----------------------------
-      # Extra checks: main only
+      # Existing determinism script gate: main only
       # -----------------------------
       - name: Run determinism gate (existing)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -346,6 +296,9 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
+      # -----------------------------
+      # Weekly publish-marketing determinism (file mode): main only
+      # -----------------------------
       - name: Publish-marketing determinism (weekly; file mode; dry-run)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
@@ -356,23 +309,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          PERIOD_KEY="$(python - <<'PY'
-          from datetime import datetime, timezone
-          import os
-
-          raw = (os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z").strip()
-          if raw.endswith("Z"):
-              raw = raw[:-1] + "+00:00"
-          dt = datetime.fromisoformat(raw)
-          if dt.tzinfo is None:
-              dt = dt.replace(tzinfo=timezone.utc)
-          else:
-              dt = dt.astimezone(timezone.utc)
-
-          y, w, _ = dt.isocalendar()
-          print(f"{y}-W{w:02d}")
-          PY
-          )"
+          PERIOD_KEY="$(python -c "from datetime import datetime,timezone; import os; raw=(os.environ.get('MGC_FIXED_TIME') or '2020-01-01T00:00:00Z').strip(); raw=(raw[:-1] + '+00:00') if raw.endswith('Z') else raw; dt=datetime.fromisoformat(raw); dt=dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc); y,w,_=dt.isocalendar(); print(f'{y}-W{w:02d}')")"
           echo "PERIOD_KEY=${PERIOD_KEY}"
 
           WEEKLY1="${MGC_ARTIFACTS_DIR}/weekly_pub_1"
@@ -416,14 +353,12 @@ jobs:
           rm -rf "${OUT1}" "${OUT2}"
           mkdir -p "${OUT1}" "${OUT2}"
 
-          # Build the same weekly bundle twice
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
             --context focus --out-dir "${OUT1}" --deterministic --period-key 2020-W01
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
             --context focus --out-dir "${OUT2}" --deterministic --period-key 2020-W01
 
-          # Write receipts into each out_dir (dry-run but writes deterministic receipts)
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${OUT1}/drop_bundle" --deterministic --dry-run --out-dir "${OUT1}" \
             --json
@@ -432,16 +367,13 @@ jobs:
             --bundle-dir "${OUT2}/drop_bundle" --deterministic --dry-run --out-dir "${OUT2}" \
             --json
 
-          # Build submission zips
           python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip"
           python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip"
 
           test -s "${OUT1}/submission.zip"
           test -s "${OUT2}/submission.zip"
 
-          # Determinism: receipts trees and zips must match
           diff -ru "${OUT1}/marketing/receipts" "${OUT2}/marketing/receipts"
-          sha256sum "${OUT1}/submission.zip" "${OUT2}/submission.zip"
           test "$(sha256sum "${OUT1}/submission.zip" | awk '{print $1}')" = "$(sha256sum "${OUT2}/submission.zip" | awk '{print $1}')"
 
       - name: Verify drop output contract (main only)
@@ -452,7 +384,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Verify any drop outputs that CI produced
           if test -d "${MGC_ARTIFACTS_DIR}/auto"; then
             python scripts/verify_drop_contract.py \
               --out-dir "${MGC_ARTIFACTS_DIR}/auto"
