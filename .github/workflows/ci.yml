@@ -342,8 +342,12 @@ jobs:
             | python -m json.tool
 
           # Build submission zips
-          python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip" | python -m json.tool
-          python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip" | python -m json.tool
+          python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip"
+          python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip"
+          
+          test -s "${OUT1}/submission.zip"
+          test -s "${OUT2}/submission.zip"
+
 
           # Determinism: receipts trees and zips must match
           diff -ru "${OUT1}/marketing/receipts" "${OUT2}/marketing/receipts"
