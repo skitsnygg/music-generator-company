@@ -248,6 +248,58 @@ jobs:
             --repo-root .
 
       # -----------------------------
+      # NEW: Release contract gate
+      # -----------------------------
+      - name: Autonomous contract (local; PRs and main)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_PROVIDER: "stub"
+        run: |
+          set -euxo pipefail
+          OUT="${MGC_ARTIFACTS_DIR}/auto_local"
+          rm -rf "${OUT}"
+          mkdir -p "${OUT}"
+          python -m mgc.main --db "${MGC_DB}" --seed 1 \
+            run autonomous --context focus --out-dir "${OUT}" --deterministic --contract local
+
+          test -s "${OUT}/contract_report.json"
+
+      - name: Autonomous contract (publish; main only; twice + determinism diff)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
+          MGC_PROVIDER: "stub"
+          # Make sure autonomous can stage receipts into out_dir.
+          # ci_gate.sh typically writes receipts under ${MGC_ARTIFACTS_DIR}/run/marketing/receipts.jsonl
+          MGC_MARKETING_RECEIPTS_PATH: ${{ env.MGC_ARTIFACTS_DIR }}/run/marketing/receipts.jsonl
+        run: |
+          set -euxo pipefail
+
+          OUT1="${MGC_ARTIFACTS_DIR}/auto_publish_1"
+          OUT2="${MGC_ARTIFACTS_DIR}/auto_publish_2"
+          rm -rf "${OUT1}" "${OUT2}"
+          mkdir -p "${OUT1}" "${OUT2}"
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 \
+            run autonomous --context focus --out-dir "${OUT1}" --deterministic --contract publish
+
+          python -m mgc.main --db "${MGC_DB}" --seed 1 \
+            run autonomous --context focus --out-dir "${OUT2}" --deterministic --contract publish
+
+          test -s "${OUT1}/contract_report.json"
+          test -s "${OUT2}/contract_report.json"
+
+          # Determinism: whole publish bundle tree must match
+          (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
+          (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
+
+          diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
+
+      # -----------------------------
       # FULL gate: only on main pushes
       # -----------------------------
       - name: Run CI gate (full; once)
@@ -397,7 +449,6 @@ jobs:
             python scripts/verify_drop_contract.py \
               --out-dir "${MGC_ARTIFACTS_DIR}/weekly_pub_2"
           fi
-
 
       - name: Web player build (from evidence)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
