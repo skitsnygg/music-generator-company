@@ -5068,6 +5068,10 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
     if require_web:
         try:
             web_dir.mkdir(parents=True, exist_ok=True)
+            # Prefer the portable bundle playlist if present (it resolves against drop_bundle/tracks).
+            bundle_playlist = (out_dir / "drop_bundle" / "playlist.json").resolve()
+            playlist_path = bundle_playlist if bundle_playlist.exists() else (out_dir / "playlist.json").resolve()
+
             cmd = [
                 sys.executable,
                 "-m",
@@ -5075,14 +5079,15 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
                 "web",
                 "build",
                 "--playlist",
-                str((out_dir / "playlist.json").resolve()),
+                str(playlist_path),
+
                 "--out-dir",
                 str(web_dir.resolve()),
                 "--clean",
                 "--fail-on-missing",
                 "--fail-if-empty",
             ]
-            p = subprocess.run(cmd, capture_output=True, text=True)
+            p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(playlist_path.parent))
             if p.returncode != 0:
                 web_build_ok = False
                 web_build_error = (p.stderr or p.stdout or "web build failed").strip()[:2000]
