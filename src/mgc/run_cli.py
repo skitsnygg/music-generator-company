@@ -4168,8 +4168,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
             "drop_evidence": "drop_evidence.json",
             "manifest": "weekly_manifest.json",
             "manifest_sha256": manifest_sha256,
-            "marketing_publish_dir": contract_report["paths"].get("marketing_publish_dir"),
-            "marketing_receipts_dir": contract_report["paths"].get("marketing_receipts_dir"),
+            "marketing_publish_dir": None,
+            "marketing_receipts_dir": ("marketing/receipts" if bool(getattr(args, "marketing", False)) else None),
         },
     }
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -5212,8 +5212,8 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "manifest": manifest_rel,
             "manifest_sha256": manifest_sha256,
             "contract_report": "contract_report.json",
-            "marketing_publish_dir": contract_report["paths"].get("marketing_publish_dir"),
-            "marketing_receipts_dir": contract_report["paths"].get("marketing_receipts_dir"),
+            "marketing_publish_dir": None,
+            "marketing_receipts_dir": ("marketing/receipts" if bool(getattr(args, "marketing", False)) else None),
             "web_manifest": contract_report["paths"].get("web_manifest"),
         },
         "verify": {"skipped": verify_skipped, "ok": verify_ok, "error": verify_error},
