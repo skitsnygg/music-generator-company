@@ -92,23 +92,13 @@ jobs:
           rm -rf "${DROP_DIR}" "${WEB_DIR}"
           mkdir -p "${DROP_DIR}" "${WEB_DIR}"
 
-          python -m mgc.main run drop \
-            --context focus \
-            --seed 1 \
-            --deterministic \
-            --out-dir "${DROP_DIR}" \
-            > "${DROP_DIR}/drop_stdout.json"
+          python -m mgc.main run drop             --context focus             --seed 1             --deterministic             --out-dir "${DROP_DIR}"             > "${DROP_DIR}/drop_stdout.json"
 
           python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
 
           # Resolve portable bundle dir from the stdout JSON (no jq dependency)
           BUNDLE_DIR_VALUE="$(
-            DROP_DIR="${DROP_DIR}" python -c 'import json, os
-p = os.path.join(os.environ["DROP_DIR"], "drop_stdout.json")
-j = json.load(open(p, "r", encoding="utf-8"))
-paths = j.get("paths") or {}
-print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
-'
+            DROP_DIR="${DROP_DIR}" python -c "import json, os; p=os.path.join(os.environ['DROP_DIR'],'drop_stdout.json'); j=json.load(open(p,'r',encoding='utf-8')); paths=j.get('paths') or {}; print(paths.get('bundle_dir_path') or paths.get('bundle_dir') or '')"
           )"
           test -n "${BUNDLE_DIR_VALUE}"
 
@@ -126,14 +116,7 @@ print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
           test -s "${BUNDLE_DIR}/playlist.json"
           test -s "${BUNDLE_DIR}/daily_evidence.json"
 
-          python -m mgc.main web build \
-            --playlist "${BUNDLE_DIR}/playlist.json" \
-            --out-dir "${WEB_DIR}" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json \
-            | python -m json.tool
+          python -m mgc.main web build             --playlist "${BUNDLE_DIR}/playlist.json"             --out-dir "${WEB_DIR}"             --prefer-mp3             --clean             --fail-if-empty             --json             | python -m json.tool
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
 
@@ -142,7 +125,6 @@ print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
         env:
           MGC_DETERMINISTIC: "1"
           MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-          DROP_DIR: ${{ env.MGC_DROP_DIR }}
           BUNDLE_DIR: ${{ env.BUNDLE_DIR }}
         run: |
           set -euxo pipefail
@@ -150,11 +132,7 @@ print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
           test -n "${BUNDLE_DIR}"
           test -d "${BUNDLE_DIR}"
 
-          # Build submission.zip directly from the bundle dir.
-          # Use the unified CLI path (same as CI gate) to avoid drift.
-          python -m mgc.main submission build \
-            --bundle-dir "${BUNDLE_DIR}" \
-            --out "${RUNNER_TEMP}/submission.zip"
+          python -m mgc.main submission build             --bundle-dir "${BUNDLE_DIR}"             --out "${RUNNER_TEMP}/submission.zip"
 
           test -s "${RUNNER_TEMP}/submission.zip"
           sha256sum "${RUNNER_TEMP}/submission.zip"
@@ -166,7 +144,6 @@ print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
         run: |
           set -euxo pipefail
           cd "${WEB_DIR}"
-          # zip the contents (not the parent folder)
           zip -r "${RUNNER_TEMP}/web_bundle.zip" .
           test -s "${RUNNER_TEMP}/web_bundle.zip"
           sha256sum "${RUNNER_TEMP}/web_bundle.zip"
