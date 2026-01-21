@@ -101,7 +101,8 @@ jobs:
 
           python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
           test -s "${DROP_DIR}/playlist.json"
-          test -d "${DROP_DIR}/tracks"
+          test -d "${DROP_DIR}/drop_bundle"
+          test -d "${DROP_DIR}/drop_bundle/tracks"
 
           pushd "${DROP_DIR}" >/dev/null
           python -m mgc.main web build \
@@ -128,7 +129,7 @@ jobs:
           # Build submission.zip directly from the bundle dir.
           # Use the unified CLI path (same as CI gate) to avoid drift
           python -m mgc.main submission build \
-            --bundle-dir "${DROP_DIR}" \
+            --bundle-dir "${DROP_DIR}/drop_bundle" \
             --out "${RUNNER_TEMP}/submission.zip"
 
           test -s "${RUNNER_TEMP}/submission.zip"
