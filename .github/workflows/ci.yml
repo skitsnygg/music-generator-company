@@ -422,13 +422,14 @@ jobs:
           # -------------------------------------------------------------------
           PLAYLIST_DIR="$(dirname "${PLAYLIST_PATH}")"
           FALLBACK_PLAYLIST="${PLAYLIST_DIR}/drop_bundle/playlist.json"
-
-          echo "PLAYLIST_DIR=${PLAYLIST_DIR}"
-          if test -f "${FALLBACK_PLAYLIST}"; then
-            echo "FALLBACK_PLAYLIST=${FALLBACK_PLAYLIST}"
+          
+          if test -s "${FALLBACK_PLAYLIST}"; then
+            echo "Using drop_bundle playlist: ${FALLBACK_PLAYLIST}"
+            PLAYLIST_PATH="${FALLBACK_PLAYLIST}"
           else
-            echo "FALLBACK_PLAYLIST not found at ${FALLBACK_PLAYLIST}"
+            echo "Using evidence playlist: ${PLAYLIST_PATH}"
           fi
+
 
           # If the current playlist yields no local audio files but drop_bundle has some,
           # switch to the drop_bundle playlist.
