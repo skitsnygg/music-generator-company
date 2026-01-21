@@ -99,21 +99,32 @@ jobs:
             --out-dir "${DROP_DIR}" \
             > "${DROP_DIR}/drop_stdout.json"
 
-          python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
-          test -s "${DROP_DIR}/playlist.json"
-          test -d "${DROP_DIR}/drop_bundle"
-          test -d "${DROP_DIR}/drop_bundle/tracks"
+                    python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
 
-          pushd "${DROP_DIR}" >/dev/null
-          python -m mgc.main web build \
-            --playlist "playlist.json" \
-            --out-dir "${WEB_DIR}" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json \
-            | python -m json.tool
-          popd >/dev/null
+          # Resolve portable bundle dir from the stdout JSON (no jq dependency)
+          BUNDLE_DIR_VALUE="$(python - <<'PY'
+import json
+j = json.load(open("${DROP_DIR}/drop_stdout.json","r",encoding="utf-8"))
+p = (j.get("paths") or {})
+print(p.get("bundle_dir_path") or p.get("bundle_dir") or "")
+PY
+)"
+          test -n "${BUNDLE_DIR_VALUE}"
+
+          if [[ "${BUNDLE_DIR_VALUE}" = /* ]]; then
+            BUNDLE_DIR="${BUNDLE_DIR_VALUE}"
+          else
+            BUNDLE_DIR="${DROP_DIR}/${BUNDLE_DIR_VALUE}"
+          fi
+
+          test -d "${BUNDLE_DIR}"
+          test -d "${BUNDLE_DIR}/tracks"
+          test -s "${BUNDLE_DIR}/playlist.json"
+          test -s "${BUNDLE_DIR}/daily_evidence.json"
+
+          python -m mgc.main web build             --playlist "${BUNDLE_DIR}/playlist.json"             --out-dir "${WEB_DIR}"             --prefer-mp3             --clean             --fail-if-empty             --json             | python -m json.tool
+
+
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
 
@@ -129,7 +140,7 @@ jobs:
           # Build submission.zip directly from the bundle dir.
           # Use the unified CLI path (same as CI gate) to avoid drift
           python -m mgc.main submission build \
-            --bundle-dir "${DROP_DIR}/drop_bundle" \
+            --bundle-dir "${BUNDLE_DIR}" \
             --out "${RUNNER_TEMP}/submission.zip"
 
           test -s "${RUNNER_TEMP}/submission.zip"
