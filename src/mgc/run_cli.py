@@ -5115,16 +5115,20 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
 
     web_build_ok: Optional[bool] = None
     web_build_error: Optional[str] = None
+    web_validate_ok: Optional[bool] = None
+    web_validate_error: Optional[str] = None
+    web_tree_sha256: Optional[str] = None
     staged_receipts_ok: Optional[bool] = None
     staged_receipts_error: Optional[str] = None
 
-    # If web is required, build web bundle into out_dir/web, capturing stdout.
+    # If web is required, build web bundle into out_dir/web and VALIDATE it.
     # We intentionally do NOT surface the web.build JSON on stdout here.
     web_dir = out_dir / "web"
     web_manifest = web_dir / "web_manifest.json"
     if require_web:
         try:
             web_dir.mkdir(parents=True, exist_ok=True)
+
             # Prefer the portable bundle playlist if present (it resolves against drop_bundle/tracks).
             bundle_playlist = (out_dir / "drop_bundle" / "playlist.json").resolve()
             playlist_path = bundle_playlist if bundle_playlist.exists() else (out_dir / "playlist.json").resolve()
@@ -5137,19 +5141,59 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
                 "build",
                 "--playlist",
                 str(playlist_path),
-
                 "--out-dir",
-                str(web_dir.resolve()),
+                str(web_dir),
                 "--clean",
+                "--fail-if-none-copied",
                 "--fail-on-missing",
-                "--fail-if-empty",
             ]
-            p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(playlist_path.parent))
+            if deterministic_expected:
+                cmd.append("--deterministic")
+
+            p = subprocess.run(cmd, text=True, capture_output=True)
+            stdout = (p.stdout or "").strip()
             if p.returncode != 0:
                 web_build_ok = False
-                web_build_error = (p.stderr or p.stdout or "web build failed").strip()[:2000]
+                web_build_error = (p.stderr or stdout or "web build failed").strip()[:2000]
             else:
                 web_build_ok = True
+                # Parse build JSON payload (best-effort; not required for correctness)
+                try:
+                    _ = json.loads(stdout) if stdout else None
+                except Exception:
+                    pass
+
+                # Validate bundle (strict)
+                cmdv = [
+                    sys.executable,
+                    "-m",
+                    "mgc.main",
+                    "web",
+                    "validate",
+                    "--out-dir",
+                    str(web_dir),
+                ]
+                pv = subprocess.run(cmdv, text=True, capture_output=True)
+                v_stdout = (pv.stdout or "").strip()
+                if pv.returncode != 0:
+                    web_validate_ok = False
+                    web_validate_error = (pv.stderr or v_stdout or "web validate failed").strip()[:2000]
+                else:
+                    try:
+                        v_payload = json.loads(v_stdout) if v_stdout else {}
+                    except Exception:
+                        v_payload = {}
+                    web_validate_ok = bool(isinstance(v_payload, dict) and v_payload.get("ok", False))
+                    if not web_validate_ok:
+                        web_validate_error = f"web validate returned ok=false: {v_payload}"
+                    if isinstance(v_payload, dict) and isinstance(v_payload.get("web_tree_sha256"), str):
+                        web_tree_sha256 = v_payload["web_tree_sha256"]
+
+                # If validate failed, mark overall web_build as failed too (contract semantics).
+                if web_validate_ok is False:
+                    web_build_ok = False
+                    if web_build_error is None:
+                        web_build_error = web_validate_error or "web validate failed"
         except Exception as e:
             web_build_ok = False
             web_build_error = str(e)
@@ -5335,9 +5379,11 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "present": present,
             "missing": missing,
             "track_files": track_files,
+            "web_tree_sha256": web_tree_sha256,
         },
         "actions": {
             "web_build": {"ok": web_build_ok, "error": web_build_error},
+            "web_validate": {"ok": web_validate_ok, "error": web_validate_error},
             "stage_marketing_receipts": {"ok": staged_receipts_ok, "error": staged_receipts_error},
         },
         "paths": {
