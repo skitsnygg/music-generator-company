@@ -117,6 +117,26 @@ def _deterministic_now_iso(deterministic: bool) -> str:
         return "2020-01-01T00:00:00+00:00"
     return _utc_now_iso()
 
+def _manifest_generated_at(playlist_obj: Any, deterministic: bool) -> str:
+    """
+    Choose a deterministic generated_at whenever possible.
+
+    Priority:
+      1) MGC_DETERMINISTIC_TS (handled by _deterministic_now_iso)
+      2) If deterministic flag set: fixed timestamp
+      3) If playlist has a stable 'ts' field: use that (common in pipeline outputs)
+      4) Otherwise: wall clock UTC now
+    """
+    if deterministic:
+        return _deterministic_now_iso(True)
+    if isinstance(playlist_obj, dict):
+        ts = playlist_obj.get("ts")
+        if isinstance(ts, str) and ts.strip():
+            # Trust playlist ts to be stable if present.
+            return ts.strip()
+    return _utc_now_iso()
+
+
 
 # ---------------------------------------------------------------------
 # Billing gate (token -> require pro entitlement)
@@ -475,7 +495,7 @@ def _build_web_manifest(
     return {
         "schema": WEB_MANIFEST_SCHEMA,
         "version": WEB_MANIFEST_VERSION,
-        "generated_at": _deterministic_now_iso(deterministic),
+        "generated_at": _manifest_generated_at(playlist_obj, deterministic),
         "playlist_sha256": playlist_sha,
         "web_tree_sha256": web_tree,
         "tracks": tracks_payload,
