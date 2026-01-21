@@ -3459,6 +3459,14 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         pths["bundle_evidence"] = "drop_bundle/daily_evidence.json"
         pths["bundle_tracks_dir"] = "drop_bundle/tracks"
         pths["run_out_dir"] = str(out_dir)
+
+        # Make the *portable* bundle playlist the canonical playlist path for downstream tooling.
+        # CI helpers (scripts/find_artifacts.py) generally look for paths["playlist"], so if we leave
+        # it pointing at "playlist.json" we can end up resolving tracks/ that are not materialized.
+        # The bundle playlist references drop_bundle/tracks/* and is always portable.
+        pths["playlist"] = pths.get("bundle_playlist") or "drop_bundle/playlist.json"
+        pths["playlist_path"] = pths["playlist"]
+
         evidence_obj["paths"] = pths
 
         # Validate bundle before packaging
