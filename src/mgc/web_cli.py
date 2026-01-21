@@ -391,27 +391,23 @@ def _resolve_track_paths_from_db(*, db_path: str, track_ids: List[str]) -> Tuple
 def _resolve_input_path(raw: str, *, playlist_dir: Path, repo_root: Path) -> Path:
     """Resolve an audio path from playlist metadata.
 
-    This repo needs to handle several playlist shapes:
-      - repo paths:        data/tracks/<id>.wav   (often relative)
-      - absolute paths:    /.../data/tracks/<id>.wav (CI runner, local dev)
-      - bundle paths:      tracks/<id>.wav or tracks/<file> relative to playlist dir
-      - older variants:    arbitrary relative paths next to playlist.json
+    We need to support several playlist shapes:
+      - repo paths:        data/tracks/<id>.wav (relative)
+      - absolute paths:    /.../data/tracks/<id>.wav
+      - bundle paths:      tracks/<id>.wav (relative to playlist dir)
+      - other relative:    next to playlist.json
 
-    Behavior:
-      - Prefer exact existing paths.
-      - If an absolute path is missing, fall back to bundle/playlist-dir candidates by filename.
-      - If relative, prefer repo_root first (for DB-returned data/tracks/...), then fall back to
-        deterministic search within data/tracks/*/<file>, then to playlist_dir.
+    Key rule: if a path is missing, fall back deterministically by filename to
+    (playlist_dir/<name>) and (playlist_dir/tracks/<name>).
     """
     raw_s = str(raw or "").strip()
     rp = Path(raw_s).expanduser()
 
-    # Absolute path: accept if it exists, otherwise fall back to bundle-style lookup.
+    # Absolute path: use it if present, otherwise fall back by filename.
     if rp.is_absolute():
         if rp.exists():
             return rp.resolve()
 
-        # Try filename-based fallbacks (portable bundle layout)
         needle = rp.name
         cand = (playlist_dir / needle)
         if cand.exists():
@@ -420,39 +416,46 @@ def _resolve_input_path(raw: str, *, playlist_dir: Path, repo_root: Path) -> Pat
         if cand.exists():
             return cand.resolve()
 
-        # If this absolute path actually points inside repo_root, try to relativize.
+        # If it points inside repo_root, try repo_root-relative.
         try:
             rel = rp.relative_to(repo_root)
-            cand = (repo_root / rel)
+            cand = repo_root / rel
             if cand.exists():
                 return cand.resolve()
         except Exception:
             pass
 
-        # Give back the original absolute path (caller will treat as missing)
-        return rp
+        return rp  # caller will treat as missing
 
-    # Relative path: prefer repo root for DB-returned relative paths like data/tracks/...
+    # Relative path: prefer repo root for DB-returned paths like data/tracks/...
     cand1 = (repo_root / rp)
     if cand1.exists():
         return cand1.resolve()
 
-    # Fallback 1: if DB says data/tracks/<file> but files live in daily folders:
+    # If DB says data/tracks/<file> but files live in daily folders:
     # try <repo_root>/data/tracks/*/<file>
     try:
         parts = rp.parts
         if len(parts) >= 3 and parts[0] == "data" and parts[1] == "tracks":
             needle = parts[-1]
             base = repo_root / "data" / "tracks"
-            # one directory level deep, deterministic ordering
             hits = sorted(p for p in base.glob(f"*/{needle}") if p.is_file())
             if len(hits) == 1:
                 return hits[0].resolve()
-            # if multiple matches, do NOT guess—fall through to playlist_dir behavior
+            # if multiple matches, do NOT guess—fall through to bundle/playlist fallbacks
     except Exception:
         pass
 
-    # Fallback 2: resolve relative to the playlist directory (run-bundled playlists)
+    # Bundle/portable fallbacks by filename.
+    needle = rp.name
+    cand = (playlist_dir / needle)
+    if cand.exists():
+        return cand.resolve()
+    cand = (playlist_dir / "tracks" / needle)
+    if cand.exists():
+        return cand.resolve()
+
+    # Last resort: resolve relative to the playlist directory.
     return (playlist_dir / rp).resolve()
 
 def _prefer_mp3_path(p: Path) -> Path:
