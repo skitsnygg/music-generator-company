@@ -126,8 +126,8 @@ jobs:
           set -euxo pipefail
 
           # Build submission.zip directly from the bundle dir.
-          # This assumes mgc.submission_cli.py supports --bundle-dir + --out
-          python -m mgc.submission_cli build \
+          # Use the unified CLI path (same as CI gate) to avoid drift
+          python -m mgc.main submission build \
             --bundle-dir "${DROP_DIR}" \
             --out "${RUNNER_TEMP}/submission.zip"
 

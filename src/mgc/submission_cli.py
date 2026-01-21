@@ -297,7 +297,7 @@ def cmd_submission_build(args: argparse.Namespace) -> int:
     res = build_submission_zip(bundle_dir=bundle_dir, out_zip=out)
     if getattr(args, "json", False):
         print(json.dumps(res, sort_keys=True))
-    return 0
+    return 0 if bool(res.get("ok")) else 2
 
 
 def cmd_submission_latest(args: argparse.Namespace) -> int:
@@ -316,7 +316,7 @@ def cmd_submission_latest(args: argparse.Namespace) -> int:
     res["drop_id"] = drop_id
     if getattr(args, "json", False):
         print(json.dumps(res, sort_keys=True))
-    return 0
+    return 0 if bool(res.get("ok")) else 2
 
 
 def cmd_submission_verify(args: argparse.Namespace) -> int:
@@ -354,3 +354,58 @@ def register_submission_subcommand(subparsers: argparse._SubParsersAction) -> No
     v = sp.add_parser("verify", help="Verify a submission ZIP structure")
     v.add_argument("--zip", required=True, help="ZIP path to verify")
     v.set_defaults(fn=cmd_submission_verify)
+
+
+# -----------------------------
+# Standalone entrypoint
+# -----------------------------
+
+def _build_standalone_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m mgc.submission_cli",
+        description="Deterministic submission bundle packaging (standalone).",
+    )
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    b = sp.add_parser("build", help="Build submission ZIP from a bundle directory or a DB-resolved drop")
+    b.add_argument("--bundle-dir", default=None, help="Drop bundle directory (may contain drop_bundle)")
+    b.add_argument("--drop-id", default=None, help="Drop ID (requires --db)")
+    b.add_argument("--db", default=None, help="SQLite DB path (required with --drop-id)")
+    b.add_argument("--out", required=True, help="Output ZIP path")
+    b.add_argument("--evidence-root", default=None, help="Evidence root")
+    b.add_argument("--json", action="store_true", help="Emit JSON result")
+    b.set_defaults(fn=cmd_submission_build)
+
+    l = sp.add_parser("latest", help="Build submission ZIP for latest drop in DB")
+    l.add_argument("--db", required=True, help="SQLite DB path")
+    l.add_argument("--out", required=True, help="Output ZIP path")
+    l.add_argument("--evidence-root", default=None, help="Evidence root")
+    l.add_argument("--json", action="store_true", help="Emit JSON result")
+    l.set_defaults(fn=cmd_submission_latest)
+
+    v = sp.add_parser("verify", help="Verify a submission ZIP structure")
+    v.add_argument("--zip", required=True, help="ZIP path to verify")
+    v.add_argument("--json", action="store_true", help="Emit JSON result")
+    v.set_defaults(fn=cmd_submission_verify)
+
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = _build_standalone_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.fn(args))
+    except SystemExit:
+        raise
+    except Exception as e:
+        # Don't mask failures: return non-zero and emit a minimal JSON error if requested.
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": str(e)}, sort_keys=True))
+        else:
+            raise
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
