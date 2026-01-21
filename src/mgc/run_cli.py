@@ -5154,116 +5154,93 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             web_build_ok = False
             web_build_error = str(e)
 
-    # If marketing is required, ensure receipts exist under out_dir/marketing/receipts.
+        # If marketing is required, ensure receipts exist under out_dir/marketing/receipts.
     #
-    # CI release-contract expects: marketing/receipts/*.
-    # In publish-contract mode we run publish-marketing (dry-run) to generate deterministic receipts,
-    # then stage/copy a stable receipts.jsonl into out_dir/marketing/receipts/receipts.jsonl.
+    # Historical note:
+    # - Older pipelines wrote a single file receipts.jsonl somewhere under repo_root.
+    # - Newer pipelines (publish-marketing) write per-post JSON receipts under
+    #   <out_dir>/marketing/receipts/<batch>/<platform>/<post_id>.json
+    #
+    # The release contract only cares that marketing/receipts/* exists when marketing is required.
     marketing_receipts_dir = out_dir / "marketing" / "receipts"
     marketing_publish_dir = out_dir / "marketing" / "publish"
+
     if require_marketing:
         try:
             marketing_receipts_dir.mkdir(parents=True, exist_ok=True)
 
-            def _find_receipts_candidate() -> Optional[Path]:
-                # Prefer receipts already written into this out_dir first.
-                local_candidates = [
-                    out_dir / "marketing" / "receipts" / "receipts.jsonl",
-                    out_dir / "marketing" / "receipts.jsonl",
-                ]
-                for c in local_candidates:
-                    if c.exists() and c.is_file() and c.stat().st_size > 0:
-                        return c
-
-                # Any jsonl in receipts dir?
-                if (out_dir / "marketing" / "receipts").exists():
-                    for c in sorted((out_dir / "marketing" / "receipts").glob("*.jsonl")):
-                        if c.is_file() and c.stat().st_size > 0:
-                            return c
-
-                # Env override (used by some CI setups)
-                env_p = os.environ.get("MGC_MARKETING_RECEIPTS_PATH") or ""
-                if env_p:
-                    p = Path(env_p)
-                    if p.exists() and p.is_file() and p.stat().st_size > 0:
-                        return p
-
-                return None
-
-            # If not already present, run publish-marketing (dry-run) to generate receipts deterministically.
-            src_receipts = _find_receipts_candidate()
-            if src_receipts is None:
+            def _has_any_receipts(d: Path) -> bool:
                 try:
-                    db_path = resolve_db_path(args)
-                    bundle_dir = out_dir / "drop_bundle"
-                    if bundle_dir.exists() and bundle_dir.is_dir():
-                        pm_cmd = [
+                    for p in d.rglob("*"):
+                        if p.is_file() and p.stat().st_size >= 1:
+                            return True
+                except Exception:
+                    return False
+                return False
+
+            # 1) If receipts already exist in the out_dir, we're done.
+            if _has_any_receipts(marketing_receipts_dir):
+                staged_receipts_ok = True
+                staged_receipts_error = None
+            else:
+                # 2) Try to generate receipts deterministically by running publish-marketing in FILE MODE.
+                #    This is safe in CI because we run with --dry-run and stub provider.
+                try:
+                    bundle_dir = (out_dir / "drop_bundle").resolve()
+                    if bundle_dir.exists():
+                        cmd = [
                             sys.executable,
                             "-m",
                             "mgc.main",
-                            "--db",
-                            db_path,
                             "run",
                             "publish-marketing",
                             "--bundle-dir",
                             str(bundle_dir),
+                            "--deterministic",
+                            "--dry-run",
+                            "--out-dir",
+                            str(out_dir),
+                            "--json",
                         ]
-                        # Keep determinism when requested
-                        if bool(getattr(args, "deterministic", False)) or _env_truthy("MGC_DETERMINISTIC"):
-                            pm_cmd.append("--deterministic")
-
-                        # Always dry-run during contract validation unless user explicitly asked to publish.
-                        # (Avoid external side effects in CI.)
-                        if bool(getattr(args, "publish_marketing", False)):
-                            pass
-                        else:
-                            pm_cmd.append("--dry-run")
-
-                        # Write outputs under this run's out_dir (so staging can find them).
-                        pm_cmd += ["--out-dir", str(out_dir)]
-
-                        # JSON output is fine but we don't surface it here.
-                        pm_cmd.append("--json")
-
-                        p = subprocess.run(pm_cmd, capture_output=True, text=True)
-                        # Do not hard-fail here; contract validation will report missing receipts if generation didn't happen.
+                        # Suppress nested JSON output; capture for debug only.
+                        _run_quiet(cmd)
                 except Exception:
                     pass
 
-                # Re-check after publish-marketing attempt
-                src_receipts = _find_receipts_candidate()
+                # 3) Re-check after attempting to generate.
+                if _has_any_receipts(marketing_receipts_dir):
+                    staged_receipts_ok = True
+                    staged_receipts_error = None
+                else:
+                    # 4) Legacy fallback: stage/copy receipts.jsonl if present somewhere repo-relative.
+                    repo_root = Path(getattr(args, "repo_root", None) or os.environ.get("MGC_REPO_ROOT") or os.getcwd()).resolve()
+                    candidates = [
+                        repo_root / "artifacts" / "run" / "marketing" / "receipts.jsonl",
+                        repo_root / "data" / "receipts" / "receipts.jsonl",
+                        repo_root / "artifacts" / "run" / "agents" / "music" / "receipts.jsonl",
+                        (out_dir / "marketing" / "receipts.jsonl").resolve(),
+                        (out_dir / "marketing" / "receipts" / "receipts.jsonl").resolve(),
+                    ]
+                    src_receipts: Optional[Path] = None
+                    for c in candidates:
+                        if c.exists() and c.is_file() and c.stat().st_size > 0:
+                            src_receipts = c
+                            break
 
-            # As a last resort, look for older canonical receipts locations in the repo tree.
-            if src_receipts is None:
-                repo_root = Path(getattr(args, "repo_root", None) or os.environ.get("MGC_REPO_ROOT") or os.getcwd()).resolve()
-                repo_candidates = [
-                    repo_root / "artifacts" / "run" / "marketing" / "receipts.jsonl",
-                    repo_root / "data" / "receipts" / "receipts.jsonl",
-                    repo_root / "artifacts" / "run" / "agents" / "music" / "receipts.jsonl",
-                ]
-                for c in repo_candidates:
-                    if c.exists() and c.is_file() and c.stat().st_size > 0:
-                        src_receipts = c
-                        break
+                    if src_receipts is None:
+                        staged_receipts_ok = False
+                        staged_receipts_error = "no receipts found to stage (expected files under marketing/receipts or a receipts.jsonl fallback)"
+                    else:
+                        dst = marketing_receipts_dir / "receipts.jsonl"
+                        shutil.copyfile(src_receipts, dst)
+                        staged_receipts_ok = True
+                        staged_receipts_error = None
 
-            if src_receipts is None:
-                staged_receipts_ok = False
-                staged_receipts_error = "no receipts.jsonl found to stage"
-            else:
-                dst = marketing_receipts_dir / "receipts.jsonl"
-                # Copy deterministically (single file with stable name).
-                # Avoid copying timestamps/mtimes into contract validation by rewriting via bytes.
-                dst.write_bytes(src_receipts.read_bytes())
-                staged_receipts_ok = True
-                staged_receipts_error = None
-
-                # Also expose marketing_publish_dir if publish-marketing wrote it.
-                if marketing_publish_dir.exists() and marketing_publish_dir.is_dir():
-                    pass
         except Exception as e:
             staged_receipts_ok = False
             staged_receipts_error = str(e)
 
+# 6) Release contract validation (hard gate)
     required_files = [
         "drop_evidence.json",
         "playlist.json",
