@@ -79,8 +79,13 @@ def _die(msg: str, code: int = 2) -> None:
             pass
     else:
         sys.stderr.write(str(msg).rstrip() + "\n")
-    raise SystemExit(code)
-
+    se = SystemExit(code)
+    # Attach message so callers can record deterministic evidence.
+    try:
+        setattr(se, "msg", str(msg))
+    except Exception:
+        pass
+    raise se
 
 def _stable_json_dumps(obj: Any) -> str:
     if _STABLE_JSON:
@@ -92,6 +97,31 @@ def _stable_json_dumps(obj: Any) -> str:
             pass
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
+def _write_billing_evidence(
+    out_dir: Path,
+    *,
+    token: str,
+    ok: bool,
+    reason: str,
+    action: str = "web.build",
+) -> None:
+    ev_dir = out_dir / "evidence"
+    ev_dir.mkdir(parents=True, exist_ok=True)
+
+    ev = {
+        "schema": "mgc.billing_evidence.v1",
+        "action": action,
+        "token": token,
+        "input": {"token": token},
+        "decision": {
+            "ok": ok,
+            "reason": reason,
+        },
+    }
+
+    p = ev_dir / "billing_evidence.json"
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(ev, f, indent=2, sort_keys=True)
 
 def _sha256_hex_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -186,33 +216,97 @@ def _billing_require_pro(con: sqlite3.Connection, token: str) -> None:
     if not token:
         _die("token is empty", 2)
 
-    if not _table_exists(con, "tokens"):
-        _die("billing_db missing required table: tokens", 2)
-    if not _table_exists(con, "entitlements"):
-        _die("billing_db missing required table: entitlements", 2)
+    def _looks_hex64(s: str) -> bool:
+        if len(s) != 64:
+            return False
+        try:
+            int(s, 16)
+            return True
+        except Exception:
+            return False
 
-    row = con.execute(
-        "SELECT user_id, revoked_at FROM tokens WHERE token=?",
-        (token,),
-    ).fetchone()
-    if not row:
-        _die("billing denied: invalid token", 2)
-    if row["revoked_at"]:
-        _die("billing denied: token revoked", 2)
+    # New billing schema (preferred)
+    if _table_exists(con, "billing_tokens") and _table_exists(con, "billing_entitlements"):
+        # Support either a raw token (hashed in DB) or a token_sha256 already.
+        candidates: list[str]
+        if _looks_hex64(token):
+            candidates = [token.lower(), hashlib.sha256(token.encode('utf-8')).hexdigest()]
+        else:
+            candidates = [hashlib.sha256(token.encode('utf-8')).hexdigest()]
 
-    user_id = row["user_id"]
-    ent = con.execute(
-        "SELECT tier, active FROM entitlements WHERE user_id=? ORDER BY rowid DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    if not ent:
-        _die("billing denied: no entitlements", 2)
+        row = None
+        for cand in candidates:
+            row = con.execute(
+                "SELECT token_sha256, user_id FROM billing_tokens WHERE token_sha256=? LIMIT 1",
+                (cand,),
+            ).fetchone()
+            if row:
+                break
 
-    tier = str(ent["tier"] or "").strip().lower()
-    active = int(ent["active"] or 0)
-    if tier != "pro" or active != 1:
-        _die(f"billing denied: requires pro (tier={tier!r}, active={active})", 2)
+        if not row:
+            _die("billing denied: invalid token", 2)
 
+        token_sha = row["token_sha256"]
+        user_id = row["user_id"]
+
+        # Optional revocations table
+        if _table_exists(con, "billing_token_revocations"):
+            revoked = con.execute(
+                "SELECT 1 FROM billing_token_revocations WHERE token_sha256=? LIMIT 1",
+                (token_sha,),
+            ).fetchone()
+            if revoked:
+                _die("billing denied: token revoked", 2)
+
+        now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        ent = con.execute(
+            """
+            SELECT tier, starts_ts, ends_ts
+            FROM billing_entitlements
+            WHERE user_id=?
+              AND starts_ts <= ?
+              AND (ends_ts IS NULL OR ends_ts > ?)
+            ORDER BY starts_ts DESC
+            LIMIT 1
+            """,
+            (user_id, now_ts, now_ts),
+        ).fetchone()
+
+        if not ent:
+            _die("billing denied: no active entitlement", 2)
+
+        tier = str(ent["tier"] or "").strip().lower()
+        if tier != "pro":
+            _die(f"billing denied: requires pro (tier={tier!r})", 2)
+
+        return
+
+    # Legacy schema
+    if _table_exists(con, "tokens") and _table_exists(con, "entitlements"):
+        row = con.execute(
+            "SELECT user_id, revoked_at FROM tokens WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not row:
+            _die("billing denied: invalid token", 2)
+        if row["revoked_at"]:
+            _die("billing denied: token revoked", 2)
+
+        user_id = row["user_id"]
+        ent = con.execute(
+            "SELECT tier, active FROM entitlements WHERE user_id=? ORDER BY rowid DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not ent:
+            _die("billing denied: no entitlements", 2)
+
+        tier = str(ent["tier"] or "").strip().lower()
+        active = int(ent["active"] or 0)
+        if tier != "pro" or active != 1:
+            _die(f"billing denied: requires pro (tier={tier!r}, active={active})", 2)
+        return
+
+    _die("billing_db missing required table: tokens (or billing_tokens)", 2)
 
 def _require_pro_if_token(args: argparse.Namespace) -> None:
     token = getattr(args, "token", None)
@@ -634,17 +728,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         }) + "\n")
         return 2
 
-    if getattr(args, "token", None):
-        try:
-            _require_pro_if_token(args)
-        except Exception as e:
-            sys.stdout.write(_stable_json_dumps({
-                "ok": False,
-                "reason": "billing_denied",
-                "error": str(e),
-                "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
-            }) + "\n")
-            return 2
+    
 
     out_dir = Path(str(args.out_dir)).expanduser().resolve()
     tracks_dir = out_dir / "tracks"
@@ -656,6 +740,32 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         shutil.rmtree(out_dir)
 
     _safe_mkdir(tracks_dir)
+    token = getattr(args, "token", None)
+    if token:
+        try:
+            _require_pro_if_token(args)
+            _write_billing_evidence(
+                out_dir,
+                token=str(token),
+                ok=True,
+                reason="allow",
+            )
+        except BaseException as e:
+            reason = getattr(e, "msg", None) or str(e)
+            _write_billing_evidence(
+                out_dir,
+                token=str(token),
+                ok=False,
+                reason=reason,
+            )
+            sys.stdout.write(_stable_json_dumps({
+                "ok": False,
+                "reason": "billing_denied",
+                "error": reason,
+                "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
+            }) + "\n")
+            return 2
+
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
     strip_paths = bool(getattr(args, "strip_paths", False))
@@ -896,14 +1006,30 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "dir_not_found", "dir": str(directory)}) + "\n")
         return 2
 
-    if getattr(args, "token", None):
+    token = getattr(args, "token", None)
+    if token:
         try:
             _require_pro_if_token(args)
-        except Exception as e:
+            _write_billing_evidence(
+                Path(args.out_dir),
+                token=str(token),
+                ok=True,
+                reason="allow",
+                action="web.build",
+            )
+        except BaseException as e:
+            reason = getattr(e, "msg", None) or str(e)
+            _write_billing_evidence(
+                Path(args.out_dir),
+                token=str(token),
+                ok=False,
+                reason=str(reason),
+                action="web.build",
+            )
             sys.stdout.write(_stable_json_dumps({
                 "ok": False,
                 "reason": "billing_denied",
-                "error": str(e),
+                "error": str(reason),
                 "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
             }) + "\n")
             return 2

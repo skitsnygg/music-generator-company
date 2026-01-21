@@ -31,6 +31,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -845,7 +846,128 @@ def cmd_billing_whoami(args: argparse.Namespace) -> int:
 
 # -----------------------------
 # CLI registration
-# -----------------------------
+# -------------------
+
+def _looks_like_sha256_hex(s: str) -> bool:
+    s = (s or "").strip().lower()
+    if len(s) != 64:
+        return False
+    for ch in s:
+        if ch not in "0123456789abcdef":
+            return False
+    return True
+
+
+def cmd_billing_validate(args) -> int:
+    """
+    Validate billing evidence by replaying the pro-access policy against the billing DB.
+
+    Evidence path:
+      <out_dir>/evidence/billing_evidence.json
+
+    Policy (current):
+      allow iff token exists AND not revoked AND user has an active entitlement with tier == 'pro' at evidence time.
+    """
+    out_dir = Path(args.out_dir)
+    ev_path = out_dir / "evidence" / "billing_evidence.json"
+    if not ev_path.exists():
+        print(f"[billing.validate] missing evidence: {ev_path}", file=sys.stderr)
+        return 2
+
+    with ev_path.open("r", encoding="utf-8") as f:
+        evidence = json.load(f)
+
+    checks: list[dict] = []
+
+    schema = evidence.get("schema")
+    checks.append({"name": "schema", "ok": schema == "mgc.billing_evidence.v1", "found": schema})
+
+    token = None
+    inp = evidence.get("input") or {}
+    if isinstance(inp, dict):
+        token = inp.get("token")
+    if not token:
+        token = evidence.get("token")
+
+    checks.append({"name": "input.token", "ok": bool(token)})
+
+    found_ok = None
+    if isinstance(evidence.get("decision"), dict):
+        found_ok = evidence["decision"].get("ok")
+
+    checks.append({"name": "decision.ok.present", "ok": isinstance(found_ok, bool)})
+
+    if not token or not isinstance(found_ok, bool):
+        ok = all(c["ok"] for c in checks)
+        if args.json:
+            stable_json({"ok": ok, "evidence": str(ev_path), "checks": checks})
+        else:
+            for c in checks:
+                print(f"[{'ok' if c['ok'] else 'FAIL'}] {c['name']}")
+            print(f"[billing.validate] {'ok' if ok else 'FAILED'}")
+        return 0 if ok else 2
+
+    # Determine evaluation time (prefer evidence created_utc, else now)
+    at = evidence.get("created_utc") or evidence.get("created_ts") or evidence.get("ts")
+    at_dt = parse_now(at) if at else datetime.now(timezone.utc)
+    at_ts = at_dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    # Resolve token_sha256
+    token_s = str(token).strip()
+    token_sha = token_s.lower() if _looks_like_sha256_hex(token_s) else sha256_hex(token_s)
+
+    billing_db = _resolve_db_path(args)
+    with DB(billing_db).connect() as con:
+        _require_tables(con)
+
+        tok = con.execute(
+            "SELECT token_sha256, user_id FROM billing_tokens WHERE token_sha256=? LIMIT 1",
+            (token_sha,),
+        ).fetchone()
+
+        token_found = tok is not None
+        checks.append({"name": "token.found", "ok": token_found})
+
+        revoked = False
+        if token_found and _table_exists(con, "billing_token_revocations"):
+            r = con.execute(
+                "SELECT 1 FROM billing_token_revocations WHERE token_sha256=? LIMIT 1",
+                (token_sha,),
+            ).fetchone()
+            revoked = r is not None
+        checks.append({"name": "token.not_revoked", "ok": token_found and not revoked})
+
+        pro_active = False
+        if token_found and not revoked:
+            ent = con.execute(
+                """
+                SELECT tier, starts_ts, ends_ts
+                FROM billing_entitlements
+                WHERE user_id=?
+                  AND starts_ts <= ?
+                  AND (ends_ts IS NULL OR ends_ts > ?)
+                ORDER BY starts_ts DESC
+                LIMIT 1
+                """,
+                (tok["user_id"], at_ts, at_ts),
+            ).fetchone()
+            pro_active = bool(ent) and (ent["tier"] == "pro")
+        checks.append({"name": "entitlement.pro_active", "ok": pro_active})
+
+        recomputed_ok = token_found and (not revoked) and pro_active
+        checks.append({"name": "decision.recompute", "ok": bool(recomputed_ok) == bool(found_ok), "expected": bool(recomputed_ok), "found": bool(found_ok)})
+
+    ok = all(c["ok"] for c in checks)
+    if args.json:
+        stable_json({"ok": ok, "evidence": str(ev_path), "checks": checks})
+    else:
+        for c in checks:
+            print(f"[{'ok' if c['ok'] else 'FAIL'}] {c['name']}")
+        print(f"[billing.validate] {'ok' if ok else 'FAILED'}")
+    return 0 if ok else 2
+
+
+# ----------
 def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     billing = sub.add_parser("billing", help="Billing tools (users/tokens/entitlements)")
     bs = billing.add_subparsers(dest="billing_cmd", required=True)
@@ -981,6 +1103,14 @@ def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     el.set_defaults(func=cmd_billing_entitlements_list)
 
     # auth / UX
+    vd = bs.add_parser("validate", help="Validate billing evidence (billing_evidence.json)")
+    add_billing_db_opt(vd)
+    vd.add_argument("--out-dir", required=True, help="Output directory containing evidence/billing_evidence.json")
+    vd.add_argument("--now", default=None, help="Override evaluation time (ISO). Defaults to evidence time or now.")
+    vd.add_argument("--json", action="store_true")
+    vd.set_defaults(func=cmd_billing_validate)
+
+
     ck = bs.add_parser("check", help="Validate token and return tier")
     add_billing_db_opt(ck)
     ck.add_argument("--token", required=True)
