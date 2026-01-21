@@ -3960,9 +3960,9 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     Outputs (under out_dir):
       - drop_bundle/playlist.json
       - drop_bundle/daily_evidence.json
-      - drop_bundle/tracks/<track_id>.wav   (copied from library)
-      - evidence/daily_evidence.json        (lead track only; used by publish-marketing)
-      - drop_evidence.json                  (summary)
+      - drop_bundle/tracks/<track_id>.(wav|mp3)   (copied from library)
+      - evidence/daily_evidence.json              (lead track only; used by publish-marketing)
+      - drop_evidence.json                        (summary)
 
     Determinism:
       - Uses period_key (ISO week label) + seed + context for IDs.
@@ -3978,7 +3978,10 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     seed_val = getattr(args, "seed", None)
     seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
 
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
+    out_dir = Path(
+        getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence"
+    ).expanduser().resolve()
+
     bundle_dir = out_dir / "drop_bundle"
     bundle_tracks_dir = bundle_dir / "tracks"
     evidence_dir = out_dir / "evidence"
@@ -3988,15 +3991,19 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     # Determine ISO week label
     now_iso = deterministic_now_iso(deterministic)
-    today = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).date() if "T" in now_iso else datetime.now(timezone.utc).date()
+    today = (
+        datetime.fromisoformat(now_iso.replace("Z", "+00:00")).date()
+        if "T" in now_iso
+        else datetime.now(timezone.utc).date()
+    )
     iso_year, iso_week, _ = today.isocalendar()
     period_key = f"{iso_year}-W{iso_week:02d}"
 
     # Allow explicit override for deterministic CI / backfills
-    override_pk = str(getattr(args, 'period_key', None) or '').strip()
+    override_pk = str(getattr(args, "period_key", None) or "").strip()
     if override_pk:
-        if not re.match(r'^\d{4}-W\d{2}$', override_pk):
-            raise SystemExit(f'Invalid --period-key: {override_pk} (expected YYYY-Www)')
+        if not re.match(r"^\d{4}-W\d{2}$", override_pk):
+            raise SystemExit(f"Invalid --period-key: {override_pk} (expected YYYY-Www)")
         period_key = override_pk
 
     # Optional: generate new tracks into the library before building the weekly playlist
@@ -4072,7 +4079,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         playlist_id = str(uuid.uuid4())
         run_id = str(uuid.uuid4())
 
-    # Write bundle playlist.json (schema mgc.playlist.v1)
+    # Write bundle playlist.json (schema mgc.playlist.v1) referencing bundle-relative tracks/
     playlist_obj = {
         "schema": "mgc.playlist.v1",
         "version": 1,
@@ -4085,7 +4092,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     }
     playlist_json = json.dumps(playlist_obj, indent=2, sort_keys=True) + "\n"
     (bundle_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
-    # Pipeline contract: always expose top-level playlist.json as well
+    # Keep top-level playlist.json for compatibility, but CI/web should prefer bundle playlist
     (out_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
 
     # Write evidence/daily_evidence.json for the LEAD track (marketing contract)
@@ -4107,46 +4114,49 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         },
         "period": {"label": period_key},
     }
-    (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (bundle_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (evidence_dir / "daily_evidence.json").write_text(
+        json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (bundle_dir / "daily_evidence.json").write_text(
+        json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
     # ------------------------------------------------------------------
     # Emit planned marketing posts for file-mode publishing (weekly)
     # Writes: <out_dir>/marketing/publish/<post_id>.json
     # ------------------------------------------------------------------
-    marketing_dir = out_dir / 'marketing'
-    publish_dir = marketing_dir / 'publish'
+    marketing_dir = out_dir / "marketing"
+    publish_dir = marketing_dir / "publish"
     publish_dir.mkdir(parents=True, exist_ok=True)
 
-    platforms_raw = os.environ.get('MGC_MARKETING_PLATFORMS', 'x,tiktok,instagram_reels,youtube_shorts')
-    platforms = [p.strip() for p in platforms_raw.split(',') if p.strip()]
-    # stable ordering
+    platforms_raw = os.environ.get("MGC_MARKETING_PLATFORMS", "x,tiktok,instagram_reels,youtube_shorts")
+    platforms = [p.strip() for p in platforms_raw.split(",") if p.strip()]
     platforms = sorted(dict.fromkeys(platforms))
 
-    title = f'Weekly Drop {period_key} ({context})'
-    hook = f'New weekly {context} drop is ready.'
-    cta = 'Listen now.'
+    title = f"Weekly Drop {period_key} ({context})"
+    hook = f"New weekly {context} drop is ready."
+    cta = "Listen now."
 
     for platform in platforms:
-        post_id = stable_uuid5('marketing_post', 'weekly', period_key, str(drop_id), platform)
+        post_id = stable_uuid5("marketing_post", "weekly", period_key, str(drop_id), platform)
         payload = {
-            'schema': 'mgc.marketing_post.v1',
-            'version': 1,
-            'post_id': post_id,
-            'status': 'planned',
-            'platform': platform,
-            'schedule': 'weekly',
-            'period_key': period_key,
-            'created_at': now_iso,
-            'run_id': str(run_id),
-            'drop_id': str(drop_id),
-            'track_id': lead_track_id,
-            'title': title,
-            'hook': hook,
-            'cta': cta,
-            'context': context,
+            "schema": "mgc.marketing_post.v1",
+            "version": 1,
+            "post_id": post_id,
+            "status": "planned",
+            "platform": platform,
+            "schedule": "weekly",
+            "period_key": period_key,
+            "created_at": now_iso,
+            "run_id": str(run_id),
+            "drop_id": str(drop_id),
+            "track_id": lead_track_id,
+            "title": title,
+            "hook": hook,
+            "cta": cta,
+            "context": context,
         }
-        (publish_dir / f'{post_id}.json').write_text(stable_json_dumps(payload) + '\n', encoding='utf-8')
+        (publish_dir / f"{post_id}.json").write_text(stable_json_dumps(payload) + "\n", encoding="utf-8")
 
     # Compute deterministic repo manifest alongside playlist (helps CI provenance)
     repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
@@ -4164,12 +4174,58 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
         marketing_obj = _agents_marketing_plan(
             drop_dir=bundle_dir,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            repo_root=repo_root,
             out_dir=marketing_out,
             seed=int(seed),
             teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
             ts=now_iso,
         )
+
+    # Prefer the bundle playlist for downstream steps (web/submission), since it is portable.
+    bundle_playlist_path = (bundle_dir / "playlist.json").resolve()
+    fallback_playlist_path = (out_dir / "playlist.json").resolve()
+    playlist_path = bundle_playlist_path if bundle_playlist_path.exists() else fallback_playlist_path
+
+    # Optional: build a web bundle (static player) under out_dir/web
+    web_manifest_rel: Optional[str] = None
+    if bool(getattr(args, "web", False)):
+        web_out = (out_dir / "web").resolve()
+        web_cmd = [
+            sys.executable,
+            "-m",
+            "mgc.main",
+            "web",
+            "build",
+            "--playlist",
+            str(playlist_path),
+            "--out-dir",
+            str(web_out),
+            "--prefer-mp3",
+            "--clean",
+            "--fail-if-empty",
+            "--json",
+        ]
+        # Important: run from the playlist directory so relative "tracks/..." resolves to drop_bundle/tracks.
+        subprocess.run(web_cmd, check=True, cwd=str(playlist_path.parent))
+        web_manifest_rel = str(Path("web") / "web_manifest.json")
+
+    # Optional: deterministic submission bundle under out_dir/submission.zip
+    submission_zip_rel: Optional[str] = None
+    if bool(getattr(args, "submission", False)):
+        # Always submit the bundle directory; that's the portable artifact.
+        sub_cmd = [
+            sys.executable,
+            "-m",
+            "mgc.main",
+            "submission",
+            "build",
+            "--bundle-dir",
+            str(bundle_dir.resolve()),
+            "--out",
+            str((out_dir / "submission.zip").resolve()),
+        ]
+        subprocess.run(sub_cmd, check=True)
+        submission_zip_rel = "submission.zip"
 
     drop_evidence = {
         "ok": True,
@@ -4183,15 +4239,15 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "paths": {
             "bundle_dir": "drop_bundle",
             "bundle_playlist": "drop_bundle/playlist.json",
-
-            # Weekly runs still emit a lead-track evidence file using the daily schema
-            # (marketing contract). We expose semantically-correct keys while keeping
-            # legacy names for backward compatibility.
+            # Set "playlist" to the portable playlist so CI finders that look for paths.playlist do the right thing.
+            "playlist": "drop_bundle/playlist.json",
+            "web_manifest": web_manifest_rel,
+            "submission_zip": submission_zip_rel,
+            # Weekly runs still emit a lead-track evidence file using the daily schema (marketing contract).
             "bundle_weekly_evidence": "drop_bundle/daily_evidence.json",
             "weekly_evidence": "evidence/daily_evidence.json",
             "bundle_daily_evidence": "drop_bundle/daily_evidence.json",
             "daily_evidence": "evidence/daily_evidence.json",
-
             "drop_evidence": "drop_evidence.json",
             "manifest": "weekly_manifest.json",
             "manifest_sha256": manifest_sha256,
@@ -4200,6 +4256,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         },
     }
     (out_dir / "drop_evidence.json").write_text(json.dumps(drop_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     if json_mode:
         sys.stdout.write(stable_json_dumps(drop_evidence) + "\n")
     else:
@@ -5314,15 +5371,34 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
     # 2) Verify output contract (hard gate)
     run_cmd([sys.executable, 'scripts/verify_drop_contract.py', '--out-dir', out_dir])
 
+    # Ensure web builder can resolve playlist-relative audio paths.
+    # web.build resolves "tracks/<file>" relative to the playlist.json directory, so we stage
+    # bundle tracks into <out_dir>/tracks when present.
+    try:
+        import shutil
+        top_tracks = Path(out_dir) / 'tracks'
+        bundle_tracks = Path(out_dir) / 'drop_bundle' / 'tracks'
+        if bundle_tracks.is_dir():
+            need_copy = (not top_tracks.exists())
+            if top_tracks.is_dir():
+                # treat empty dir as missing
+                try:
+                    need_copy = next(top_tracks.iterdir(), None) is None
+                except Exception:
+                    need_copy = True
+            if need_copy:
+                top_tracks.parent.mkdir(parents=True, exist_ok=True)
+                # Copy deterministically (same filenames/bytes).
+                shutil.copytree(bundle_tracks, top_tracks, dirs_exist_ok=True)
+    except Exception:
+        # Best-effort: if this fails, web.build will raise a clear missing_tracks error.
+        pass
+
     # 3) Optional: web build
     if getattr(args, 'web', False):
-        # Prefer the portable bundle playlist if present (it resolves against drop_bundle/tracks).
-        bundle_playlist = Path(out_dir) / 'drop_bundle' / 'playlist.json'
-        playlist_path = bundle_playlist if bundle_playlist.exists() else (Path(out_dir) / 'playlist.json')
-
         web_cmd = base + [
             'web', 'build',
-            '--playlist', str(playlist_path),
+            '--playlist', str(Path(out_dir) / 'playlist.json'),
             '--out-dir', str(Path(out_dir) / 'web'),
             '--clean',
             '--fail-if-empty',
@@ -5741,6 +5817,18 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "--deterministic",
         action="store_true",
         help="Deterministic mode (also via MGC_DETERMINISTIC=1)",
+    )
+
+
+    weekly.add_argument(
+        "--web",
+        action="store_true",
+        help="Build a static web bundle under <out_dir>/web (also records paths.web_manifest)",
+    )
+    weekly.add_argument(
+        "--submission",
+        action="store_true",
+        help="Build a deterministic submission.zip under <out_dir>/submission.zip (also records paths.submission_zip)",
     )
 
     weekly.add_argument(

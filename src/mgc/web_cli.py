@@ -389,73 +389,31 @@ def _resolve_track_paths_from_db(*, db_path: str, track_ids: List[str]) -> Tuple
             pass
 
 def _resolve_input_path(raw: str, *, playlist_dir: Path, repo_root: Path) -> Path:
-    """Resolve an audio path from playlist metadata.
-
-    We need to support several playlist shapes:
-      - repo paths:        data/tracks/<id>.wav (relative)
-      - absolute paths:    /.../data/tracks/<id>.wav
-      - bundle paths:      tracks/<id>.wav (relative to playlist dir)
-      - other relative:    next to playlist.json
-
-    Key rule: if a path is missing, fall back deterministically by filename to
-    (playlist_dir/<name>) and (playlist_dir/tracks/<name>).
-    """
-    raw_s = str(raw or "").strip()
-    rp = Path(raw_s).expanduser()
-
-    # Absolute path: use it if present, otherwise fall back by filename.
+    rp = Path(str(raw or "")).expanduser()
     if rp.is_absolute():
-        if rp.exists():
-            return rp.resolve()
+        return rp
 
-        needle = rp.name
-        cand = (playlist_dir / needle)
-        if cand.exists():
-            return cand.resolve()
-        cand = (playlist_dir / "tracks" / needle)
-        if cand.exists():
-            return cand.resolve()
-
-        # If it points inside repo_root, try repo_root-relative.
-        try:
-            rel = rp.relative_to(repo_root)
-            cand = repo_root / rel
-            if cand.exists():
-                return cand.resolve()
-        except Exception:
-            pass
-
-        return rp  # caller will treat as missing
-
-    # Relative path: prefer repo root for DB-returned paths like data/tracks/...
+    # Prefer repo root for DB-returned relative paths like data/tracks/...
     cand1 = (repo_root / rp)
     if cand1.exists():
         return cand1.resolve()
 
-    # If DB says data/tracks/<file> but files live in daily folders:
+    # Fallback 1: if DB says data/tracks/<file> but files live in daily folders:
     # try <repo_root>/data/tracks/*/<file>
     try:
         parts = rp.parts
         if len(parts) >= 3 and parts[0] == "data" and parts[1] == "tracks":
             needle = parts[-1]
             base = repo_root / "data" / "tracks"
+            # one directory level deep, deterministic ordering
             hits = sorted(p for p in base.glob(f"*/{needle}") if p.is_file())
             if len(hits) == 1:
                 return hits[0].resolve()
-            # if multiple matches, do NOT guess—fall through to bundle/playlist fallbacks
+            # if multiple matches, do NOT guess—fall through to playlist_dir behavior
     except Exception:
         pass
 
-    # Bundle/portable fallbacks by filename.
-    needle = rp.name
-    cand = (playlist_dir / needle)
-    if cand.exists():
-        return cand.resolve()
-    cand = (playlist_dir / "tracks" / needle)
-    if cand.exists():
-        return cand.resolve()
-
-    # Last resort: resolve relative to the playlist directory.
+    # Fallback 2: resolve relative to the playlist directory (older run-bundled playlists)
     return (playlist_dir / rp).resolve()
 
 def _prefer_mp3_path(p: Path) -> Path:
@@ -714,7 +672,19 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "missing_count": int(missing),
 
         # Bundled files: ensure stable ordering
-        "bundled": sorted(bundled) if isinstance(bundled, list) else bundled,
+        "bundled": (
+                sorted(
+                    bundled,
+                    key=lambda d: (
+                        int(d.get("index", 0)) if isinstance(d, dict) and str(d.get("index", "0")).isdigit() else 0,
+                        str(d.get("source", "")) if isinstance(d, dict) else str(d),
+                        str(d.get("resolved", "")) if isinstance(d, dict) else "",
+                        str(d.get("reason", "")) if isinstance(d, dict) else "",
+                    ),
+                )
+                if isinstance(bundled, list)
+                else bundled
+            ),
 
         # DB metadata must already be deterministic upstream
         "db_meta": db_meta,
