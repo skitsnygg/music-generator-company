@@ -3332,6 +3332,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 "manifest_path": str(manifest_path),
                 "manifest": "manifest.json",
                 "manifest_sha256": manifest_sha256,
+                "bundle_dir": "drop_bundle",
             },
             "note": "dry_run=true; generator not executed",
         }
@@ -3353,6 +3354,52 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             con.close()
 
         drop_id = str((daily or {}).get("drop_id") or stable_uuid5("drop", run_id))
+
+        # -------------------------------------------------------------------
+        # Portable bundle copy for this drop run
+        #
+        # Historically, the daily stage wrote a portable bundle layout directly
+        # under out_dir (playlist.json, daily_evidence.json, tracks/...). For
+        # "run drop", we additionally emit a self-contained bundle directory:
+        #
+        #   <out_dir>/drop_bundle/
+        #     playlist.json
+        #     daily_evidence.json
+        #     (optional) daily_evidence_<drop_id>.json
+        #     (optional) manifest.json
+        #     tracks/...
+        #
+        # This makes downstream commands consistent:
+        #   submission build --bundle-dir <out_dir>/drop_bundle --out submission.zip
+        # -------------------------------------------------------------------
+        drop_bundle_dir = out_dir / "drop_bundle"
+        if not dry_run:
+            try:
+                if drop_bundle_dir.exists():
+                    shutil.rmtree(drop_bundle_dir)
+            except Exception:
+                # If rmtree fails for any reason, fall back to a best-effort cleanup
+                # by creating the directory anew (copy operations below will overwrite).
+                pass
+
+            drop_bundle_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy required portable-bundle files from out_dir into drop_bundle_dir.
+            # We rely on the daily stage to have written these in out_dir.
+            for name in ("playlist.json", "daily_evidence.json", "manifest.json"):
+                src = (out_dir / name).resolve()
+                if src.exists() and src.is_file():
+                    shutil.copy2(str(src), str((drop_bundle_dir / name).resolve()))
+
+            scoped_ev = (out_dir / f"daily_evidence_{drop_id}.json").resolve()
+            if scoped_ev.exists() and scoped_ev.is_file():
+                shutil.copy2(str(scoped_ev), str((drop_bundle_dir / scoped_ev.name).resolve()))
+
+            # Copy tracks/ directory (required by bundle validator).
+            src_tracks = (out_dir / "tracks").resolve()
+            dst_tracks = (drop_bundle_dir / "tracks").resolve()
+            if src_tracks.exists() and src_tracks.is_dir():
+                shutil.copytree(src_tracks, dst_tracks, dirs_exist_ok=True)
 
         track_id = ""
         try:
@@ -3437,8 +3484,14 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
     if not dry_run:
         pths = evidence_obj.get("paths") or {}
-        bundle_dir = Path(str(pths.get("bundle_dir") or out_dir)).expanduser().resolve()
-
+        bundle_dir_raw = pths.get("bundle_dir") or ""
+        if bundle_dir_raw:
+            bd = Path(str(bundle_dir_raw)).expanduser()
+            if not bd.is_absolute():
+                bd = (out_dir / bd)
+            bundle_dir = bd.resolve()
+        else:
+            bundle_dir = out_dir.resolve()
         # Validate bundle before packaging
         validate_bundle(bundle_dir)
 
