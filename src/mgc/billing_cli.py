@@ -119,6 +119,161 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+
+# -----------------------------
+# Receipts (append-only audit log)
+# -----------------------------
+RECEIPT_SCHEMA_V1 = "mgc.billing_receipt.v1"
+
+
+class _BillingConflict(Exception):
+    def __init__(self, reason: str, *, detail: Optional[str] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+def _resolve_receipts_dir(args: argparse.Namespace, db_path: Path) -> Path:
+    """Resolve receipt directory.
+
+    Precedence:
+      1) --receipts-dir (billing-level option)
+      2) <db_dir>/billing_receipts
+    """
+    raw = getattr(args, "receipts_dir", None)
+    if raw:
+        return Path(str(raw)).expanduser().resolve()
+    return (db_path.parent / "billing_receipts").resolve()
+
+
+def _receipt_id_for(action: str, core: Dict[str, Any]) -> str:
+    """Deterministic-ish id for pairing attempt/result receipts.
+
+    We hash (action + stable_json(core)). If callers pass deterministic timestamps/inputs,
+    this becomes deterministic for CI.
+    """
+    h = hashlib.sha256()
+    h.update(action.encode("utf-8"))
+    h.update(b"\n")
+    h.update(stable_json(core).encode("utf-8"))
+    return h.hexdigest()[:20]
+
+
+def _write_receipt(receipts_dir: Path, payload: Dict[str, Any]) -> Path:
+    """Atomically write a receipt JSON file. Raises on failure."""
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = str(payload.get("ts") or utc_now_iso())
+    safe_ts = ts.replace(":", "").replace("+", "").replace("Z", "Z")
+    phase = str(payload.get("phase") or "event")
+    action = str(payload.get("action") or "unknown").replace("/", "_")
+    rid = str(payload.get("receipt_id") or "noid")
+    fname = f"{safe_ts}_{phase}_{action}_{rid}.json"
+
+    tmp = receipts_dir / (fname + ".tmp")
+    final = receipts_dir / fname
+    tmp.write_text(stable_json(payload), encoding="utf-8")
+    tmp.replace(final)
+    return final
+
+
+def _sanitize_input_for_receipt(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove any secrets from input before writing to disk."""
+    out = dict(d)
+    for k in ("token", "token_value", "api_token", "auth_token"):
+        if k in out:
+            out[k] = "[REDACTED]"
+    return out
+
+
+def _mutate_with_receipts(
+    args: argparse.Namespace,
+    *,
+    db: "DB",
+    cmd: str,
+    action: str,
+    now_ts: str,
+    core_input: Dict[str, Any],
+    mutate_fn,
+) -> tuple[int, Dict[str, Any]]:
+    """Run a DB mutation with mandatory attempt/result receipts.
+
+    Contract:
+      - attempt receipt is written before any mutation
+      - result receipt is written before COMMIT (so if receipt write fails, we rollback)
+
+    Returns: (exit_code, payload_for_cli)
+    """
+    receipts_dir = _resolve_receipts_dir(args, db.path)
+    core = _sanitize_input_for_receipt(core_input)
+    receipt_id = _receipt_id_for(action, core)
+
+    base: Dict[str, Any] = {
+        "schema": RECEIPT_SCHEMA_V1,
+        "receipt_id": receipt_id,
+        "action": action,
+        "cmd": cmd,
+        "ts": now_ts,
+        "db_path": str(db.path),
+    }
+
+    # 1) attempt receipt (MUST succeed before any mutation)
+    try:
+        _write_receipt(receipts_dir, {**base, "phase": "attempt", "input": core})
+    except Exception as e:
+        out = {"ok": False, "cmd": cmd, "error": "receipt_write_failed", "reason": str(e)}
+        return (EXIT_INTERNAL, out)
+
+    con: Optional[sqlite3.Connection] = None
+    try:
+        with db.connect() as con:
+            _require_tables(con)
+            con.execute("BEGIN IMMEDIATE")
+            result = mutate_fn(con)
+
+            # 2) result receipt before commit
+            _write_receipt(receipts_dir, {**base, "phase": "result", "ok": True, "result": result})
+            con.commit()
+
+        out = {"ok": True, "cmd": cmd, **result}
+        return (EXIT_OK, out)
+
+    except _BillingConflict as e:
+        if con is not None:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        try:
+            _write_receipt(receipts_dir, {**base, "phase": "result", "ok": False, "error": "conflict", "reason": e.reason, "detail": e.detail})
+        except Exception:
+            pass
+        return (EXIT_CONFLICT, {"ok": False, "cmd": cmd, "error": "conflict", "reason": e.reason, "detail": e.detail})
+
+    except sqlite3.IntegrityError as e:
+        if con is not None:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        try:
+            _write_receipt(receipts_dir, {**base, "phase": "result", "ok": False, "error": "integrity_error", "reason": str(e)})
+        except Exception:
+            pass
+        return (EXIT_CONFLICT, {"ok": False, "cmd": cmd, "error": "integrity_error", "reason": str(e)})
+
+    except Exception as e:
+        if con is not None:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        try:
+            _write_receipt(receipts_dir, {**base, "phase": "result", "ok": False, "error": "exception", "reason": str(e)})
+        except Exception:
+            pass
+        return (EXIT_INTERNAL, {"ok": False, "cmd": cmd, "error": "exception", "reason": str(e)})
+
+
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
     row = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
@@ -232,28 +387,35 @@ def _revoke_token(con: sqlite3.Connection, *, token_sha: str, revoked_ts: str, r
 # -----------------------------
 # users
 # -----------------------------
+
 def cmd_billing_users_add(args: argparse.Namespace) -> int:
     _require_nonempty(args.user_id, "user_id")
     db = DB(_resolve_db_path(args))
     created_ts = (args.created_ts or utc_now_iso()).strip()
 
-    with db.connect() as con:
-        _require_tables(con)
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         _user_upsert(con, args.user_id, args.email, created_ts)
-        con.commit()
         row = _user_get(con, args.user_id)
+        return {"user_id": args.user_id, "user": dict(row) if row else None}
 
-    out: Dict[str, Any] = {
-        "ok": True,
-        "cmd": "billing.users.add",
-        "user_id": args.user_id,
-        "user": dict(row) if row else None,
-    }
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.users.add",
+        action="users.add",
+        now_ts=created_ts,
+        core_input={"user_id": args.user_id, "email": args.email, "created_ts": created_ts},
+        mutate_fn=_mutate,
+    )
+
     if args.json:
         print(stable_json(out), end="")
     else:
-        print(f"OK user_id={args.user_id}")
-    return EXIT_OK
+        if out.get("ok"):
+            print(f"OK user_id={args.user_id}")
+        else:
+            print(f"ERROR {out.get('error')}: {out.get('reason')}", file=sys.stderr)
+    return code
 
 
 def cmd_billing_users_list(args: argparse.Namespace) -> int:
@@ -277,6 +439,7 @@ def cmd_billing_users_list(args: argparse.Namespace) -> int:
 # -----------------------------
 # tokens
 # -----------------------------
+
 def cmd_billing_tokens_mint(args: argparse.Namespace) -> int:
     _require_nonempty(args.user_id, "user_id")
     db = DB(_resolve_db_path(args))
@@ -286,55 +449,48 @@ def cmd_billing_tokens_mint(args: argparse.Namespace) -> int:
     _require_nonempty(token_value, "token")
     token_sha = sha256_hex(token_value)
 
-    with db.connect() as con:
-        _require_tables(con)
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         if _user_get(con, args.user_id) is None:
             _user_upsert(con, args.user_id, args.email, created_ts)
 
-        try:
-            con.execute(
-                """
-                INSERT INTO billing_tokens(token_sha256, user_id, created_ts, label)
-                VALUES(?, ?, ?, ?)
-                """,
-                (token_sha, args.user_id, created_ts, args.label),
-            )
-        except sqlite3.IntegrityError as e:
-            # token_sha256 is PK; collision means token already exists
-            con.rollback()
-            out = {
-                "ok": False,
-                "cmd": "billing.tokens.mint",
-                "error": "conflict",
-                "reason": "token_already_exists",
-                "token_sha256": token_sha,
-            }
-            if args.json:
-                print(stable_json(out), end="")
-            else:
-                print(f"DENY token_already_exists token_sha256={token_sha}")
-            return EXIT_CONFLICT
+        # pre-check so we can return a clear reason (and still emit a receipt)
+        if _token_row_by_sha(con, token_sha) is not None:
+            raise _BillingConflict("token_already_exists", detail=token_sha)
 
-        con.commit()
+        con.execute(
+            """
+            INSERT INTO billing_tokens(token_sha256, user_id, created_ts, label)
+            VALUES(?, ?, ?, ?)
+            """,
+            (token_sha, args.user_id, created_ts, args.label),
+        )
+        return {"token_sha256": token_sha, "user_id": args.user_id, "label": args.label, "created_ts": created_ts}
 
-    out: Dict[str, Any] = {
-        "ok": True,
-        "cmd": "billing.tokens.mint",
-        "user_id": args.user_id,
-        "token_sha256": token_sha,
-        "created_ts": created_ts,
-        "label": args.label,
-    }
-    if args.show_token:
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.tokens.mint",
+        action="tokens.mint",
+        now_ts=created_ts,
+        core_input={"user_id": args.user_id, "email": args.email, "label": args.label, "created_ts": created_ts, "token_sha256": token_sha},
+        mutate_fn=_mutate,
+    )
+
+    # include plaintext token only in process output when explicitly requested
+    if out.get("ok") and args.show_token:
         out["token"] = token_value
 
     if args.json:
         print(stable_json(out), end="")
     else:
-        print(f"OK token_sha256={token_sha} user_id={args.user_id}")
-        if args.show_token:
-            print(token_value)
-    return EXIT_OK
+        if out.get("ok"):
+            print(f"OK token_sha256={token_sha} user_id={args.user_id}")
+            if args.show_token:
+                print(token_value)
+        else:
+            reason = out.get("reason") or out.get("error")
+            print(f"DENY {reason} token_sha256={token_sha}")
+    return code
 
 
 def cmd_billing_tokens_list(args: argparse.Namespace) -> int:
@@ -382,6 +538,7 @@ def cmd_billing_tokens_list(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+
 def cmd_billing_tokens_revoke(args: argparse.Namespace) -> int:
     db = DB(_resolve_db_path(args))
     revoked_ts = (args.revoked_ts or utc_now_iso()).strip()
@@ -390,13 +547,8 @@ def cmd_billing_tokens_revoke(args: argparse.Namespace) -> int:
     token_sha = (args.token_sha256 or sha256_hex(args.token)).strip()
     _require_nonempty(token_sha, "token_sha256")
 
-    with db.connect() as con:
-        _require_tables(con)
-
-        # If token never existed, still allow idempotent tombstone (optional behavior),
-        # but return NOT_FOUND for clarity.
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         existed = _token_row_by_sha(con, token_sha) is not None
-
         inserted = _revoke_token(
             con,
             token_sha=token_sha,
@@ -404,26 +556,41 @@ def cmd_billing_tokens_revoke(args: argparse.Namespace) -> int:
             reason=args.reason,
             meta_json=meta_json,
         )
-        con.commit()
+        return {
+            "token_sha256": token_sha,
+            "revoked_ts": revoked_ts,
+            "already_revoked": (not inserted),
+            "token_existed": existed,
+        }
 
-    out = {
-        "ok": True,
-        "cmd": "billing.tokens.revoke",
-        "token_sha256": token_sha,
-        "revoked_ts": revoked_ts,
-        "already_revoked": (not inserted),
-        "token_existed": existed,
-    }
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.tokens.revoke",
+        action="tokens.revoke",
+        now_ts=revoked_ts,
+        core_input={"token_sha256": token_sha, "revoked_ts": revoked_ts, "reason": args.reason, "meta_json": meta_json},
+        mutate_fn=_mutate,
+    )
+
+    # Preserve prior behavior: return NOT_FOUND if token never existed (even though we still record a tombstone).
+    if out.get("ok") and not out.get("token_existed"):
+        code = EXIT_NOT_FOUND
+
     if args.json:
         print(stable_json(out), end="")
     else:
-        msg = "OK"
-        if not existed:
-            msg += " token_not_found"
-        if not inserted:
-            msg += " already_revoked"
-        print(f"{msg} token_sha256={token_sha}")
-    return EXIT_OK if existed else EXIT_NOT_FOUND
+        if out.get("ok"):
+            msg = "OK"
+            if not out.get("token_existed"):
+                msg += " token_not_found"
+            if out.get("already_revoked"):
+                msg += " already_revoked"
+            print(f"{msg} token_sha256={token_sha}")
+        else:
+            print(f"ERROR {out.get('error')}: {out.get('reason')}", file=sys.stderr)
+    return code
+
 
 
 def cmd_billing_tokens_rotate(args: argparse.Namespace) -> int:
@@ -441,34 +608,20 @@ def cmd_billing_tokens_rotate(args: argparse.Namespace) -> int:
     elif args.revoke_token:
         revoke_sha = sha256_hex(args.revoke_token.strip())
 
-    with db.connect() as con:
-        _require_tables(con)
-
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         if _user_get(con, args.user_id) is None:
             _user_upsert(con, args.user_id, args.email, created_ts)
 
-        try:
-            con.execute(
-                """
-                INSERT INTO billing_tokens(token_sha256, user_id, created_ts, label)
-                VALUES(?, ?, ?, ?)
-                """,
-                (new_token_sha, args.user_id, created_ts, args.label),
-            )
-        except sqlite3.IntegrityError:
-            con.rollback()
-            out = {
-                "ok": False,
-                "cmd": "billing.tokens.rotate",
-                "error": "conflict",
-                "reason": "new_token_already_exists",
-                "token_sha256": new_token_sha,
-            }
-            if args.json:
-                print(stable_json(out), end="")
-            else:
-                print(f"DENY new_token_already_exists token_sha256={new_token_sha}")
-            return EXIT_CONFLICT
+        if _token_row_by_sha(con, new_token_sha) is not None:
+            raise _BillingConflict("new_token_already_exists", detail=new_token_sha)
+
+        con.execute(
+            """
+            INSERT INTO billing_tokens(token_sha256, user_id, created_ts, label)
+            VALUES(?, ?, ?, ?)
+            """,
+            (new_token_sha, args.user_id, created_ts, args.label),
+        )
 
         revoked_inserted = None
         revoked_existed = None
@@ -482,37 +635,57 @@ def cmd_billing_tokens_rotate(args: argparse.Namespace) -> int:
                 meta_json=None,
             )
 
-        con.commit()
+        return {
+            "user_id": args.user_id,
+            "token_sha256": new_token_sha,
+            "created_ts": created_ts,
+            "label": args.label,
+            "revoked_token_sha256": revoke_sha,
+            "revoked_inserted": revoked_inserted,
+            "revoked_token_existed": revoked_existed,
+        }
 
-    out: Dict[str, Any] = {
-        "ok": True,
-        "cmd": "billing.tokens.rotate",
-        "user_id": args.user_id,
-        "token_sha256": new_token_sha,
-        "created_ts": created_ts,
-        "label": args.label,
-        "revoked_token_sha256": revoke_sha,
-        "revoked_inserted": revoked_inserted,
-        "revoked_token_existed": revoked_existed,
-    }
-    if args.show_token:
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.tokens.rotate",
+        action="tokens.rotate",
+        now_ts=created_ts,
+        core_input={
+            "user_id": args.user_id,
+            "email": args.email,
+            "label": args.label,
+            "created_ts": created_ts,
+            "new_token_sha256": new_token_sha,
+            "revoke_token_sha256": revoke_sha,
+        },
+        mutate_fn=_mutate,
+    )
+
+    if out.get("ok") and args.show_token:
         out["token"] = new_token_value
 
     if args.json:
         print(stable_json(out), end="")
     else:
-        base = f"OK token_sha256={new_token_sha} user_id={args.user_id}"
-        if revoke_sha:
-            base += f" revoked_token_sha256={revoke_sha}"
-        print(base)
-        if args.show_token:
-            print(new_token_value)
-    return EXIT_OK
+        if out.get("ok"):
+            base = f"OK token_sha256={new_token_sha} user_id={args.user_id}"
+            if revoke_sha:
+                base += f" revoked_token_sha256={revoke_sha}"
+            print(base)
+            if args.show_token:
+                print(new_token_value)
+        else:
+            reason = out.get("reason") or out.get("error")
+            print(f"DENY {reason} token_sha256={new_token_sha}")
+    return code
+
 
 
 # -----------------------------
 # entitlements
 # -----------------------------
+
 def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
     _require_nonempty(args.entitlement_id, "entitlement_id")
     _require_nonempty(args.user_id, "user_id")
@@ -520,51 +693,62 @@ def cmd_billing_entitlements_grant(args: argparse.Namespace) -> int:
     starts_ts = (args.starts_ts or utc_now_iso()).strip()
     meta_json = _validate_meta_json(args.meta_json)
 
-    with db.connect() as con:
-        _require_tables(con)
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         if _user_get(con, args.user_id) is None:
             _user_upsert(con, args.user_id, args.email, utc_now_iso())
 
-        try:
-            con.execute(
-                """
-                INSERT INTO billing_entitlements(entitlement_id, user_id, tier, starts_ts, ends_ts, source, meta_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
-                """,
-                (args.entitlement_id, args.user_id, args.tier, starts_ts, args.ends_ts, args.source, meta_json),
-            )
-        except sqlite3.IntegrityError:
-            con.rollback()
-            out = {
-                "ok": False,
-                "cmd": "billing.entitlements.grant",
-                "error": "conflict",
-                "reason": "entitlement_id_exists",
-                "entitlement_id": args.entitlement_id,
-            }
-            if args.json:
-                print(stable_json(out), end="")
-            else:
-                print(f"DENY entitlement_id_exists entitlement_id={args.entitlement_id}")
-            return EXIT_CONFLICT
+        # clear conflict reason for receipts + CLI
+        row = con.execute(
+            "SELECT 1 FROM billing_entitlements WHERE entitlement_id = ? LIMIT 1",
+            (args.entitlement_id,),
+        ).fetchone()
+        if row is not None:
+            raise _BillingConflict("entitlement_already_exists", detail=args.entitlement_id)
 
-        con.commit()
+        con.execute(
+            """
+            INSERT INTO billing_entitlements(entitlement_id, user_id, tier, starts_ts, ends_ts, source, meta_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (args.entitlement_id, args.user_id, args.tier, starts_ts, args.ends_ts, args.source, meta_json),
+        )
+        return {
+            "entitlement_id": args.entitlement_id,
+            "user_id": args.user_id,
+            "tier": args.tier,
+            "starts_ts": starts_ts,
+            "ends_ts": args.ends_ts,
+            "source": args.source,
+        }
 
-    out = {
-        "ok": True,
-        "cmd": "billing.entitlements.grant",
-        "entitlement_id": args.entitlement_id,
-        "user_id": args.user_id,
-        "tier": args.tier,
-        "starts_ts": starts_ts,
-        "ends_ts": args.ends_ts,
-        "source": args.source,
-    }
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.entitlements.grant",
+        action="entitlements.grant",
+        now_ts=starts_ts,
+        core_input={
+            "entitlement_id": args.entitlement_id,
+            "user_id": args.user_id,
+            "tier": args.tier,
+            "starts_ts": starts_ts,
+            "ends_ts": args.ends_ts,
+            "source": args.source,
+            "meta_json": meta_json,
+            "email": args.email,
+        },
+        mutate_fn=_mutate,
+    )
+
     if args.json:
         print(stable_json(out), end="")
     else:
-        print(f"OK entitlement_id={args.entitlement_id} user_id={args.user_id} tier={args.tier}")
-    return EXIT_OK
+        if out.get("ok"):
+            print(f"OK entitlement_id={args.entitlement_id} user_id={args.user_id} tier={args.tier}")
+        else:
+            reason = out.get("reason") or out.get("error")
+            print(f"DENY {reason} entitlement_id={args.entitlement_id}")
+    return code
 
 
 def cmd_billing_entitlements_grant_user(args: argparse.Namespace) -> int:
@@ -623,15 +807,14 @@ def cmd_billing_entitlements_grant_user(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+
 def cmd_billing_entitlements_revoke(args: argparse.Namespace) -> int:
     _require_nonempty(args.user_id, "user_id")
     db = DB(_resolve_db_path(args))
     now_dt = parse_now(args.now)
     now_ts = now_dt.isoformat(timespec="seconds")
 
-    with db.connect() as con:
-        _require_tables(con)
-
+    def _mutate(con: sqlite3.Connection) -> Dict[str, Any]:
         if args.entitlement_id:
             cur = con.execute(
                 """
@@ -654,91 +837,147 @@ def cmd_billing_entitlements_revoke(args: argparse.Namespace) -> int:
             )
             revoked = cur.rowcount
 
-        con.commit()
+        return {
+            "user_id": args.user_id,
+            "entitlement_id": args.entitlement_id,
+            "revoked": int(revoked or 0),
+            "now": now_ts,
+        }
 
-    out = {
-        "ok": True,
-        "cmd": "billing.entitlements.revoke",
-        "user_id": args.user_id,
-        "entitlement_id": args.entitlement_id,
-        "now": now_ts,
-        "revoked": revoked,
-    }
+    code, out = _mutate_with_receipts(
+        args,
+        db=db,
+        cmd="billing.entitlements.revoke",
+        action="entitlements.revoke",
+        now_ts=now_ts,
+        core_input={"user_id": args.user_id, "entitlement_id": args.entitlement_id, "now": now_ts},
+        mutate_fn=_mutate,
+    )
+
     if args.json:
         print(stable_json(out), end="")
     else:
-        if args.entitlement_id:
-            print(f"OK revoked={revoked} entitlement_id={args.entitlement_id}")
+        if out.get("ok"):
+            if out.get("revoked", 0) == 0:
+                print("OK none")
+            else:
+                if args.entitlement_id:
+                    print(f"OK entitlement_id={args.entitlement_id} revoked")
+                else:
+                    print(f"OK user_id={args.user_id} revoked={out.get('revoked')}")
         else:
-            print(f"OK revoked={revoked} user_id={args.user_id}")
-    return EXIT_OK
+            print(f"ERROR {out.get('error')}: {out.get('reason')}", file=sys.stderr)
+    return code
+
+
 
 
 def cmd_billing_entitlements_active(args: argparse.Namespace) -> int:
     _require_nonempty(args.user_id, "user_id")
     db = DB(_resolve_db_path(args))
-    now_dt = parse_now(args.now)
+    now_dt = parse_now(getattr(args, "now", None))
     now_ts = now_dt.isoformat(timespec="seconds")
 
     with db.connect() as con:
         _require_tables(con)
-        ent = _entitlement_active_row(con, user_id=args.user_id, now_ts=now_ts)
+        row = _entitlement_active_row(con, user_id=args.user_id, now_ts=now_ts)
 
-    tier = str(ent["tier"]) if ent is not None else "free"
-    ent_d = dict(ent) if ent is not None else None
+    if row is None:
+        out: Dict[str, Any] = {"ok": True, "user_id": args.user_id, "now": now_ts, "active": False}
+    else:
+        d = dict(row)
+        out = {
+            "ok": True,
+            "user_id": args.user_id,
+            "now": now_ts,
+            "active": True,
+            "entitlement": {
+                "entitlement_id": d.get("entitlement_id"),
+                "tier": d.get("tier"),
+                "starts_ts": d.get("starts_ts"),
+                "ends_ts": d.get("ends_ts"),
+                "source": d.get("source"),
+                "meta_json": d.get("meta_json"),
+            },
+        }
 
-    out: Dict[str, Any] = {
-        "ok": True,
-        "cmd": "billing.entitlements.active",
-        "user_id": args.user_id,
-        "now": now_ts,
-        "tier": tier,
-        "active_entitlement": ent_d,
-    }
-    if args.json:
+    if getattr(args, "json", False):
         print(stable_json(out), end="")
     else:
-        if ent_d is None:
-            print(f"OK user_id={args.user_id} tier=free active_entitlement=")
+        if not out.get("active"):
+            print(f"NONE user_id={args.user_id} now={now_ts}")
         else:
+            e = out["entitlement"]
             print(
-                f"OK user_id={args.user_id} tier={tier} entitlement_id={ent_d.get('entitlement_id')} "
-                f"starts={ent_d.get('starts_ts')} ends={(ent_d.get('ends_ts') or '')} source={ent_d.get('source')}"
+                f"ACTIVE user_id={args.user_id} tier={e.get('tier')} "
+                f"entitlement_id={e.get('entitlement_id')} starts_ts={e.get('starts_ts')}"
             )
-    return EXIT_OK
+    return 0
 
 
 def cmd_billing_entitlements_list(args: argparse.Namespace) -> int:
     db = DB(_resolve_db_path(args))
+    limit = int(getattr(args, "limit", 50) or 50)
+    user_id = getattr(args, "user_id", None)
+
     with db.connect() as con:
         _require_tables(con)
-        if args.user_id:
+        if user_id:
             rows = con.execute(
                 """
-                SELECT * FROM billing_entitlements
-                WHERE user_id = ?
-                ORDER BY starts_ts DESC
-                LIMIT ?
+                SELECT *
+                  FROM billing_entitlements
+                 WHERE user_id = ?
+                 ORDER BY starts_ts DESC
+                 LIMIT ?
                 """,
-                (args.user_id, int(args.limit)),
+                (user_id, limit),
             ).fetchall()
         else:
             rows = con.execute(
-                "SELECT * FROM billing_entitlements ORDER BY starts_ts DESC LIMIT ?",
-                (int(args.limit),),
+                """
+                SELECT *
+                  FROM billing_entitlements
+                 ORDER BY starts_ts DESC
+                 LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
 
-    data = [dict(r) for r in rows]
-    if args.json:
-        print(stable_json({"ok": True, "cmd": "billing.entitlements.list", "entitlements": data}), end="")
-    else:
-        for e in data:
-            print(
-                f"{e.get('entitlement_id')}  user_id={e.get('user_id')}  tier={e.get('tier')}  "
-                f"starts={e.get('starts_ts')}  ends={e.get('ends_ts') or ''}  source={e.get('source')}"
-            )
-    return EXIT_OK
+    items = []
+    for r in rows:
+        d = dict(r)
+        items.append(
+            {
+                "entitlement_id": d.get("entitlement_id"),
+                "user_id": d.get("user_id"),
+                "tier": d.get("tier"),
+                "starts_ts": d.get("starts_ts"),
+                "ends_ts": d.get("ends_ts"),
+                "source": d.get("source"),
+                "meta_json": d.get("meta_json"),
+            }
+        )
 
+    out: Dict[str, Any] = {"ok": True, "count": len(items), "items": items}
+    if user_id:
+        out["user_id"] = user_id
+
+    if getattr(args, "json", False):
+        print(stable_json(out), end="")
+    else:
+        if not items:
+            if user_id:
+                print(f"(no entitlements) user_id={user_id}")
+            else:
+                print("(no entitlements)")
+        else:
+            for it in items:
+                print(
+                    f"{it['entitlement_id']} user_id={it['user_id']} tier={it['tier']} "
+                    f"starts_ts={it['starts_ts']} ends_ts={it['ends_ts']}"
+                )
+    return 0
 
 # -----------------------------
 # auth / UX
@@ -970,6 +1209,12 @@ def cmd_billing_validate(args) -> int:
 # ----------
 def register_billing_subcommand(sub: argparse._SubParsersAction) -> None:
     billing = sub.add_parser("billing", help="Billing tools (users/tokens/entitlements)")
+    billing.add_argument(
+        "--receipts-dir",
+        dest="receipts_dir",
+        default=None,
+        help="Directory for append-only billing receipts (audit log). Defaults to <db_dir>/billing_receipts. Mutating commands will fail if receipts cannot be written.",
+    )
     bs = billing.add_subparsers(dest="billing_cmd", required=True)
 
     def add_billing_db_opt(p: argparse.ArgumentParser) -> None:

@@ -1,4 +1,4 @@
--- 0002_billing.sql
+--0002_billing.sql
 -- Billing users, tokens, and entitlements
 
 CREATE TABLE IF NOT EXISTS billing_users (
