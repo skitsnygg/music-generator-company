@@ -3459,14 +3459,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         pths["bundle_evidence"] = "drop_bundle/daily_evidence.json"
         pths["bundle_tracks_dir"] = "drop_bundle/tracks"
         pths["run_out_dir"] = str(out_dir)
-
-        # Make the *portable* bundle playlist the canonical playlist path for downstream tooling.
-        # CI helpers (scripts/find_artifacts.py) generally look for paths["playlist"], so if we leave
-        # it pointing at "playlist.json" we can end up resolving tracks/ that are not materialized.
-        # The bundle playlist references drop_bundle/tracks/* and is always portable.
-        pths["playlist"] = pths.get("bundle_playlist") or "drop_bundle/playlist.json"
-        pths["playlist_path"] = pths["playlist"]
-
         evidence_obj["paths"] = pths
 
         # Validate bundle before packaging
@@ -5322,34 +5314,15 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
     # 2) Verify output contract (hard gate)
     run_cmd([sys.executable, 'scripts/verify_drop_contract.py', '--out-dir', out_dir])
 
-    # Ensure web builder can resolve playlist-relative audio paths.
-    # web.build resolves "tracks/<file>" relative to the playlist.json directory, so we stage
-    # bundle tracks into <out_dir>/tracks when present.
-    try:
-        import shutil
-        top_tracks = Path(out_dir) / 'tracks'
-        bundle_tracks = Path(out_dir) / 'drop_bundle' / 'tracks'
-        if bundle_tracks.is_dir():
-            need_copy = (not top_tracks.exists())
-            if top_tracks.is_dir():
-                # treat empty dir as missing
-                try:
-                    need_copy = next(top_tracks.iterdir(), None) is None
-                except Exception:
-                    need_copy = True
-            if need_copy:
-                top_tracks.parent.mkdir(parents=True, exist_ok=True)
-                # Copy deterministically (same filenames/bytes).
-                shutil.copytree(bundle_tracks, top_tracks, dirs_exist_ok=True)
-    except Exception:
-        # Best-effort: if this fails, web.build will raise a clear missing_tracks error.
-        pass
-
     # 3) Optional: web build
     if getattr(args, 'web', False):
+        # Prefer the portable bundle playlist if present (it resolves against drop_bundle/tracks).
+        bundle_playlist = Path(out_dir) / 'drop_bundle' / 'playlist.json'
+        playlist_path = bundle_playlist if bundle_playlist.exists() else (Path(out_dir) / 'playlist.json')
+
         web_cmd = base + [
             'web', 'build',
-            '--playlist', str(Path(out_dir) / 'playlist.json'),
+            '--playlist', str(playlist_path),
             '--out-dir', str(Path(out_dir) / 'web'),
             '--clean',
             '--fail-if-empty',
