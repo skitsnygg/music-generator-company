@@ -84,7 +84,7 @@ jobs:
           if [ -f scripts/ci_gate.sh ]; then
             bash scripts/ci_gate.sh
           else
-            # Fallback: at least compile + run a deterministic drop
+            # Fallback: at least compile (keeps release workflow useful even if ci_gate.sh is absent)
             python -m py_compile $(git ls-files '*.py')
           fi
 
@@ -114,14 +114,9 @@ jobs:
           python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
 
           # Resolve portable bundle dir from the stdout JSON (no jq dependency)
+          # NOTE: must be single-line python to avoid YAML/heredoc parsing pitfalls.
           BUNDLE_DIR_VALUE="$(
-            DROP_DIR="${DROP_DIR}" python - <<'PY'
-import json, os
-p = os.path.join(os.environ["DROP_DIR"], "drop_stdout.json")
-j = json.load(open(p, "r", encoding="utf-8"))
-paths = j.get("paths") or {}
-print(paths.get("bundle_dir_path") or paths.get("bundle_dir") or "")
-PY
+            DROP_DIR="${DROP_DIR}" python -c "import json,os; p=os.path.join(os.environ['DROP_DIR'],'drop_stdout.json'); j=json.load(open(p,'r',encoding='utf-8')); paths=j.get('paths') or {}; print(paths.get('bundle_dir_path') or paths.get('bundle_dir') or '')"
           )"
 
           test -n "${BUNDLE_DIR_VALUE}"
