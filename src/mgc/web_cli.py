@@ -70,6 +70,32 @@ def _utc_now_iso() -> str:
 def _stable_json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
+def _normalize_bundled_entries(bundled: Any) -> Any:
+    """Strip absolute paths from bundled entries to keep web_manifest.json deterministic."""
+    if not isinstance(bundled, list):
+        return bundled
+
+    out: List[Dict[str, Any]] = []
+    for item in bundled:
+        if not isinstance(item, dict):
+            continue
+        cleaned: Dict[str, Any] = {}
+        if "index" in item:
+            try:
+                cleaned["index"] = int(item["index"])
+            except Exception:
+                cleaned["index"] = item["index"]
+        if "ok" in item:
+            cleaned["ok"] = bool(item["ok"])
+        if "web_path" in item:
+            cleaned["web_path"] = item["web_path"]
+        if "resolved_from" in item:
+            cleaned["resolved_from"] = item["resolved_from"]
+        out.append(cleaned)
+
+    out.sort(key=lambda d: (int(d.get("index", 0) or 0), str(d.get("web_path", "") or "")))
+    return out
+
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -647,7 +673,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_playlist_path.write_text(json.dumps(out_playlist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    out_playlist_path.write_text(_stable_json_dumps(out_playlist) + "\n", encoding="utf-8")
     index_path.write_text(_INDEX_HTML, encoding="utf-8")
 
     ok = True
@@ -659,20 +685,34 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     manifest = {
         "ok": ok,
         "cmd": "web.build",
-        "out_dir": str(out_dir),
-        "playlist": str(playlist_path),
-        "playlist_out": str(out_playlist_path),
-        "index": str(index_path),
-        "manifest_path": str(manifest_path),
-        "resolved_from": resolved_from,
-        "copied_count": copied,
-        "missing_count": missing,
-        "bundled": bundled,
-        "db_meta": db_meta,
-    }
-    manifest_path.write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
 
-    sys.stdout.write(_stable_json_dumps(manifest) + "\n")
+        # Contract-stable relative paths only
+        "paths": {
+            "playlist": "playlist.json",
+            "index": "index.html",
+            "web_manifest": "web_manifest.json",
+        },
+
+        # Counts are deterministic
+        "copied_count": int(copied),
+        "missing_count": int(missing),
+
+        # Bundled files: ensure stable ordering
+        "bundled": _normalize_bundled_entries(bundled),
+
+        # DB metadata must already be deterministic upstream
+        "db_meta": db_meta,
+
+        # Resolution source should be semantic, not path-based
+        "resolved_from": resolved_from,
+    }
+
+    # Write manifest deterministically
+    manifest_text = _stable_json_dumps(manifest) + "\n"
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+
+    # Emit the same object to stdout (CLI contract preserved)
+    sys.stdout.write(manifest_text)
     return 0
 
 
