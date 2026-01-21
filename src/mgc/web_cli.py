@@ -70,32 +70,6 @@ def _utc_now_iso() -> str:
 def _stable_json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
-def _normalize_bundled_entries(bundled: Any) -> Any:
-    """Strip absolute paths from bundled entries to keep web_manifest.json deterministic."""
-    if not isinstance(bundled, list):
-        return bundled
-
-    out: List[Dict[str, Any]] = []
-    for item in bundled:
-        if not isinstance(item, dict):
-            continue
-        cleaned: Dict[str, Any] = {}
-        if "index" in item:
-            try:
-                cleaned["index"] = int(item["index"])
-            except Exception:
-                cleaned["index"] = item["index"]
-        if "ok" in item:
-            cleaned["ok"] = bool(item["ok"])
-        if "web_path" in item:
-            cleaned["web_path"] = item["web_path"]
-        if "resolved_from" in item:
-            cleaned["resolved_from"] = item["resolved_from"]
-        out.append(cleaned)
-
-    out.sort(key=lambda d: (int(d.get("index", 0) or 0), str(d.get("web_path", "") or "")))
-    return out
-
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -633,8 +607,8 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
         bundled.append({
             "index": i,
-            "source": str(rp) if not strip_paths else rp.name,
-            "dest": str(dest),
+            "source": str(Path("tracks") / rp.name) if not strip_paths else rp.name,
+            "dest": rel,
             "web_path": rel,
             "ok": True,
             "resolved_from": resolved_from,
@@ -642,7 +616,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
         out_tracks.append({
             "title": rp.stem,
-            "path": str(rp) if not strip_paths else rp.name,
+            "path": rel,
             "web_path": rel,
         })
 
@@ -667,7 +641,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         return 2
 
     out_playlist = {
-        "source_playlist": str(playlist_path),
+        "source_playlist": str(playlist_path.name),
         "resolved_from": resolved_from,
         "tracks": out_tracks,
     }
@@ -698,7 +672,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "missing_count": int(missing),
 
         # Bundled files: ensure stable ordering
-        "bundled": _normalize_bundled_entries(bundled),
+        "bundled": sorted(bundled) if isinstance(bundled, list) else bundled,
 
         # DB metadata must already be deterministic upstream
         "db_meta": db_meta,
