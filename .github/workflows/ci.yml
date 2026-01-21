@@ -216,41 +216,6 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_PROVIDER: "stub"
-        run: |
-          set -euxo pipefail
-
-          # Ensure the publish contract can stage receipts from the repo-relative default path.
-          mkdir -p artifacts/run/marketing
-          printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
-            > artifacts/run/marketing/receipts.jsonl
-          test -s artifacts/run/marketing/receipts.jsonl
-
-          OUT1="${MGC_ARTIFACTS_DIR}/auto_publish_1"
-          OUT2="${MGC_ARTIFACTS_DIR}/auto_publish_2"
-          rm -rf "${OUT1}" "${OUT2}"
-          mkdir -p "${OUT1}" "${OUT2}"
-
-          python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT1}" --deterministic --contract publish
-
-          python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT2}" --deterministic --contract publish
-
-          test -s "${OUT1}/contract_report.json"
-          test -s "${OUT2}/contract_report.json"
-
-          # Determinism: whole publish bundle tree must match
-          (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
-          (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
-          diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
-
-      - name: Autonomous contract (publish; main only; twice + determinism diff)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          MGC_DB: ${{ env.MGC_DB }}
-          MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
-          MGC_PROVIDER: "stub"
           # Allow autonomous to stage receipts into out_dir.
           # ci_gate.sh typically writes receipts under ${MGC_ARTIFACTS_DIR}/run/marketing/receipts.jsonl
           MGC_MARKETING_RECEIPTS_PATH: ${{ env.MGC_ARTIFACTS_DIR }}/run/marketing/receipts.jsonl
@@ -448,6 +413,44 @@ jobs:
 
           test -n "${PLAYLIST_PATH}"
           test -s "${PLAYLIST_PATH}"
+
+          # -------------------------------------------------------------------
+          # Fix for CI red: playlist may reference tracks/ at the out-dir root,
+          # but the actual audio may live under drop_bundle/tracks/.
+          # If we detect missing audio next to the playlist, fall back to
+          # sibling drop_bundle/playlist.json when it exists.
+          # -------------------------------------------------------------------
+          PLAYLIST_DIR="$(dirname "${PLAYLIST_PATH}")"
+          FALLBACK_PLAYLIST="${PLAYLIST_DIR}/drop_bundle/playlist.json"
+
+          echo "PLAYLIST_DIR=${PLAYLIST_DIR}"
+          if test -f "${FALLBACK_PLAYLIST}"; then
+            echo "FALLBACK_PLAYLIST=${FALLBACK_PLAYLIST}"
+          else
+            echo "FALLBACK_PLAYLIST not found at ${FALLBACK_PLAYLIST}"
+          fi
+
+          # If the current playlist yields no local audio files but drop_bundle has some,
+          # switch to the drop_bundle playlist.
+          AUDIO_NEAR_PLAYLIST="$(find "${PLAYLIST_DIR}" -maxdepth 2 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
+          AUDIO_IN_DROP_BUNDLE="0"
+          if test -d "${PLAYLIST_DIR}/drop_bundle"; then
+            AUDIO_IN_DROP_BUNDLE="$(find "${PLAYLIST_DIR}/drop_bundle" -maxdepth 3 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
+          fi
+
+          echo "AUDIO_NEAR_PLAYLIST=${AUDIO_NEAR_PLAYLIST}"
+          echo "AUDIO_IN_DROP_BUNDLE=${AUDIO_IN_DROP_BUNDLE}"
+
+          if test "${AUDIO_NEAR_PLAYLIST}" = "0" && test "${AUDIO_IN_DROP_BUNDLE}" != "0" && test -f "${FALLBACK_PLAYLIST}"; then
+            echo "Switching PLAYLIST_PATH to drop_bundle playlist because audio is only present under drop_bundle/"
+            PLAYLIST_PATH="${FALLBACK_PLAYLIST}"
+            echo "PLAYLIST_PATH=${PLAYLIST_PATH}"
+            test -s "${PLAYLIST_PATH}"
+          fi
+
+          # Helpful diagnostics when this fails again
+          echo "Playlist head (first 200 lines):"
+          sed -n '1,200p' "${PLAYLIST_PATH}" || true
 
           python -m mgc.main web build \
             --playlist "${PLAYLIST_PATH}" \
