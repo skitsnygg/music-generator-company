@@ -3188,18 +3188,15 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
         lines = [
             "# Music Generator Company – Drop Submission",
-            "",
             "## Identifiers",
             f"- drop_id: {drop_id}",
             f"- run_id: {run_id_local}",
             f"- track_id: {track_id_local}",
-            "",
             "## Run metadata",
             f"- ts: {ts_local}",
             f"- context: {context_local}",
             f"- provider: {provider}",
             f"- deterministic: {deterministic_local}",
-            "",
             "## Contents",
             f"- {playlist}: playlist pointing at bundled audio",
             f"- {bundle_track}: bundled audio asset",
@@ -3209,7 +3206,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             lines += ["- web/: static web player bundle (index.html + tracks/)"]
 
         lines += [
-            "",
             "## How to review",
             "1) Inspect playlist.json (it references the bundled track under tracks/).",
             "2) Confirm hashes match the files in the bundle.",
@@ -3218,7 +3214,6 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             lines += ["3) Open web/index.html (or serve web/) to listen."]
 
         lines += [
-            "",
             "## Notes",
             f"- Packaged at: {ts_local or _utc_now_iso()}",
         ]
@@ -3226,7 +3221,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
     def _build_web_bundle_from_portable_bundle(*, bundle_dir: Path, web_out_dir: Path) -> Dict[str, Any]:
         """
         Build a web bundle using `mgc.main web build` with cwd=bundle_dir so relative paths resolve.
-        Also passes --strip-paths so the generated playlist.json doesn't bake absolute paths.
+        Also passes so the generated playlist.json doesn't bake absolute paths.
         """
         playlist_path = bundle_dir / "playlist.json"
         if not playlist_path.exists():
@@ -3245,9 +3240,13 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             "--clean",
             "--fail-if-empty",
             "--fail-if-none-copied",
-            "--strip-paths",
             "--json",
         ]
+
+        # Defensive: drop empty argv elements (argparse would treat them as unknown args)
+
+        cmd = [x for x in cmd if x]
+
 
         proc = subprocess.run(
             cmd,

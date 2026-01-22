@@ -187,8 +187,6 @@ def cmd_drops_show(args: argparse.Namespace) -> int:
 
 def register_drops_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drops = subparsers.add_parser("drops", help="Inspect drops (daily releases)")
-    drops.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="SQLite DB path")
-
     drops_sub = drops.add_subparsers(dest="drops_cmd", required=True)
 
     ls = drops_sub.add_parser("list", help="List drops")
