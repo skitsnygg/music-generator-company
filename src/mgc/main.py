@@ -1819,11 +1819,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Optional: billing (only if billing_cli is present)
     try:
-        from mgc.billing_cli import register_billing_subcommand  # type: ignore
-    except Exception:
-        register_billing_subcommand = None  # type: ignore
-    if register_billing_subcommand:
-        register_billing_subcommand(sub)
+        from mgc.billing_cli import register_billing_subcommand as _register_billing_subcommand  # type: ignore
+    except Exception as e:
+        print(f"[mgc.main] WARN: billing subcommand not registered: {e}")
+        _register_billing_subcommand = None  # type: ignore
+    if _register_billing_subcommand:
+        _register_billing_subcommand(sub)
 
     return p
 

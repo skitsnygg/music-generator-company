@@ -40,6 +40,16 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# Billing access (optional; required only when --token is used)
+try:
+    from mgc.billing_access import resolve_access, AccessContext  # type: ignore
+except Exception as _e:
+    resolve_access = None  # type: ignore
+    AccessContext = None  # type: ignore
+    _BILLING_ACCESS_IMPORT_ERROR = str(_e)
+else:
+    _BILLING_ACCESS_IMPORT_ERROR = None
+
 
 # ---------------------------------------------------------------------
 # Optional imports (keep web_cli importable in CI/minimal environments)
@@ -104,7 +114,16 @@ def _write_billing_evidence(
     ok: bool,
     reason: str,
     action: str = "web.build",
+    user_id: Optional[str] = None,
+    tier: Optional[str] = None,
+    entitlements: Optional[Sequence[str]] = None,
 ) -> None:
+    """Write a small, deterministic-ish billing decision evidence file.
+
+    This is intentionally separate from append-only billing receipts (which live under
+    billing_cli). Web evidence is a convenient artifact for CI / debugging and can be
+    shipped alongside the built web bundle.
+    """
     ev_dir = out_dir / "evidence"
     ev_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,6 +135,9 @@ def _write_billing_evidence(
         "decision": {
             "ok": ok,
             "reason": reason,
+            "user_id": user_id,
+            "tier": tier,
+            "entitlements": list(entitlements) if entitlements is not None else None,
         },
     }
 
@@ -308,18 +330,35 @@ def _billing_require_pro(con: sqlite3.Connection, token: str) -> None:
 
     _die("billing_db missing required table: tokens (or billing_tokens)", 2)
 
-def _require_pro_if_token(args: argparse.Namespace) -> None:
+def _require_pro_if_token(args: argparse.Namespace) -> "AccessContext":
+    """If args.token is provided, enforce billing access.
+
+    Policy:
+      - token must resolve successfully
+      - allow if tier == "pro" OR user has entitlement "web"
+    """
     token = getattr(args, "token", None)
     if not token:
-        return
+        _die("token is empty", 2)
+
+    if resolve_access is None:
+        msg = _BILLING_ACCESS_IMPORT_ERROR or "mgc.billing_access unavailable"
+        _die(f"billing denied: cannot import billing_access: {msg}", 2)
+
     db_path = _resolve_billing_db_strict(args)
     if not db_path:
         _die("billing denied: missing billing db path (use --billing-db or MGC_BILLING_DB)", 2)
-    con = _connect(db_path)
-    try:
-        _billing_require_pro(con, str(token))
-    finally:
-        con.close()
+
+    ctx = resolve_access(billing_db=str(db_path), token=str(token))
+    if not getattr(ctx, "ok", False):
+        _die(f"billing denied: {getattr(ctx, 'reason', 'unknown')}", 2)
+
+    # Prefer explicit entitlement gating; allow "pro" as an override to keep older flows working.
+    if (getattr(ctx, "tier", None) != "pro") and ("web" not in set(getattr(ctx, "entitlements", set()))):
+        _die(f"billing denied: requires entitlement 'web' or pro tier (tier={getattr(ctx, 'tier', None)!r})", 2)
+
+    return ctx
+
 
 
 # ---------------------------------------------------------------------
@@ -743,12 +782,15 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     token = getattr(args, "token", None)
     if token:
         try:
-            _require_pro_if_token(args)
+            ctx = _require_pro_if_token(args)
             _write_billing_evidence(
                 out_dir,
                 token=str(token),
                 ok=True,
                 reason="allow",
+                user_id=ctx.user_id,
+                tier=ctx.tier,
+                entitlements=sorted(ctx.entitlements),
             )
         except BaseException as e:
             reason = getattr(e, "msg", None) or str(e)
