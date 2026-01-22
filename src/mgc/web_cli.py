@@ -124,14 +124,18 @@ def _ensure_portable_relpath(relpath: str) -> None:
 
 
 def _tree_hash(root: Path) -> str:
+    # IMPORTANT:
+    # Exclude web_manifest.json to avoid self-referential hashing.
     items: List[Tuple[str, str]] = []
     for p in sorted(root.rglob("*")):
-        if p.is_file():
-            rel = str(p.relative_to(root)).replace("\\", "/")
-            items.append((rel, _sha256_file(p)))
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        if rel == "web_manifest.json":
+            continue
+        items.append((rel, _sha256_file(p)))
     payload = _stable_json_dumps(items)
     return _sha256_hex_str(payload)
-
 
 def _looks_like_audio_path(s: str) -> bool:
     s2 = s.lower().strip()
@@ -574,6 +578,13 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                 title = effective_track_id
             attempted.append(str(src_path))
 
+        # Guard: never allow empty effective_track_id; derive from filename if needed.
+        # This prevents hard-fail validation in CI when playlist entries have missing/blank track_id.
+        if src_path is not None and (not str(effective_track_id or "").strip()):
+            effective_track_id = src_path.stem
+        if not title:
+            title = effective_track_id or orig_track_id
+
         if src_path is None or (not src_path.exists()) or (not src_path.is_file()):
             missing += 1
             bundled.append({
@@ -670,19 +681,10 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     "track_id": t.get("track_id"),
                     "title": t.get("title"),
                 })
-
-    # Write manifest + playlist snapshot (playlist snapshot is informational)
-    manifest = _build_web_manifest(
-        out_dir=out_dir,
-        playlist_obj=playlist_obj,
-        tracks_payload=tracks_payload,
-        deterministic=deterministic,
-        bundle_audio=bundle_audio,
-    )
-    (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
+    # Write playlist snapshot (informational)
     (out_dir / "playlist.json").write_text(_stable_json_dumps(playlist_obj) + "\n", encoding="utf-8")
 
-    # index.html copy rules
+    # Ensure index.html exists BEFORE computing web_tree_sha256.
     index_from = str(getattr(args, "index_from", "") or "").strip()
     if index_from:
         src = Path(index_from).expanduser().resolve()
@@ -705,7 +707,17 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     if not (out_dir / "index.html").exists():
         (out_dir / "index.html").write_text(_EMBEDDED_INDEX_HTML, encoding="utf-8")
 
-    # Validate
+    # Build + write manifest LAST (tree hash sees final bundle)
+    manifest = _build_web_manifest(
+        out_dir=out_dir,
+        playlist_obj=playlist_obj,
+        tracks_payload=tracks_payload,
+        deterministic=deterministic,
+        bundle_audio=bundle_audio,
+    )
+    (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
+
+    # Validate (emit JSON on failure rather than a silent SystemExit)
     try:
         _validate_web_manifest(out_dir, manifest)
     except SystemExit:
@@ -726,7 +738,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         "missing": [x for x in bundled if isinstance(x, dict) and not x.get("ok", True)],
     }) + "\n")
     return 0
-
 
 def cmd_web_validate(args: argparse.Namespace) -> int:
     out_dir = Path(str(getattr(args, "out_dir"))).expanduser().resolve()
