@@ -8,21 +8,24 @@ Web contract hardening:
 - Deterministic, contract-grade web output (manifest + assets).
 - Manifest includes content hashes and sizes for every bundled track.
 - Validation fails loudly on missing assets, hash mismatch, or unsafe path issues.
-- Content-based tree hash for entire bundle (paths + sha256), suitable for determinism gates.
+- Content-based tree hash for entire bundle (paths + sha256), suitable for CI determinism gates.
 
-Important behaviors for this repo:
-- Playlists may contain placeholder track_id/path (e.g. 0000...0001.wav). When the
-  playlist track path does not exist, we fall back to:
-    1) Resolve real artifact_path from the *main* DB using tracks.track_id
-    2) Infer real track paths from sibling drop_evidence.json/manifest.json/contract_report.json
-       next to the playlist (common in /tmp/mgc_release output)
+Runtime gating (dev server):
+- Serves static web dir
+- Adds tiny /api/* endpoints for entitlement checks + gated streaming:
+  - GET /api/health
+  - GET /api/me
+  - GET /api/catalog
+  - GET /api/stream/<track_id>
+  - HEAD /api/health
+  - HEAD /api/me
+  - HEAD /api/catalog
+  - HEAD /api/stream/<track_id>   (returns correct headers; no body)
 
-Tree hash determinism:
-- The bundle tree hash EXCLUDES web_manifest.json to avoid self-referential hashing
-  (manifest contains web_tree_sha256, so including it would make the hash unstable).
-
-Registrar:
-- mgc.main discovers register_web_subcommand(subparsers) (plus aliases).
+Notes:
+- The API relies on a billing DB schema (new or legacy) already supported by this file.
+- Tokens can be passed via `Authorization: Bearer <token>` or `?token=<token>` (dev convenience).
+- `web serve --token ...` provides a default token if the browser doesn't send one.
 """
 
 from __future__ import annotations
@@ -30,39 +33,25 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import mimetypes
 import os
 import shutil
 import sqlite3
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# Billing access (optional; required only when --token is used)
-try:
-    from mgc.billing_access import resolve_access, AccessContext  # type: ignore
-except Exception as _e:
-    resolve_access = None  # type: ignore
-    AccessContext = None  # type: ignore
-    _BILLING_ACCESS_IMPORT_ERROR = str(_e)
-else:
-    _BILLING_ACCESS_IMPORT_ERROR = None
 
+WEB_MANIFEST_VERSION = 2
+WEB_MANIFEST_SCHEMA = "mgc.web_manifest.v2"
 
-# ---------------------------------------------------------------------
-# Optional imports (keep web_cli importable in CI/minimal environments)
-# ---------------------------------------------------------------------
 
 def _try_import_stable_json() -> Optional[Any]:
-    for mod_name, fn_name in (
-        ("mgc.util", "stable_json"),
-        ("mgc.util", "stable_json_dumps"),
-    ):
+    for name in ("orjson",):
         try:
-            mod = __import__(mod_name, fromlist=[fn_name])
-            return getattr(mod, fn_name)
+            return __import__(name)
         except Exception:
             continue
     return None
@@ -70,80 +59,29 @@ def _try_import_stable_json() -> Optional[Any]:
 
 def _try_import_die() -> Optional[Any]:
     try:
-        mod = __import__("mgc.util", fromlist=["die"])
-        return getattr(mod, "die")
+        from mgc.util import die  # type: ignore
+        return die
     except Exception:
         return None
 
 
-_STABLE_JSON = _try_import_stable_json()
-_DIE = _try_import_die()
-
-
 def _die(msg: str, code: int = 2) -> None:
-    # Prefer project die() if available; otherwise print something.
-    if _DIE:
-        try:
-            _DIE(msg)
-        except Exception:
-            pass
-    else:
-        sys.stderr.write(str(msg).rstrip() + "\n")
-    se = SystemExit(code)
-    # Attach message so callers can record deterministic evidence.
-    try:
-        setattr(se, "msg", str(msg))
-    except Exception:
-        pass
-    raise se
+    die_fn = _try_import_die()
+    if die_fn:
+        die_fn(msg, code)
+    raise SystemExit(code)
+
 
 def _stable_json_dumps(obj: Any) -> str:
-    if _STABLE_JSON:
-        try:
-            s = _STABLE_JSON(obj)
-            if isinstance(s, str):
-                return s
-        except Exception:
-            pass
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-def _write_billing_evidence(
-    out_dir: Path,
-    *,
-    token: str,
-    ok: bool,
-    reason: str,
-    action: str = "web.build",
-    user_id: Optional[str] = None,
-    tier: Optional[str] = None,
-    entitlements: Optional[Sequence[str]] = None,
-) -> None:
-    """Write a small, deterministic-ish billing decision evidence file.
-
-    This is intentionally separate from append-only billing receipts (which live under
-    billing_cli). Web evidence is a convenient artifact for CI / debugging and can be
-    shipped alongside the built web bundle.
     """
-    ev_dir = out_dir / "evidence"
-    ev_dir.mkdir(parents=True, exist_ok=True)
+    Deterministic JSON output (sorted keys, stable separators).
+    Uses orjson if available, otherwise json.
+    """
+    orjson = _try_import_stable_json()
+    if orjson:
+        return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-    ev = {
-        "schema": "mgc.billing_evidence.v1",
-        "action": action,
-        "token": token,
-        "input": {"token": token},
-        "decision": {
-            "ok": ok,
-            "reason": reason,
-            "user_id": user_id,
-            "tier": tier,
-            "entitlements": list(entitlements) if entitlements is not None else None,
-        },
-    }
-
-    p = ev_dir / "billing_evidence.json"
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(ev, f, indent=2, sort_keys=True)
 
 def _sha256_hex_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -152,248 +90,153 @@ def _sha256_hex_str(s: str) -> str:
 def _sha256_file(p: Path) -> str:
     h = hashlib.sha256()
     with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 256), b""):
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _deterministic_now_iso(deterministic: bool) -> str:
-    env_ts = (os.environ.get("MGC_DETERMINISTIC_TS") or "").strip()
-    if env_ts:
-        return env_ts
+def _deterministic_now_iso() -> str:
+    return datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat(timespec="seconds")
+
+
+def _manifest_generated_at(playlist_obj: Dict[str, Any], deterministic: bool) -> str:
     if deterministic:
-        return "2020-01-01T00:00:00+00:00"
+        return _deterministic_now_iso()
+    for k in ("date", "generated_at", "created_at", "ts"):
+        v = playlist_obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return _utc_now_iso()
 
-def _manifest_generated_at(playlist_obj: Any, deterministic: bool) -> str:
-    """
-    Choose a deterministic generated_at whenever possible.
-
-    Priority:
-      1) MGC_DETERMINISTIC_TS (handled by _deterministic_now_iso)
-      2) If deterministic flag set: fixed timestamp
-      3) If playlist has a stable 'ts' field: use that (common in pipeline outputs)
-      4) Otherwise: wall clock UTC now
-    """
-    if deterministic:
-        return _deterministic_now_iso(True)
-    if isinstance(playlist_obj, dict):
-        ts = playlist_obj.get("ts")
-        if isinstance(ts, str) and ts.strip():
-            # Trust playlist ts to be stable if present.
-            return ts.strip()
-    return _utc_now_iso()
-
-
-
-# ---------------------------------------------------------------------
-# Billing gate (token -> require pro entitlement)
-# ---------------------------------------------------------------------
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    p = Path(str(db_path or "")).expanduser()
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
-    if not str(p):
-        _die("billing_db path is empty", 2)
-    if not p.exists():
-        _die(f"billing_db not found: {p}", 2)
-    con = sqlite3.connect(str(p))
+    con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     return con
 
 
-def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
     row = con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
     ).fetchone()
-    return row is not None
+    return bool(row)
 
 
-def _resolve_billing_db_strict(args: argparse.Namespace) -> str:
-    raw = getattr(args, "billing_db", None)
-    if raw:
-        return str(raw).strip()
-
-    env = (os.environ.get("MGC_BILLING_DB") or "").strip()
-    if env:
-        return env
-
-    db = (getattr(args, "db", "") or "").strip()
-    if db:
-        return db
-
-    return ""
+def _ensure_portable_relpath(relpath: str) -> None:
+    rel = Path(relpath)
+    if rel.is_absolute():
+        _die(f"unsafe relpath (absolute): {relpath}", 2)
+    parts = rel.parts
+    if any(p in ("..", "") for p in parts):
+        _die(f"unsafe relpath (traversal): {relpath}", 2)
 
 
-def _billing_require_pro(con: sqlite3.Connection, token: str) -> None:
-    token = (token or "").strip()
-    if not token:
-        _die("token is empty", 2)
-
-    def _looks_hex64(s: str) -> bool:
-        if len(s) != 64:
-            return False
-        try:
-            int(s, 16)
-            return True
-        except Exception:
-            return False
-
-    # New billing schema (preferred)
-    if _table_exists(con, "billing_tokens") and _table_exists(con, "billing_entitlements"):
-        # Support either a raw token (hashed in DB) or a token_sha256 already.
-        candidates: list[str]
-        if _looks_hex64(token):
-            candidates = [token.lower(), hashlib.sha256(token.encode('utf-8')).hexdigest()]
-        else:
-            candidates = [hashlib.sha256(token.encode('utf-8')).hexdigest()]
-
-        row = None
-        for cand in candidates:
-            row = con.execute(
-                "SELECT token_sha256, user_id FROM billing_tokens WHERE token_sha256=? LIMIT 1",
-                (cand,),
-            ).fetchone()
-            if row:
-                break
-
-        if not row:
-            _die("billing denied: invalid token", 2)
-
-        token_sha = row["token_sha256"]
-        user_id = row["user_id"]
-
-        # Optional revocations table
-        if _table_exists(con, "billing_token_revocations"):
-            revoked = con.execute(
-                "SELECT 1 FROM billing_token_revocations WHERE token_sha256=? LIMIT 1",
-                (token_sha,),
-            ).fetchone()
-            if revoked:
-                _die("billing denied: token revoked", 2)
-
-        now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        ent = con.execute(
-            """
-            SELECT tier, starts_ts, ends_ts
-            FROM billing_entitlements
-            WHERE user_id=?
-              AND starts_ts <= ?
-              AND (ends_ts IS NULL OR ends_ts > ?)
-            ORDER BY starts_ts DESC
-            LIMIT 1
-            """,
-            (user_id, now_ts, now_ts),
-        ).fetchone()
-
-        if not ent:
-            _die("billing denied: no active entitlement", 2)
-
-        tier = str(ent["tier"] or "").strip().lower()
-        if tier != "pro":
-            _die(f"billing denied: requires pro (tier={tier!r})", 2)
-
-        return
-
-    # Legacy schema
-    if _table_exists(con, "tokens") and _table_exists(con, "entitlements"):
-        row = con.execute(
-            "SELECT user_id, revoked_at FROM tokens WHERE token=?",
-            (token,),
-        ).fetchone()
-        if not row:
-            _die("billing denied: invalid token", 2)
-        if row["revoked_at"]:
-            _die("billing denied: token revoked", 2)
-
-        user_id = row["user_id"]
-        ent = con.execute(
-            "SELECT tier, active FROM entitlements WHERE user_id=? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        if not ent:
-            _die("billing denied: no entitlements", 2)
-
-        tier = str(ent["tier"] or "").strip().lower()
-        active = int(ent["active"] or 0)
-        if tier != "pro" or active != 1:
-            _die(f"billing denied: requires pro (tier={tier!r}, active={active})", 2)
-        return
-
-    _die("billing_db missing required table: tokens (or billing_tokens)", 2)
-
-def _require_pro_if_token(args: argparse.Namespace) -> "AccessContext":
-    """If args.token is provided, enforce billing access.
-
-    Policy:
-      - token must resolve successfully
-      - allow if tier == "pro" OR user has entitlement "web"
+def _tree_hash(root: Path) -> str:
     """
-    token = getattr(args, "token", None)
-    if not token:
-        _die("token is empty", 2)
+    Content-based tree hash: sha256 over sorted (relpath, file_sha256).
+    """
+    items: List[Tuple[str, str]] = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            items.append((rel, _sha256_file(p)))
+    payload = _stable_json_dumps(items)
+    return _sha256_hex_str(payload)
 
-    if resolve_access is None:
-        msg = _BILLING_ACCESS_IMPORT_ERROR or "mgc.billing_access unavailable"
-        _die(f"billing denied: cannot import billing_access: {msg}", 2)
-
-    db_path = _resolve_billing_db_strict(args)
-    if not db_path:
-        _die("billing denied: missing billing db path (use --billing-db or MGC_BILLING_DB)", 2)
-
-    ctx = resolve_access(billing_db=str(db_path), token=str(token))
-    if not getattr(ctx, "ok", False):
-        _die(f"billing denied: {getattr(ctx, 'reason', 'unknown')}", 2)
-
-    # Prefer explicit entitlement gating; allow "pro" as an override to keep older flows working.
-    if (getattr(ctx, "tier", None) != "pro") and ("web" not in set(getattr(ctx, "entitlements", set()))):
-        _die(f"billing denied: requires entitlement 'web' or pro tier (tier={getattr(ctx, 'tier', None)!r})", 2)
-
-    return ctx
-
-
-
-# ---------------------------------------------------------------------
-# Playlist parsing + path resolution
-# ---------------------------------------------------------------------
 
 def _safe_mkdir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _dig_first_str(obj: Any, keys: Sequence[str]) -> str:
-    if not isinstance(obj, dict):
-        return ""
+def _dig_first_str(d: Dict[str, Any], keys: Sequence[str]) -> str:
     for k in keys:
-        v = obj.get(k)
+        v = d.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
 
 
 def _looks_like_audio_path(s: str) -> bool:
-    s = (s or "").lower()
-    return s.endswith(".wav") or s.endswith(".mp3") or s.endswith(".flac") or s.endswith(".m4a")
+    s2 = s.lower().strip()
+    return s2.endswith(".wav") or s2.endswith(".mp3") or s2.endswith(".flac") or s2.endswith(".m4a") or s2.endswith(".aac") or s2.endswith(".ogg")
 
 
-def _iter_track_dicts(playlist_obj: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(playlist_obj, dict):
-        tracks = playlist_obj.get("tracks")
-        if isinstance(tracks, list):
-            for t in tracks:
-                if isinstance(t, dict):
-                    yield t
+def _collect_audio_paths_from_json(obj: Any) -> List[str]:
+    out: List[str] = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            out.extend(_collect_audio_paths_from_json(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_audio_paths_from_json(item))
+    elif isinstance(obj, str) and _looks_like_audio_path(obj):
+        out.append(obj)
+    return out
 
 
-def _collect_playlist_track_entries(playlist_obj: Any) -> List[Dict[str, Any]]:
+def _infer_track_paths_from_obj(track_obj: Dict[str, Any]) -> List[str]:
+    for k in ("web_path", "path", "artifact_path", "preview_path", "full_path", "audio_path", "wav", "mp3"):
+        v = track_obj.get(k)
+        if isinstance(v, str) and _looks_like_audio_path(v):
+            return [v]
+    return _collect_audio_paths_from_json(track_obj)
+
+
+def _prefer_mp3_path(p: Path) -> Path:
+    if p.suffix.lower() == ".wav":
+        mp3 = p.with_suffix(".mp3")
+        if mp3.exists():
+            return mp3
+    return p
+
+
+def _resolve_track_paths_from_db(con: sqlite3.Connection, track_ids: Sequence[str]) -> Dict[str, str]:
+    """
+    Map track_id -> best path column (prefers full_path; falls back to preview_path).
+    """
+    if not track_ids:
+        return {}
+    if not _table_exists(con, "tracks"):
+        return {}
+
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)").fetchall()}
+    if not cols or "id" not in cols:
+        return {}
+
+    candidates: List[str] = []
+    for col in ("full_path", "preview_path", "path"):
+        if col in cols:
+            candidates.append(col)
+    if not candidates:
+        return {}
+
+    col = candidates[0]
+    q = f"SELECT id, {col} AS p FROM tracks WHERE id IN ({','.join(['?'] * len(track_ids))})"
+    rows = con.execute(q, list(track_ids)).fetchall()
+    out: Dict[str, str] = {}
+    for r in rows:
+        tid = str(r["id"])
+        p = r["p"]
+        if isinstance(p, str) and p.strip():
+            out[tid] = p.strip()
+    return out
+
+
+def _iter_track_dicts(playlist_obj: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for key in ("tracks", "items", "playlist", "entries"):
+        v = playlist_obj.get(key)
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    yield item
+
+
+def _collect_entries(playlist_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     for idx, t in enumerate(_iter_track_dicts(playlist_obj)):
         track_id = _dig_first_str(t, ("track_id", "id"))
@@ -432,196 +275,66 @@ def _resolve_input_path(raw: str, *, playlist_dir: Path, repo_root: Path) -> Pat
         return Path(s).expanduser()
 
 
-def _prefer_mp3_path(p: Path) -> Path:
-    if not p:
-        return p
-    if p.suffix.lower() != ".wav":
-        return p
-    mp3 = p.with_suffix(".mp3")
-    if mp3.exists():
-        return mp3
-    return p
-
-
-def _resolve_track_paths_from_db(db_path: str, track_ids: List[str]) -> Tuple[Dict[str, str], Dict[str, Any]]:
+def _find_track_file(
+    *,
+    track_id: str,
+    playlist_dir: Path,
+    repo_root: Path,
+    prefer_mp3: bool,
+) -> Optional[Path]:
     """
-    Resolve track IDs -> file paths from the main DB.
+    Last-resort resolver when playlist paths + DB paths don't exist.
 
-    Fixtures schema:
-      tracks(track_id TEXT PRIMARY KEY, ..., artifact_path TEXT, ...)
-
-    Returns:
-      mapping: {track_id: artifact_path}
-      meta: diagnostics
+    Tries a small set of common layouts (kept deterministic and reasonably fast):
+    - <playlist_dir>/tracks/<id>.(wav|mp3)
+    - <playlist_dir>/drop_bundle/tracks/<id>.(wav|mp3)
+    - <repo_root>/data/tracks/**/<id>.(wav|mp3)   (date-sharded)
+    - <repo_root>/artifacts/**/<id>.(wav|mp3)     (CI / runs)
     """
-    meta: Dict[str, Any] = {"source": "db", "db_path": str(db_path or ""), "count": 0}
-    db_path = (db_path or "").strip()
-    if not db_path:
-        return {}, meta
+    tid = (track_id or "").strip()
+    if not tid:
+        return None
 
-    p = Path(db_path).expanduser()
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
-    meta["db_path"] = str(p)
-    if not p.exists():
-        return {}, meta
+    exts = [".mp3", ".wav"] if prefer_mp3 else [".wav", ".mp3"]
 
-    con = sqlite3.connect(str(p))
-    con.row_factory = sqlite3.Row
-    try:
-        if not _table_exists(con, "tracks"):
-            return {}, meta
-        out: Dict[str, str] = {}
-        for tid in track_ids:
-            tid = (tid or "").strip()
-            if not tid or tid in out:
-                continue
-            row = con.execute(
-                "SELECT track_id, artifact_path FROM tracks WHERE track_id=? LIMIT 1",
-                (tid,),
-            ).fetchone()
-            if not row:
-                continue
-            cand = (row["artifact_path"] or "").strip()
-            if cand:
-                out[tid] = cand
-        meta["count"] = len(out)
-        return out, meta
-    finally:
-        con.close()
+    fast: List[Path] = []
+    for ext in exts:
+        fast.extend([
+            playlist_dir / "tracks" / f"{tid}{ext}",
+            playlist_dir / "drop_bundle" / "tracks" / f"{tid}{ext}",
+            repo_root / "data" / "tracks" / f"{tid}{ext}",
+        ])
 
+    for p in fast:
+        if p.exists():
+            return p.resolve()
 
-def _collect_audio_paths_from_json(obj: Any) -> List[str]:
-    out: List[str] = []
-    if isinstance(obj, str):
-        s = obj.strip()
-        if s and _looks_like_audio_path(s):
-            out.append(s)
-    elif isinstance(obj, list):
-        for x in obj:
-            out.extend(_collect_audio_paths_from_json(x))
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            out.extend(_collect_audio_paths_from_json(v))
-
-    seen: set[str] = set()
-    uniq: List[str] = []
-    for p in out:
-        if p not in seen:
-            uniq.append(p)
-            seen.add(p)
-    return uniq
-
-
-def _infer_track_paths_from_sibling_files(playlist_path: Path) -> List[str]:
-    playlist_dir = playlist_path.parent
-    candidates = [
-        playlist_dir / "drop_evidence.json",
-        playlist_dir / "manifest.json",
-        playlist_dir / "contract_report.json",
+    roots = [
+        repo_root / "data" / "tracks",
+        repo_root / "artifacts",
     ]
-    for c in candidates:
-        if not c.exists():
+    for root in roots:
+        if not root.exists():
             continue
-        try:
-            obj = json.loads(c.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        paths = _collect_audio_paths_from_json(obj)
+        for ext in exts:
+            needle = f"{tid}{ext}"
+            try:
+                for p in root.rglob(needle):
+                    if p.is_file():
+                        return p.resolve()
+            except Exception:
+                continue
 
-        # Prefer paths that actually exist:
-        existing: List[str] = []
-        for p in paths:
-            pp = Path(p)
-            if pp.is_absolute():
-                if pp.exists():
-                    existing.append(str(pp))
-            else:
-                rel = playlist_dir / pp
-                if rel.exists():
-                    existing.append(str(rel))
-        if existing:
-            return existing
-    return []
-
-
-# ---------------------------------------------------------------------
-# Web bundle manifest hardening
-# ---------------------------------------------------------------------
-
-WEB_MANIFEST_SCHEMA = "mgc.web_manifest.v2"
-WEB_MANIFEST_VERSION = 2
-
-_FORBIDDEN_PATH_FRAGMENTS = (
-    "/Users/",
-    "/private/tmp",
-    "file://",
-    "\\",
-)
-
-# Exclude manifest from content tree hash to avoid self-reference.
-_TREE_HASH_EXCLUDE = {"web_manifest.json"}
-
-
-def _ensure_portable_relpath(rel: str) -> None:
-    if not rel or not isinstance(rel, str):
-        _die("web manifest contains empty relpath", 2)
-    if rel.startswith("/") or "://" in rel:
-        _die(f"web manifest contains non-relative path: {rel}", 2)
-    for bad in _FORBIDDEN_PATH_FRAGMENTS:
-        if bad in rel:
-            _die(f"web manifest contains forbidden path fragment: {bad} in {rel}", 2)
-    if "\\" in rel:
-        _die(f"web manifest contains backslashes: {rel}", 2)
-
-
-def _tree_hash(root: Path) -> str:
-    rows: List[str] = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(root).as_posix()
-        if rel in _TREE_HASH_EXCLUDE:
-            continue
-        rows.append(f"{rel}:{_sha256_file(p)}")
-    h = hashlib.sha256()
-    for r in rows:
-        h.update(r.encode("utf-8"))
-    return h.hexdigest()
-
-
-@dataclass(frozen=True)
-class _BundledTrack:
-    index: int
-    track_id: str
-    title: str
-    src_path: str
-    relpath: str
-    sha256: str
-    bytes: int
+    return None
 
 
 def _build_web_manifest(
     *,
     out_dir: Path,
     playlist_obj: Dict[str, Any],
-    bundled_tracks: List[_BundledTrack],
+    tracks_payload: List[Dict[str, Any]],
     deterministic: bool,
 ) -> Dict[str, Any]:
-    tracks_payload: List[Dict[str, Any]] = []
-    for bt in bundled_tracks:
-        _ensure_portable_relpath(bt.relpath)
-        tracks_payload.append({
-            "index": bt.index,
-            "track_id": bt.track_id,
-            "title": bt.title,
-            "relpath": bt.relpath,
-            "sha256": bt.sha256,
-            "bytes": bt.bytes,
-        })
-
     playlist_sha = _sha256_hex_str(_stable_json_dumps(playlist_obj))
     web_tree = _tree_hash(out_dir)
 
@@ -635,250 +348,103 @@ def _build_web_manifest(
     }
 
 
-def _validate_web_manifest(manifest: Dict[str, Any], *, out_dir: Path) -> None:
-    if not isinstance(manifest, dict):
-        _die("web manifest is not an object", 2)
-    if manifest.get("schema") != WEB_MANIFEST_SCHEMA:
-        _die("web manifest schema mismatch", 2)
-    if int(manifest.get("version") or 0) != WEB_MANIFEST_VERSION:
-        _die("web manifest version mismatch", 2)
+def _validate_web_manifest(out_dir: Path, manifest: Dict[str, Any]) -> None:
+    schema = manifest.get("schema")
+    version = manifest.get("version")
+    if schema != WEB_MANIFEST_SCHEMA:
+        _die(f"web_manifest schema mismatch: got {schema!r} expected {WEB_MANIFEST_SCHEMA!r}", 2)
+    if int(version or 0) != WEB_MANIFEST_VERSION:
+        _die(f"web_manifest version mismatch: got {version!r} expected {WEB_MANIFEST_VERSION!r}", 2)
 
     tracks = manifest.get("tracks")
-    if not isinstance(tracks, list) or not tracks:
-        _die("web manifest missing tracks", 2)
+    if not isinstance(tracks, list):
+        _die("web_manifest invalid: tracks must be a list", 2)
 
     for t in tracks:
         if not isinstance(t, dict):
-            _die("web manifest track entry is not an object", 2)
-        rel = t.get("relpath")
-        _ensure_portable_relpath(rel)
-        fpath = out_dir / rel
-        if not fpath.exists():
-            _die(f"web manifest references missing file: {rel}", 2)
+            _die("web_manifest invalid: track entry must be a dict", 2)
+        relpath = str(t.get("relpath") or "")
+        sha = str(t.get("sha256") or "")
+        if not relpath or not sha:
+            _die("web_manifest invalid: track missing relpath/sha256", 2)
+        _ensure_portable_relpath(relpath)
+        p = (out_dir / relpath).resolve()
+        if not p.exists():
+            _die(f"web_manifest invalid: missing file {relpath}", 2)
+        got = _sha256_file(p)
+        if got != sha:
+            _die(f"web_manifest invalid: hash mismatch for {relpath} got={got} expected={sha}", 2)
 
-        expected = str(t.get("sha256") or "").strip()
-        if not expected:
-            _die(f"web manifest missing sha256 for {rel}", 2)
-        actual = _sha256_file(fpath)
-        if actual != expected:
-            _die(f"sha256 mismatch for {rel}: expected {expected} got {actual}", 2)
+    got_tree = _tree_hash(out_dir)
+    exp_tree = str(manifest.get("web_tree_sha256") or "")
+    if exp_tree and got_tree != exp_tree:
+        _die(f"web_manifest invalid: web_tree_sha256 mismatch got={got_tree} expected={exp_tree}", 2)
 
-        expected_bytes = int(t.get("bytes") or 0)
-        actual_bytes = int(fpath.stat().st_size)
-        if expected_bytes != actual_bytes:
-            _die(f"bytes mismatch for {rel}: expected {expected_bytes} got {actual_bytes}", 2)
-
-    expected_tree = str(manifest.get("web_tree_sha256") or "").strip()
-    if not expected_tree:
-        _die("web manifest missing web_tree_sha256", 2)
-    actual_tree = _tree_hash(out_dir)
-    if actual_tree != expected_tree:
-        _die(f"web_tree_sha256 mismatch: expected {expected_tree} got {actual_tree}", 2)
-
-
-# ---------------------------------------------------------------------
-# HTML (minimal player)
-# ---------------------------------------------------------------------
-
-_INDEX_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>MGC Player</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    .track { padding: 12px 0; border-bottom: 1px solid #eee; display: flex; gap: 12px; align-items: center; }
-    .title { flex: 1; }
-    audio { width: 360px; max-width: 100%; }
-    .meta { font-size: 12px; color: #666; }
-  </style>
-</head>
-<body>
-  <h1>MGC Player</h1>
-  <div id="app"><p>Loading…</p></div>
-
-  <script>
-    async function loadJson(path) {
-      const r = await fetch(path, { cache: "no-store" });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return await r.json();
-    }
-
-    function el(tag, cls) {
-      const e = document.createElement(tag);
-      if (cls) e.className = cls;
-      return e;
-    }
-
-    (async () => {
-      const app = document.getElementById("app");
-      let playlist;
-      try {
-        playlist = await loadJson("./playlist.json");
-      } catch (e) {
-        app.innerHTML = "<p>Failed to load playlist.json</p>";
-        return;
-      }
-
-      const tracks = (playlist && playlist.tracks) ? playlist.tracks : [];
-      if (!Array.isArray(tracks) || tracks.length === 0) {
-        app.innerHTML = "<p>No tracks found in playlist.json</p>";
-        return;
-      }
-
-      app.innerHTML = "";
-      for (const t of tracks) {
-        const row = el("div", "track");
-        const title = el("div", "title");
-        title.textContent = t.title || t.track_id || "Track";
-
-        const audio = document.createElement("audio");
-        audio.controls = true;
-        audio.preload = "none";
-        audio.src = t.web_path || t.path || "";
-
-        const meta = el("div", "meta");
-        meta.textContent = audio.src;
-
-        row.appendChild(title);
-        row.appendChild(audio);
-        row.appendChild(meta);
-        app.appendChild(row);
-      }
-    })();
-  </script>
-</body>
-</html>
-"""
-
-
-# ---------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------
 
 def cmd_web_build(args: argparse.Namespace) -> int:
-    playlist_path = Path(str(args.playlist)).expanduser().resolve()
-    if not playlist_path.exists():
-        sys.stdout.write(_stable_json_dumps({
-            "ok": False,
-            "reason": "playlist_not_found",
-            "playlist": str(playlist_path),
-        }) + "\n")
-        return 2
+    playlist_path = Path(str(getattr(args, "playlist"))).expanduser().resolve()
+    out_dir = Path(str(getattr(args, "out_dir"))).expanduser().resolve()
 
-    
-
-    out_dir = Path(str(args.out_dir)).expanduser().resolve()
-    tracks_dir = out_dir / "tracks"
-    manifest_path = out_dir / "web_manifest.json"
-    out_playlist_path = out_dir / "playlist.json"
-    index_path = out_dir / "index.html"
-
-    if bool(getattr(args, "clean", False)) and out_dir.exists():
+    if getattr(args, "clean", False) and out_dir.exists():
         shutil.rmtree(out_dir)
 
-    _safe_mkdir(tracks_dir)
-    token = getattr(args, "token", None)
-    if token:
-        try:
-            ctx = _require_pro_if_token(args)
-            _write_billing_evidence(
-                out_dir,
-                token=str(token),
-                ok=True,
-                reason="allow",
-                user_id=ctx.user_id,
-                tier=ctx.tier,
-                entitlements=sorted(ctx.entitlements),
-            )
-        except BaseException as e:
-            reason = getattr(e, "msg", None) or str(e)
-            _write_billing_evidence(
-                out_dir,
-                token=str(token),
-                ok=False,
-                reason=reason,
-            )
-            sys.stdout.write(_stable_json_dumps({
-                "ok": False,
-                "reason": "billing_denied",
-                "error": reason,
-                "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
-            }) + "\n")
-            return 2
+    _safe_mkdir(out_dir)
 
+    if not playlist_path.exists():
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "playlist_missing", "playlist": str(playlist_path)}) + "\n")
+        return 2
+
+    repo_root = Path(str(getattr(args, "repo_root", "."))).expanduser().resolve()
+    playlist_dir = playlist_path.parent
+
+    playlist_obj = json.loads(playlist_path.read_text(encoding="utf-8"))
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
-    strip_paths = bool(getattr(args, "strip_paths", False))
     fail_if_empty = bool(getattr(args, "fail_if_empty", False))
     fail_if_none_copied = bool(getattr(args, "fail_if_none_copied", False))
     fail_on_missing = bool(getattr(args, "fail_on_missing", False))
     deterministic = bool(getattr(args, "deterministic", False))
 
-    playlist_obj = json.loads(playlist_path.read_text(encoding="utf-8"))
-    entries = _collect_playlist_track_entries(playlist_obj)
-
+    entries = _collect_entries(playlist_obj)
     if fail_if_empty and not entries:
-        sys.stdout.write(_stable_json_dumps({
-            "ok": False,
-            "reason": "empty_playlist",
-            "playlist": str(playlist_path),
-        }) + "\n")
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "empty_playlist"}) + "\n")
         return 2
 
-    playlist_dir = playlist_path.parent
+    db_map: Dict[str, str] = {}
+    db_raw = str(getattr(args, "db", "") or "").strip()
+    if db_raw:
+        db_path = _resolve_input_path(db_raw, playlist_dir=playlist_dir, repo_root=repo_root)
+        if db_path.exists():
+            try:
+                con = _connect(str(db_path))
+                try:
+                    ids = [e["track_id"] for e in entries if e.get("track_id")]
+                    db_map = _resolve_track_paths_from_db(con, ids)
+                finally:
+                    con.close()
+            except Exception:
+                db_map = {}
 
-    # Determine repo_root (best effort)
-    repo_root = Path.cwd().resolve()
-    db_path = (getattr(args, "db", "") or "").strip()
-    if db_path:
-        try:
-            dbp = Path(db_path).expanduser().resolve()
-            if dbp.parent.name == "data":
-                repo_root = dbp.parent.parent
-            else:
-                repo_root = dbp.parent
-        except Exception:
-            pass
+    tracks_dir = out_dir / "tracks"
+    _safe_mkdir(tracks_dir)
 
-    # DB mapping: track_id -> artifact_path
-    track_ids = [e["track_id"] for e in entries if e.get("track_id")]
-    id_to_db_path, db_meta = _resolve_track_paths_from_db(db_path=db_path, track_ids=track_ids)
-
-    # Evidence fallback: if playlist is placeholder-only, infer real audio paths
-    inferred_paths = _infer_track_paths_from_sibling_files(playlist_path)
-
+    bundled: List[Dict[str, Any]] = []
     copied = 0
     missing = 0
-    bundled: List[Dict[str, Any]] = []
-    bundled_tracks: List[_BundledTrack] = []
-    out_tracks_for_playlist: List[Dict[str, Any]] = []
 
     for e in entries:
-        i = int(e["index"])
-        track_id = (e.get("track_id") or "").strip()
-        title = (e.get("title") or "").strip() or track_id or f"Track {i+1}"
-        raw = (e.get("raw_path") or "").strip()
+        i = int(e.get("index", 0))
+        track_id = str(e.get("track_id") or "").strip()
+        title = str(e.get("title") or track_id or "").strip()
+        raw = str(e.get("raw_path") or "").strip()
 
         attempted: List[str] = []
         src_path: Optional[Path] = None
-        resolved_from = ""
+        resolved_from: Optional[str] = None
 
-        # 1) resolve from playlist path if it exists
-        if raw:
-            rp = _resolve_input_path(raw, playlist_dir=playlist_dir, repo_root=repo_root)
-            if prefer_mp3:
-                rp = _prefer_mp3_path(rp)
-            attempted.append(str(rp))
-            if rp.exists() and rp.is_file():
-                src_path = rp
-                resolved_from = "playlist"
-
-        # 2) fallback to DB artifact_path using track_id
-        if (src_path is None or (not src_path.exists())) and track_id and track_id in id_to_db_path:
-            db_raw = id_to_db_path[track_id]
-            rp = _resolve_input_path(db_raw, playlist_dir=playlist_dir, repo_root=repo_root)
+        # 1) Prefer DB mapping for the track_id
+        if track_id and track_id in db_map:
+            rp = _resolve_input_path(db_map[track_id], playlist_dir=playlist_dir, repo_root=repo_root)
             if prefer_mp3:
                 rp = _prefer_mp3_path(rp)
             attempted.append(str(rp))
@@ -886,19 +452,29 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                 src_path = rp
                 resolved_from = "db"
 
-        # 3) evidence inference fallback (use first inferred path)
-        if (src_path is None or (not src_path.exists())) and inferred_paths:
-            rp = Path(inferred_paths[0]).expanduser()
-            try:
-                rp = rp.resolve()
-            except Exception:
-                pass
-            if prefer_mp3:
-                rp = _prefer_mp3_path(rp)
-            attempted.append(str(rp))
-            if rp.exists() and rp.is_file():
-                src_path = rp
-                resolved_from = "evidence"
+        # 2) Fall back to playlist-provided path(s)
+        if src_path is None:
+            candidates: List[str] = []
+            if raw:
+                candidates.append(raw)
+            candidates.extend(_infer_track_paths_from_obj(e.get("track_obj") or {}))
+            for c in candidates:
+                rp = _resolve_input_path(c, playlist_dir=playlist_dir, repo_root=repo_root)
+                if prefer_mp3:
+                    rp = _prefer_mp3_path(rp)
+                attempted.append(str(rp))
+                if rp.exists() and rp.is_file():
+                    src_path = rp
+                    resolved_from = "playlist"
+                    break
+
+        # 3) Final fallback: search by track_id in common layouts.
+        if src_path is None and track_id:
+            fb = _find_track_file(track_id=track_id, playlist_dir=playlist_dir, repo_root=repo_root, prefer_mp3=prefer_mp3)
+            if fb is not None and fb.exists() and fb.is_file():
+                attempted.append(str(fb))
+                src_path = fb
+                resolved_from = "search"
 
         if src_path is None or (not src_path.exists()) or (not src_path.is_file()):
             missing += 1
@@ -918,128 +494,411 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     "reason": "missing_track",
                     "index": i,
                     "track_id": track_id,
-                    "source": raw,
+                    "title": title,
                     "attempted": attempted,
-                    "db_meta": db_meta,
-                    "inferred_paths": inferred_paths,
                 }) + "\n")
                 return 2
             continue
 
-        # Deterministic destination naming:
-        placeholder_id = (track_id.startswith("00000000-0000-0000-0000-") and track_id.endswith("000000000001"))
-        if track_id and not placeholder_id:
-            dest_name = f"{track_id}{src_path.suffix.lower()}"
-            out_track_id = track_id
-        else:
-            dest_name = src_path.name
-            out_track_id = src_path.stem
+        ext = src_path.suffix.lower()
+        if ext not in (".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"):
+            ext = src_path.suffix.lower() or ".bin"
 
-        dest = tracks_dir / dest_name
-        shutil.copyfile(str(src_path), str(dest))
+        dst_name = f"{track_id or f'index_{i}'}{ext}"
+        relpath = f"tracks/{dst_name}"
+        _ensure_portable_relpath(relpath)
+        dst = (out_dir / relpath).resolve()
 
-        rel = f"tracks/{dest.name}"
-        _ensure_portable_relpath(rel)
-
-        sha = _sha256_file(dest)
-        size = int(dest.stat().st_size)
-
-        bundled.append({
-            "index": i,
-            "ok": True,
-            "track_id": out_track_id,
-            "title": title,
-            "source": str(Path("tracks") / src_path.name) if strip_paths else str(src_path),
-            "dest": rel,
-            "web_path": rel,
-            "resolved_from": resolved_from,
-            "sha256": sha,
-            "bytes": size,
-        })
-
-        bundled_tracks.append(_BundledTrack(
-            index=i,
-            track_id=out_track_id,
-            title=title,
-            src_path=str(src_path),
-            relpath=rel,
-            sha256=sha,
-            bytes=size,
-        ))
-
-        out_tracks_for_playlist.append({
-            "title": title,
-            "track_id": out_track_id,
-            "path": rel,
-            "web_path": rel,
-            "sha256": sha,
-            "bytes": size,
-        })
-
-        copied += 1
+        try:
+            shutil.copy2(src_path, dst)
+            sha = _sha256_file(dst)
+            size = dst.stat().st_size
+            bundled.append({
+                "index": i,
+                "ok": True,
+                "reason": "ok",
+                "track_id": track_id,
+                "title": title,
+                "relpath": relpath,
+                "sha256": sha,
+                "bytes": size,
+                "resolved_from": resolved_from,
+            })
+            copied += 1
+        except Exception as ex:
+            missing += 1
+            bundled.append({
+                "index": i,
+                "ok": False,
+                "reason": "copy_failed",
+                "track_id": track_id,
+                "title": title,
+                "source": raw,
+                "attempted": attempted,
+                "error": str(ex),
+            })
+            if fail_on_missing:
+                sys.stdout.write(_stable_json_dumps({
+                    "ok": False,
+                    "reason": "copy_failed",
+                    "index": i,
+                    "track_id": track_id,
+                    "title": title,
+                    "error": str(ex),
+                }) + "\n")
+                return 2
 
     if fail_if_none_copied and copied == 0:
         sys.stdout.write(_stable_json_dumps({
             "ok": False,
             "reason": "none_copied",
-            "playlist": str(playlist_path),
-            "missing": missing,
-            "bundled": bundled,
-            "db_meta": db_meta,
-            "inferred_paths": inferred_paths,
+            "missing": [x for x in bundled if not x.get("ok")],
         }) + "\n")
         return 2
 
-    out_playlist = dict(playlist_obj) if isinstance(playlist_obj, dict) else {"tracks": []}
-    out_playlist["tracks"] = out_tracks_for_playlist
-    out_playlist_path.write_text(_stable_json_dumps(out_playlist), encoding="utf-8")
+    tracks_payload: List[Dict[str, Any]] = []
+    for t in bundled:
+        if not t.get("ok"):
+            continue
+        tracks_payload.append({
+            "index": t.get("index"),
+            "track_id": t.get("track_id"),
+            "title": t.get("title"),
+            "relpath": t.get("relpath"),
+            "sha256": t.get("sha256"),
+            "bytes": t.get("bytes"),
+        })
 
-    index_path.write_text(_INDEX_HTML, encoding="utf-8")
+    manifest = _build_web_manifest(out_dir=out_dir, playlist_obj=playlist_obj, tracks_payload=tracks_payload, deterministic=deterministic)
+    (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
+    (out_dir / "playlist.json").write_text(_stable_json_dumps(playlist_obj) + "\n", encoding="utf-8")
 
-    # Write manifest AFTER other files, but compute tree hash excluding the manifest itself.
-    manifest = _build_web_manifest(
-        out_dir=out_dir,
-        playlist_obj=out_playlist,
-        bundled_tracks=bundled_tracks,
-        deterministic=deterministic,
-    )
-    manifest_path.write_text(_stable_json_dumps(manifest), encoding="utf-8")
+    # Best-effort copy index.html from common template locations if missing
+    if not (out_dir / "index.html").exists():
+        for cand in (
+            repo_root / "web" / "index.html",
+            repo_root / "src" / "mgc" / "web" / "index.html",
+            repo_root / "assets" / "web" / "index.html",
+        ):
+            if cand.exists():
+                shutil.copy2(cand, out_dir / "index.html")
+                break
 
-    # Validate in-place (also checks web_tree_sha256).
-    _validate_web_manifest(manifest, out_dir=out_dir)
+    try:
+        _validate_web_manifest(out_dir, manifest)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "validate_failed", "error": str(ex)}) + "\n")
+        return 2
 
     sys.stdout.write(_stable_json_dumps({
         "ok": True,
         "out_dir": str(out_dir),
-        "index": str(index_path),
-        "playlist_out": str(out_playlist_path),
-        "manifest": str(manifest_path),
-        "copied": copied,
-        "missing": missing,
-        "bundled": bundled,
-        "db_meta": db_meta,
-        "inferred_paths": inferred_paths,
+        "playlist_sha256": manifest.get("playlist_sha256"),
         "web_tree_sha256": manifest.get("web_tree_sha256"),
+        "track_count": copied,
+        "missing_count": missing,
+        "missing": [x for x in bundled if not x.get("ok")],
     }) + "\n")
     return 0
 
 
 def cmd_web_validate(args: argparse.Namespace) -> int:
-    out_dir = Path(str(args.out_dir)).expanduser().resolve()
+    out_dir = Path(str(getattr(args, "out_dir"))).expanduser().resolve()
     manifest_path = out_dir / "web_manifest.json"
     if not manifest_path.exists():
-        _die(f"web_manifest.json missing: {manifest_path}", 2)
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "manifest_missing", "path": str(manifest_path)}) + "\n")
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _validate_web_manifest(out_dir, manifest)
+        sys.stdout.write(_stable_json_dumps({"ok": True}) + "\n")
+        return 0
+    except SystemExit:
+        raise
+    except Exception as ex:
+        sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "validate_failed", "error": str(ex)}) + "\n")
+        return 2
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    _validate_web_manifest(manifest, out_dir=out_dir)
 
-    sys.stdout.write(_stable_json_dumps({
-        "ok": True,
-        "out_dir": str(out_dir),
-        "manifest": str(manifest_path),
-        "web_tree_sha256": _tree_hash(out_dir),
-    }) + "\n")
-    return 0
+def _http_send_json(handler: SimpleHTTPRequestHandler, status: int, obj: Dict[str, Any]) -> None:
+    payload = _stable_json_dumps(obj).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+
+def _http_send_json_head(handler: SimpleHTTPRequestHandler, status: int, obj: Dict[str, Any]) -> None:
+    """
+    HEAD variant: send the same headers as JSON would, but no body.
+    """
+    payload = _stable_json_dumps(obj).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+
+
+def _parse_url(handler: SimpleHTTPRequestHandler) -> Tuple[str, Dict[str, List[str]]]:
+    from urllib.parse import urlparse, parse_qs
+    u = urlparse(handler.path)
+    return u.path, parse_qs(u.query)
+
+
+def _extract_request_token(handler: SimpleHTTPRequestHandler, query: Dict[str, List[str]]) -> Optional[str]:
+    auth = handler.headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        tok = auth.split(None, 1)[1].strip()
+        return tok or None
+    qs_tok = (query.get("token") or [None])[0]
+    if qs_tok:
+        return str(qs_tok).strip() or None
+    return None
+
+
+def _billing_resolve_access(con: sqlite3.Connection, token: str) -> Dict[str, Any]:
+    token = (token or "").strip()
+    if not token:
+        return {"ok": False, "reason": "token_empty", "tier": None, "scopes": []}
+
+    def _looks_hex64(s: str) -> bool:
+        if len(s) != 64:
+            return False
+        try:
+            int(s, 16)
+            return True
+        except Exception:
+            return False
+
+    now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    if _table_exists(con, "billing_tokens") and _table_exists(con, "billing_entitlements"):
+        # Compare sha256(raw_token) to stored token_sha256
+        # If caller accidentally passes a 64-hex token, do NOT assume it's a hash; always hash raw input.
+        token_sha = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+        row = con.execute(
+            "SELECT token_sha256, user_id FROM billing_tokens WHERE token_sha256=? LIMIT 1",
+            (token_sha,),
+        ).fetchone()
+
+        if not row:
+            return {"ok": False, "reason": "invalid_token", "tier": None, "scopes": []}
+
+        token_sha_db = str(row["token_sha256"])
+        user_id = row["user_id"]
+
+        if _table_exists(con, "billing_token_revocations"):
+            revoked = con.execute(
+                "SELECT 1 FROM billing_token_revocations WHERE token_sha256=? LIMIT 1",
+                (token_sha_db,),
+            ).fetchone()
+            if revoked:
+                return {"ok": False, "reason": "token_revoked", "tier": None, "scopes": []}
+
+        ent = con.execute(
+            """
+            SELECT tier, starts_ts, ends_ts
+            FROM billing_entitlements
+            WHERE user_id=?
+              AND starts_ts <= ?
+              AND (ends_ts IS NULL OR ends_ts > ?)
+            ORDER BY starts_ts DESC
+            LIMIT 1
+            """,
+            (user_id, now_ts, now_ts),
+        ).fetchone()
+
+        tier = None
+        if ent:
+            tier = str(ent["tier"] or "").strip().lower() or None
+
+        if tier == "pro":
+            scopes = ["catalog:full", "stream:full"]
+        else:
+            scopes = ["catalog:recent", "stream:preview"]
+
+        return {
+            "ok": True,
+            "reason": "ok",
+            "tier": tier or "free",
+            "user_id": user_id,
+            "token_sha256": token_sha_db,
+            "scopes": scopes,
+        }
+
+    # Legacy schema
+    if _table_exists(con, "tokens") and _table_exists(con, "entitlements"):
+        row = con.execute(
+            "SELECT user_id, revoked_at FROM tokens WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "reason": "invalid_token", "tier": None, "scopes": []}
+        if row["revoked_at"]:
+            return {"ok": False, "reason": "token_revoked", "tier": None, "scopes": []}
+
+        user_id = row["user_id"]
+        ent = con.execute(
+            """
+            SELECT tier, starts_ts, ends_ts
+            FROM entitlements
+            WHERE user_id=?
+              AND starts_ts <= ?
+              AND (ends_ts IS NULL OR ends_ts > ?)
+            ORDER BY starts_ts DESC
+            LIMIT 1
+            """,
+            (user_id, now_ts, now_ts),
+        ).fetchone()
+
+        tier = None
+        if ent:
+            tier = str(ent["tier"] or "").strip().lower() or None
+
+        scopes = ["catalog:full", "stream:full"] if tier == "pro" else ["catalog:recent", "stream:preview"]
+
+        return {
+            "ok": True,
+            "reason": "ok",
+            "tier": tier or "free",
+            "user_id": user_id,
+            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "scopes": scopes,
+        }
+
+    return {"ok": False, "reason": "billing_schema_missing", "tier": None, "scopes": []}
+
+
+def _load_web_manifest(directory: Path) -> Optional[Dict[str, Any]]:
+    p = directory / "web_manifest.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _manifest_tracks(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tracks = manifest.get("tracks")
+    if isinstance(tracks, list):
+        out: List[Dict[str, Any]] = []
+        for t in tracks:
+            if isinstance(t, dict) and t.get("track_id") and t.get("relpath"):
+                out.append(t)
+        return out
+    return []
+
+
+def _filter_catalog(tracks: List[Dict[str, Any]], scopes: Sequence[str]) -> List[Dict[str, Any]]:
+    if "catalog:full" in scopes:
+        return tracks
+    if not tracks:
+        return []
+    tracks2 = sorted(tracks, key=lambda x: int(x.get("index", 0)))
+    return tracks2[:1]
+
+
+def _safe_join_under(root: Path, relpath: str) -> Optional[Path]:
+    try:
+        rel = Path(relpath)
+        if rel.is_absolute():
+            return None
+        cand = (root / rel).resolve()
+        if root not in cand.parents and cand != root:
+            return None
+        return cand
+    except Exception:
+        return None
+
+
+def _stream_file(
+    handler: SimpleHTTPRequestHandler,
+    *,
+    path: Path,
+    content_type: str,
+    allow_range: bool,
+    preview_bytes: Optional[int],
+) -> None:
+    size = path.stat().st_size
+
+    if preview_bytes is not None:
+        to_send = min(int(preview_bytes), int(size))
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(to_send))
+        handler.send_header("Accept-Ranges", "none")
+        handler.end_headers()
+        with path.open("rb") as f:
+            handler.wfile.write(f.read(to_send))
+        return
+
+    range_header = handler.headers.get("Range", "").strip() if allow_range else ""
+    if range_header.lower().startswith("bytes="):
+        try:
+            spec = range_header.split("=", 1)[1].strip()
+            start_s, end_s = (spec.split("-", 1) + [""])[:2]
+            start = int(start_s) if start_s else 0
+            end = int(end_s) if end_s else (size - 1)
+            if start < 0 or end < start or start >= size:
+                raise ValueError("invalid range")
+            end = min(end, size - 1)
+            length = end - start + 1
+            handler.send_response(206)
+            handler.send_header("Content-Type", content_type)
+            handler.send_header("Content-Length", str(length))
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.end_headers()
+            with path.open("rb") as f:
+                f.seek(start)
+                handler.wfile.write(f.read(length))
+            return
+        except Exception:
+            pass
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(size))
+    handler.send_header("Accept-Ranges", "bytes" if allow_range else "none")
+    handler.end_headers()
+    with path.open("rb") as f:
+        shutil.copyfileobj(f, handler.wfile)
+
+
+def _stream_head(
+    handler: SimpleHTTPRequestHandler,
+    *,
+    path: Path,
+    content_type: str,
+    allow_range: bool,
+    preview_bytes: Optional[int],
+) -> None:
+    """
+    HEAD variant of streaming: same status + headers, but no body.
+    We do not honor Range for HEAD; we return headers for the effective full/preview length.
+    """
+    size = path.stat().st_size
+
+    if preview_bytes is not None:
+        to_send = min(int(preview_bytes), int(size))
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(to_send))
+        handler.send_header("Accept-Ranges", "none")
+        handler.end_headers()
+        return
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(size))
+    handler.send_header("Accept-Ranges", "bytes" if allow_range else "none")
+    handler.end_headers()
+    return
 
 
 def cmd_web_serve(args: argparse.Namespace) -> int:
@@ -1048,40 +907,233 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         sys.stdout.write(_stable_json_dumps({"ok": False, "reason": "dir_not_found", "dir": str(directory)}) + "\n")
         return 2
 
-    token = getattr(args, "token", None)
-    if token:
-        try:
-            _require_pro_if_token(args)
-            _write_billing_evidence(
-                Path(args.out_dir),
-                token=str(token),
-                ok=True,
-                reason="allow",
-                action="web.build",
-            )
-        except BaseException as e:
-            reason = getattr(e, "msg", None) or str(e)
-            _write_billing_evidence(
-                Path(args.out_dir),
-                token=str(token),
-                ok=False,
-                reason=str(reason),
-                action="web.build",
-            )
-            sys.stdout.write(_stable_json_dumps({
-                "ok": False,
-                "reason": "billing_denied",
-                "error": str(reason),
-                "hint": "If using --token, pass --billing-db or set MGC_BILLING_DB.",
-            }) + "\n")
-            return 2
-
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
+
+    billing_db_str = str(getattr(args, "billing_db", "") or os.environ.get("MGC_BILLING_DB", "") or "")
+    billing_db: Optional[Path] = None
+    if billing_db_str.strip():
+        billing_db = Path(billing_db_str).expanduser().resolve()
+
+    default_token = getattr(args, "token", None)
+    preview_bytes = int(os.environ.get("MGC_WEB_PREVIEW_BYTES", "1000000"))
+
+    manifest = _load_web_manifest(directory)
+    manifest_tracks = _manifest_tracks(manifest) if manifest else []
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *a: Any, **kw: Any) -> None:
             super().__init__(*a, directory=str(directory), **kw)
+
+        def log_message(self, fmt: str, *fmt_args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            path, query = _parse_url(self)
+            if path.startswith("/api/"):
+                self._handle_api_get(path, query)
+                return
+            super().do_GET()
+
+        def do_HEAD(self) -> None:
+            path, query = _parse_url(self)
+            if path.startswith("/api/"):
+                self._handle_api_head(path, query)
+                return
+            super().do_HEAD()
+
+        def _access_for_request(self, query: Dict[str, List[str]]) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+            tok = _extract_request_token(self, query) or (str(default_token).strip() if default_token else None)
+            if not tok:
+                return None, None, "missing_token"
+            if not billing_db:
+                return tok, None, "billing_db_missing"
+            con = _connect(str(billing_db))
+            try:
+                a = _billing_resolve_access(con, tok)
+            finally:
+                con.close()
+            return tok, a, None
+
+        def _handle_api_get(self, path: str, query: Dict[str, List[str]]) -> None:
+            if path == "/api/health":
+                _http_send_json(self, 200, {"ok": True})
+                return
+
+            tok, a, err = self._access_for_request(query)
+
+            if path == "/api/me":
+                if err == "missing_token":
+                    _http_send_json(self, 200, {"ok": True, "entitled": False, "tier": None, "scopes": [], "reason": "missing_token"})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                entitled = bool(a.get("ok"))
+                _http_send_json(self, 200, {"ok": True, "entitled": entitled, "tier": a.get("tier"), "scopes": a.get("scopes", []), "reason": a.get("reason")})
+                return
+
+            if path == "/api/catalog":
+                if err == "missing_token":
+                    _http_send_json(self, 200, {"ok": True, "tracks": [], "entitled": False})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                if not a.get("ok"):
+                    _http_send_json(self, 403, {"ok": False, "reason": str(a.get("reason") or "denied")})
+                    return
+                scopes = list(a.get("scopes") or [])
+                tracks = _filter_catalog(list(manifest_tracks), scopes)
+                out_tracks: List[Dict[str, Any]] = []
+                for t in tracks:
+                    out_tracks.append({
+                        "index": t.get("index"),
+                        "track_id": t.get("track_id"),
+                        "title": t.get("title"),
+                        "stream_url": f"/api/stream/{t.get('track_id')}",
+                    })
+                _http_send_json(self, 200, {"ok": True, "tier": a.get("tier"), "scopes": scopes, "tracks": out_tracks})
+                return
+
+            if path.startswith("/api/stream/"):
+                track_id = path.split("/", 3)[3] if len(path.split("/", 3)) >= 4 else ""
+                track_id = (track_id or "").strip()
+                if not track_id:
+                    _http_send_json(self, 400, {"ok": False, "reason": "missing_track_id"})
+                    return
+                if err == "missing_token":
+                    _http_send_json(self, 401, {"ok": False, "reason": "missing_token"})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                if not a.get("ok"):
+                    _http_send_json(self, 403, {"ok": False, "reason": str(a.get("reason") or "denied")})
+                    return
+                scopes = list(a.get("scopes") or [])
+
+                found = None
+                for t in manifest_tracks:
+                    if str(t.get("track_id")) == track_id:
+                        found = t
+                        break
+                if not found:
+                    _http_send_json(self, 404, {"ok": False, "reason": "track_not_found"})
+                    return
+
+                relpath = str(found.get("relpath") or "")
+                disk_path = _safe_join_under(directory, relpath)
+                if not disk_path or not disk_path.exists():
+                    _http_send_json(self, 404, {"ok": False, "reason": "file_missing"})
+                    return
+
+                ctype = mimetypes.guess_type(str(disk_path))[0] or "application/octet-stream"
+                is_pro = ("stream:full" in scopes) or (str(a.get("tier") or "").lower() == "pro")
+
+                _stream_file(
+                    self,
+                    path=disk_path,
+                    content_type=ctype,
+                    allow_range=is_pro,
+                    preview_bytes=None if is_pro else preview_bytes,
+                )
+                return
+
+            _http_send_json(self, 404, {"ok": False, "reason": "unknown_endpoint", "path": path})
+
+        def _handle_api_head(self, path: str, query: Dict[str, List[str]]) -> None:
+            if path == "/api/health":
+                _http_send_json_head(self, 200, {"ok": True})
+                return
+
+            tok, a, err = self._access_for_request(query)
+
+            if path == "/api/me":
+                if err == "missing_token":
+                    _http_send_json_head(self, 200, {"ok": True, "entitled": False, "tier": None, "scopes": [], "reason": "missing_token"})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json_head(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                entitled = bool(a.get("ok"))
+                _http_send_json_head(self, 200, {"ok": True, "entitled": entitled, "tier": a.get("tier"), "scopes": a.get("scopes", []), "reason": a.get("reason")})
+                return
+
+            if path == "/api/catalog":
+                if err == "missing_token":
+                    _http_send_json_head(self, 200, {"ok": True, "tracks": [], "entitled": False})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json_head(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                if not a.get("ok"):
+                    _http_send_json_head(self, 403, {"ok": False, "reason": str(a.get("reason") or "denied")})
+                    return
+                scopes = list(a.get("scopes") or [])
+                tracks = _filter_catalog(list(manifest_tracks), scopes)
+                out_tracks: List[Dict[str, Any]] = []
+                for t in tracks:
+                    out_tracks.append({
+                        "index": t.get("index"),
+                        "track_id": t.get("track_id"),
+                        "title": t.get("title"),
+                        "stream_url": f"/api/stream/{t.get('track_id')}",
+                    })
+                _http_send_json_head(self, 200, {"ok": True, "tier": a.get("tier"), "scopes": scopes, "tracks": out_tracks})
+                return
+
+            if path.startswith("/api/stream/"):
+                track_id = path.split("/", 3)[3] if len(path.split("/", 3)) >= 4 else ""
+                track_id = (track_id or "").strip()
+                if not track_id:
+                    _http_send_json_head(self, 400, {"ok": False, "reason": "missing_track_id"})
+                    return
+                if err == "missing_token":
+                    _http_send_json_head(self, 401, {"ok": False, "reason": "missing_token"})
+                    return
+                if err == "billing_db_missing":
+                    _http_send_json_head(self, 500, {"ok": False, "reason": "billing_db_missing", "hint": "Pass --billing-db or set MGC_BILLING_DB."})
+                    return
+                assert a is not None
+                if not a.get("ok"):
+                    _http_send_json_head(self, 403, {"ok": False, "reason": str(a.get("reason") or "denied")})
+                    return
+                scopes = list(a.get("scopes") or [])
+
+                found = None
+                for t in manifest_tracks:
+                    if str(t.get("track_id")) == track_id:
+                        found = t
+                        break
+                if not found:
+                    _http_send_json_head(self, 404, {"ok": False, "reason": "track_not_found"})
+                    return
+
+                relpath = str(found.get("relpath") or "")
+                disk_path = _safe_join_under(directory, relpath)
+                if not disk_path or not disk_path.exists():
+                    _http_send_json_head(self, 404, {"ok": False, "reason": "file_missing"})
+                    return
+
+                ctype = mimetypes.guess_type(str(disk_path))[0] or "application/octet-stream"
+                is_pro = ("stream:full" in scopes) or (str(a.get("tier") or "").lower() == "pro")
+
+                _stream_head(
+                    self,
+                    path=disk_path,
+                    content_type=ctype,
+                    allow_range=is_pro,
+                    preview_bytes=None if is_pro else preview_bytes,
+                )
+                return
+
+            _http_send_json_head(self, 404, {"ok": False, "reason": "unknown_endpoint", "path": path})
 
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((host, port), Handler)
@@ -1090,6 +1142,13 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         "ok": True,
         "serving": str(directory),
         "url": f"http://{host}:{port}/",
+        "api": {
+            "me": "/api/me",
+            "catalog": "/api/catalog",
+            "stream": "/api/stream/<track_id>",
+        },
+        "billing_db": str(billing_db) if billing_db else None,
+        "default_token": bool(default_token),
     }) + "\n")
 
     try:
@@ -1101,10 +1160,6 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------
-# Registrar + aliases
-# ---------------------------------------------------------------------
-
 def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     web = subparsers.add_parser("web", help="Static web player build/serve")
     ws = web.add_subparsers(dest="web_cmd", required=True)
@@ -1112,16 +1167,9 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     build = ws.add_parser("build", help="Build a static web bundle")
     build.add_argument("--playlist", required=True, help="Playlist JSON path")
     build.add_argument("--out-dir", required=True, help="Output directory for the web bundle")
-    build.add_argument("--db", default="", help="Main DB path (used to resolve track_id -> artifact_path)")
-    build.add_argument("--token", default=None, help="Billing access token (requires pro)")
-    build.add_argument(
-        "--billing-db",
-        dest="billing_db",
-        default=None,
-        help="DB path for billing/token validation (recommended). Uses MGC_BILLING_DB or --db.",
-    )
+    build.add_argument("--db", default="", help="Main DB path (used to resolve track_id -> full_path/preview_path)")
+    build.add_argument("--repo-root", default=".", help="Repo root used for resolving relative paths (default: .)")
     build.add_argument("--prefer-mp3", action="store_true", help="Prefer .mp3 when a .wav sibling exists")
-    build.add_argument("--strip-paths", action="store_true", help="Strip absolute paths in output diagnostics")
     build.add_argument("--clean", action="store_true", help="Delete out-dir before building")
     build.add_argument("--fail-if-empty", action="store_true", help="Fail if playlist has zero track entries")
     build.add_argument("--fail-if-none-copied", action="store_true", help="Fail if none of the tracks could be copied")
@@ -1134,10 +1182,10 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     validate.set_defaults(fn=cmd_web_validate)
 
     serve = ws.add_parser("serve", help="Serve a web bundle directory")
-    serve.add_argument("--dir", required=True, help="Directory containing index.html + playlist.json")
+    serve.add_argument("--dir", required=True, help="Directory containing index.html + playlist.json + web_manifest.json")
     serve.add_argument("--host", default="127.0.0.1", help="Bind host")
     serve.add_argument("--port", default=8000, type=int, help="Bind port")
-    serve.add_argument("--token", default=None, help="Billing access token (requires pro)")
+    serve.add_argument("--token", default=None, help="Default token for API calls (dev convenience)")
     serve.add_argument(
         "--billing-db",
         dest="billing_db",
