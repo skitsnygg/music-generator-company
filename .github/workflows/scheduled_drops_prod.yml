@@ -2,7 +2,8 @@ name: Scheduled Drops (Prod)
 
 on:
   schedule:
-    - cron: "0 9 * * *"
+    # 09:00 America/Sao_Paulo == 12:00 UTC (but GitHub cron is UTC)
+    - cron: "0 12 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -12,14 +13,40 @@ concurrency:
 jobs:
   drop:
     runs-on: [self-hosted, mgc-prod]
+
     env:
+      # Use the persistent prod DB
       MGC_DB: /var/lib/mgc/db.sqlite
+
+      # Keep these set if you want filesystem provider later, but do NOT hard-fail if empty.
+      # If your provider is still stub in prod, leaving these set won't hurt, but they may be unused.
       MGC_PROVIDER: filesystem
       MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
+
+      # Ensure scheduled runs use real time (not deterministic CI time)
+      MGC_DETERMINISTIC: ""
+      MGC_FIXED_TIME: ""
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euxo pipefail
+          whoami
+          id
+          uname -a || true
+          df -h || true
+          timedatectl || true
+
+          echo "MGC_DB=$MGC_DB"
+          ls -la "$(dirname "$MGC_DB")" || true
+          test -f "$MGC_DB"
+
+          echo "MGC_FS_PROVIDER_DIR=$MGC_FS_PROVIDER_DIR"
+          ls -la "$MGC_FS_PROVIDER_DIR" || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,55 +60,54 @@ jobs:
           set -euxo pipefail
           python -m pip install -U pip
           python -m pip install -e .
+          python -c "import mgc; print('mgc:', mgc.__file__)"
 
-      - name: Force non-deterministic mode for scheduled drops
-        shell: bash
-        run: |
-          echo "MGC_DETERMINISTIC=" >> "$GITHUB_ENV"
-          echo "MGC_FIXED_TIME=" >> "$GITHUB_ENV"
-
-      - name: Ensure directories + inputs exist
+      - name: DB migrate
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Runner outputs
-          mkdir -p artifacts/runs
-          mkdir -p data/evidence
-
-          # DB + provider dir expectations
-          mkdir -p "$(dirname "$MGC_DB")"
-          test -f "$MGC_DB"
-
-          test -d "$MGC_FS_PROVIDER_DIR"
-          count="$(find "$MGC_FS_PROVIDER_DIR" -type f \( -iname '*.wav' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' \) | wc -l | tr -d ' ')"
-          test "$count" -gt 0
-          echo "audio_pool_count=$count"
-          ls -la "$MGC_FS_PROVIDER_DIR" | head -n 50
+          python -m mgc.main --db "$MGC_DB" db migrate
+          python -m mgc.main --db "$MGC_DB" db status --json
 
       - name: Provider check
         shell: bash
         run: |
           set -euxo pipefail
-          python -m mgc.main providers check --json
+          python -m mgc.main --db "$MGC_DB" providers check --json
 
-      - name: Run drop (daily + publish)
+      - name: Run autonomous drop (end-to-end)
         shell: bash
         run: |
           set -euxo pipefail
-          python -m mgc.main run drop --context focus --seed 1 --limit 50 > artifacts/runs/drop.json
 
-      - name: Manifest
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m mgc.main run manifest --repo-root . --out artifacts/runs/manifest.json --print-hash
+          OUT_DIR="/tmp/mgc_prod_autonomous"
+          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
+
+          rm -rf "$OUT_DIR" "$WEB_OUT_DIR"
+          mkdir -p "$OUT_DIR" "$WEB_OUT_DIR"
+
+          # Run the full cron-safe pipeline.
+          # - contract local: validates presence + submission_zip without requiring publish contract inputs.
+          python -m mgc.main --db "$MGC_DB" run autonomous \
+            --context focus \
+            --seed 1 \
+            --out-dir "$OUT_DIR" \
+            --with-web \
+            --web-out-dir "$WEB_OUT_DIR" \
+            --contract local \
+            --json | tee "$OUT_DIR/autonomous.json"
+
+          echo "Autonomous outputs:"
+          find "$OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
+          find "$WEB_OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
 
       - name: Upload prod artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scheduled-drop-artifacts-prod
           path: |
-            artifacts/runs/**
-            data/evidence/**
+            /tmp/mgc_prod_autonomous/**
+            /tmp/mgc_prod_autonomous_web/**
+            data/submissions/**
           if-no-files-found: warn
