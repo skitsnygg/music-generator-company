@@ -2523,6 +2523,21 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     exclude_globs = getattr(args, "exclude_glob", None) or None
 
     manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
+# BEGIN MGC MANIFEST OUTPUT FILTER (secrets/junk)
+    def _mgc_keep_path(path: str) -> bool:
+        # Never let local secrets / OS junk into any written manifest.
+        # Do NOT exclude .env.example
+        if path == ".env" or path.startswith(".env.") or path.endswith("/.env") or "/.env." in path:
+            return False
+        if path == ".DS_Store" or path.endswith("/.DS_Store"):
+            return False
+        return True
+    
+    if isinstance(manifest_obj, dict):
+        _ents = manifest_obj.get("entries")
+        if isinstance(_ents, list):
+            manifest_obj["entries"] = [e for e in _ents if _mgc_keep_path(e.get("path", ""))]
+    # END MGC MANIFEST OUTPUT FILTER
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
@@ -4165,6 +4180,21 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     exclude_globs = getattr(args, "exclude_glob", None) or None
 
     manifest_obj = compute_manifest(repo_root, include=include, exclude_dirs=exclude_dirs, exclude_globs=exclude_globs)
+# BEGIN MGC MANIFEST OUTPUT FILTER (secrets/junk)
+    def _mgc_keep_path(path: str) -> bool:
+        # Never let local secrets / OS junk into any written manifest.
+        # Do NOT exclude .env.example
+        if path == ".env" or path.startswith(".env.") or path.endswith("/.env") or "/.env." in path:
+            return False
+        if path == ".DS_Store" or path.endswith("/.DS_Store"):
+            return False
+        return True
+    
+    if isinstance(manifest_obj, dict):
+        _ents = manifest_obj.get("entries")
+        if isinstance(_ents, list):
+            manifest_obj["entries"] = [e for e in _ents if _mgc_keep_path(e.get("path", ""))]
+    # END MGC MANIFEST OUTPUT FILTER
     manifest_path = out_dir / "weekly_manifest.json"
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
