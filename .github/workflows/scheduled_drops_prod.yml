@@ -1,0 +1,87 @@
+name: Scheduled Drops (Prod)
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: scheduled-drops-prod
+  cancel-in-progress: false
+
+jobs:
+  drop:
+    runs-on: [self-hosted, mgc-prod]
+    env:
+      MGC_DB: /var/lib/mgc/db.sqlite
+      MGC_PROVIDER: filesystem
+      MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip
+          python -m pip install -e .
+
+      - name: Force non-deterministic mode for scheduled drops
+        shell: bash
+        run: |
+          echo "MGC_DETERMINISTIC=" >> "$GITHUB_ENV"
+          echo "MGC_FIXED_TIME=" >> "$GITHUB_ENV"
+
+      - name: Ensure directories + inputs exist
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Runner outputs
+          mkdir -p artifacts/runs
+          mkdir -p data/evidence
+
+          # DB + provider dir expectations
+          mkdir -p "$(dirname "$MGC_DB")"
+          test -f "$MGC_DB"
+
+          test -d "$MGC_FS_PROVIDER_DIR"
+          count="$(find "$MGC_FS_PROVIDER_DIR" -type f \( -iname '*.wav' -o -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' \) | wc -l | tr -d ' ')"
+          test "$count" -gt 0
+          echo "audio_pool_count=$count"
+          ls -la "$MGC_FS_PROVIDER_DIR" | head -n 50
+
+      - name: Provider check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m mgc.main providers check --json
+
+      - name: Run drop (daily + publish)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m mgc.main run drop --context focus --seed 1 --limit 50 > artifacts/runs/drop.json
+
+      - name: Manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m mgc.main run manifest --repo-root . --out artifacts/runs/manifest.json --print-hash
+
+      - name: Upload prod artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduled-drop-artifacts-prod
+          path: |
+            artifacts/runs/**
+            data/evidence/**
+          if-no-files-found: warn
