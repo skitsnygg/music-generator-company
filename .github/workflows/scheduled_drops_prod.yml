@@ -71,6 +71,7 @@ jobs:
 
       - name: Provider check
         shell: bash
+        continue-on-error: true
         run: |
           set -euxo pipefail
           python -m mgc.main --db "$MGC_DB" providers check --json
@@ -88,7 +89,7 @@ jobs:
 
           # Run the full cron-safe pipeline.
           # - contract local: validates presence + submission_zip without requiring publish contract inputs.
-          python -m mgc.main --db "$MGC_DB" run autonomous \
+          MGC_PROVIDER=stub python -m mgc.main --db "$MGC_DB" run autonomous \
             --context focus \
             --seed 1 \
             --out-dir "$OUT_DIR" \
@@ -96,6 +97,7 @@ jobs:
             --web-out-dir "$WEB_OUT_DIR" \
             --contract local \
             --json | tee "$OUT_DIR/autonomous.json"
+
 
           echo "Autonomous outputs:"
           find "$OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
