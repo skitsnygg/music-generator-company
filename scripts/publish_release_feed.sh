@@ -1,130 +1,206 @@
-cat > scripts/publish_release_feed.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat <<'USAGE'
-usage: ./scripts/publish_release_feed.sh --context CONTEXT [--period-key KEY] [--out-dir DIR] [--src-latest-root DIR] [--dest-releases-root DIR]
+# Generates /var/lib/mgc/releases/feed.json by scanning:
+#   /var/lib/mgc/releases/<release_id>/<context>/...
+#   /var/lib/mgc/releases/<release_id>/web/<context>/...
+# and latest as:
+#   /var/lib/mgc/releases/latest -> /var/lib/mgc/releases/<release_id>
+#
+# Hardened:
+# - flock to prevent concurrent writers
+# - atomic feed.json write
+# - tolerant of either /web/<context> or /<context> layout
 
-Publishes an internal "release" snapshot by copying the already-built latest web bundle
-into a versioned releases directory, and updates a simple feed.json.
+ROOT_DIR="${ROOT_DIR:-/var/lib/mgc/releases}"
+OUT_JSON="${OUT_JSON:-$ROOT_DIR/feed.json}"
+LOCK_FILE="${LOCK_FILE:-$ROOT_DIR/.feed.lock}"
+MAX_ITEMS="${MAX_ITEMS:-200}"
+BASE_URL="${BASE_URL:-}"   # optional, e.g. https://your-domain.example
 
-Defaults:
-  --src-latest-root      /var/lib/mgc/releases/latest/web
-  --dest-releases-root   /var/lib/mgc/releases
+log() { printf '%s %s\n' "[release_feed]" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
 
-Notes:
-  - Expects that latest bundle exists at: <src-latest-root>/<context>/
-    (Normally created by scripts/publish_latest.sh which run_daily/run_weekly call.)
-  - Writes:
-      <dest-releases-root>/<period-key>/<context>/(index.html, web_manifest.json, playlist.json, tracks/...)
-      <dest-releases-root>/feed.json
-USAGE
-}
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
+command -v flock >/dev/null 2>&1 || die "flock not found"
 
-CONTEXT=""
-PERIOD_KEY="$(date -u +%Y-%m-%d)"
-OUT_DIR=""
-SRC_LATEST_ROOT="/var/lib/mgc/releases/latest/web"
-DEST_RELEASES_ROOT="/var/lib/mgc/releases"
+[ -d "$ROOT_DIR" ] || die "ROOT_DIR not found: $ROOT_DIR"
+mkdir -p "$(dirname "$OUT_JSON")"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --context) CONTEXT="${2:-}"; shift 2 ;;
-    --period-key) PERIOD_KEY="${2:-}"; shift 2 ;;
-    --out-dir) OUT_DIR="${2:-}"; shift 2 ;;
-    --src-latest-root) SRC_LATEST_ROOT="${2:-}"; shift 2 ;;
-    --dest-releases-root) DEST_RELEASES_ROOT="${2:-}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "[publish_release_feed] unknown arg: $1" >&2; usage; exit 2 ;;
-  esac
-done
+# Lock
+exec 9>"$LOCK_FILE"
+flock -n 9 || die "another feed run is in progress (lock: $LOCK_FILE)"
 
-if [[ -z "$CONTEXT" ]]; then
-  echo "[publish_release_feed] missing --context" >&2
-  usage
-  exit 2
-fi
+tmp="$(mktemp "${OUT_JSON}.tmp.XXXXXX")"
+cleanup() { rm -f "$tmp" || true; }
+trap cleanup EXIT
 
-log() { echo "[publish_release_feed] $*"; }
+log "ROOT_DIR=$ROOT_DIR"
+log "OUT_JSON=$OUT_JSON"
+log "MAX_ITEMS=$MAX_ITEMS"
+log "BASE_URL=${BASE_URL:-<empty>}"
 
-src_dir="${SRC_LATEST_ROOT%/}/${CONTEXT}"
-dest_dir="${DEST_RELEASES_ROOT%/}/${PERIOD_KEY}/${CONTEXT}"
-feed_path="${DEST_RELEASES_ROOT%/}/feed.json"
-
-if [[ ! -d "$src_dir" ]]; then
-  echo "[publish_release_feed] missing source bundle: $src_dir" >&2
-  echo "[publish_release_feed] hint: run ./scripts/run_daily.sh (or publish_latest) first on this machine" >&2
-  exit 1
-fi
-
-mkdir -p "$dest_dir"
-
-# Copy snapshot (atomic-ish via temp dir)
-tmp_root="$(mktemp -d "${DEST_RELEASES_ROOT%/}/.tmp_release_${PERIOD_KEY}_${CONTEXT}_XXXXXX")"
-tmp_dir="${tmp_root}/${CONTEXT}"
-mkdir -p "$tmp_dir"
-
-# Copy everything (including tracks/)
-cp -a "$src_dir/." "$tmp_dir/"
-
-# Move into place
-rm -rf "$dest_dir"
-mkdir -p "$(dirname "$dest_dir")"
-mv "$tmp_dir" "$dest_dir"
-rm -rf "$tmp_root"
-
-log "published release snapshot: $dest_dir"
-
-# Build/update feed.json (append newest first; keep last 50)
-python3 - <<PY
-import json
+python3 - <<PY >"$tmp"
+import json, os
 from pathlib import Path
 from datetime import datetime, timezone
 
-context = ${CONTEXT@Q}
-period_key = ${PERIOD_KEY@Q}
-dest_releases_root = Path(${DEST_RELEASES_ROOT@Q})
-feed_path = dest_releases_root / "feed.json"
-dest_dir = dest_releases_root / period_key / context
+ROOT = Path(${ROOT_DIR@Q})
+OUT = Path(${OUT_JSON@Q})
+MAX_ITEMS = int(${MAX_ITEMS@Q})
+BASE_URL = (${BASE_URL@Q}).strip().rstrip("/")
 
-def read_json(p: Path, default):
+def iso_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+
+def is_release_dir(p: Path) -> bool:
+    if not p.is_dir():
+        return False
+    name = p.name
+    if name.startswith("."):
+        return False
+    if name in ("latest",):
+        return False
+    if name == OUT.name:
+        return False
+    return True
+
+def looks_like_context_dir(d: Path) -> bool:
+    if not d.is_dir():
+        return False
+    # minimal: one of these must exist
+    return any((d / fn).exists() for fn in ("index.html", "playlist.json", "web_manifest.json"))
+
+def collect_contexts(release_dir: Path):
+    # Support both layouts:
+    #   release/<context>
+    #   release/web/<context>
+    candidates = []
+    web = release_dir / "web"
+    if web.is_dir():
+        for child in web.iterdir():
+            if looks_like_context_dir(child):
+                candidates.append(("web", child.name, child))
+    for child in release_dir.iterdir():
+        if child.name in ("web", "bundle", "marketing"):
+            continue
+        if looks_like_context_dir(child):
+            candidates.append(("root", child.name, child))
+
+    # de-dupe by context name, prefer /web/<context> if both exist
+    by_ctx = {}
+    for kind, ctx, path in candidates:
+        prev = by_ctx.get(ctx)
+        if prev is None or (prev[0] == "root" and kind == "web"):
+            by_ctx[ctx] = (kind, path)
+
+    out = []
+    for ctx in sorted(by_ctx.keys()):
+        kind, path = by_ctx[ctx]
+        # choose URL prefix matching layout
+        out.append({"context": ctx, "kind": kind})
+    return out, by_ctx
+
+def dir_mtime_iso(p: Path) -> str:
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        ts = p.stat().st_mtime
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
     except Exception:
-        return default
+        return "1970-01-01T00:00:00Z"
 
-playlist = read_json(dest_dir / "playlist.json", {})
-wm = read_json(dest_dir / "web_manifest.json", {})
+def make_url(release_id: str, ctx: str, kind: str, latest: bool):
+    if latest:
+        # Nginx: user said it serves /latest/web and /releases.
+        # If kind == web, use /latest/web/<ctx>/ else /latest/<ctx>/
+        path = f"/latest/web/{ctx}/" if kind == "web" else f"/latest/{ctx}/"
+    else:
+        path = f"/releases/{release_id}/web/{ctx}/" if kind == "web" else f"/releases/{release_id}/{ctx}/"
+    return f"{BASE_URL}{path}" if BASE_URL else path
 
-track_count = len((playlist.get("tracks") or []))
+def read_playlist_track_count(p: Path) -> int:
+    pl = p / "playlist.json"
+    if not pl.exists():
+        return 0
+    try:
+        obj = json.loads(pl.read_text(encoding="utf-8"))
+        tracks = obj.get("tracks") or []
+        return len(tracks) if isinstance(tracks, list) else 0
+    except Exception:
+        return 0
 
-item = {
-    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-    "period_key": period_key,
-    "context": context,
-    "paths": {
-        "web": f"/releases/{period_key}/{context}/",
-        "playlist_json": f"/releases/{period_key}/{context}/playlist.json",
-        "web_manifest_json": f"/releases/{period_key}/{context}/web_manifest.json",
-    },
-    "track_count": track_count,
+def latest_entry(latest_path: Path):
+    if not latest_path.exists():
+        return {"ok": False, "reason": "latest_missing", "contexts": []}
+    if not latest_path.is_dir():
+        return {"ok": False, "reason": "latest_not_dir", "contexts": []}
+
+    ctx_list, by_ctx = collect_contexts(latest_path)
+    contexts = []
+    for ctx in sorted(by_ctx.keys()):
+        kind, path = by_ctx[ctx]
+        contexts.append({
+            "context": ctx,
+            "kind": kind,
+            "mtime": dir_mtime_iso(path),
+            "track_count": read_playlist_track_count(path),
+            "url": make_url("latest", ctx, kind, latest=True),
+        })
+
+    return {"ok": True, "contexts": contexts}
+
+# Build releases list
+release_dirs = [p for p in ROOT.iterdir() if is_release_dir(p)]
+# deterministic scan order
+release_dirs.sort(key=lambda p: p.name)
+
+releases = []
+for r in release_dirs:
+    ctx_list, by_ctx = collect_contexts(r)
+    if not by_ctx:
+        continue
+
+    contexts = []
+    release_mtime = dir_mtime_iso(r)
+    for ctx in sorted(by_ctx.keys()):
+        kind, path = by_ctx[ctx]
+        m = dir_mtime_iso(path)
+        release_mtime = max(release_mtime, m)
+        contexts.append({
+            "context": ctx,
+            "kind": kind,
+            "mtime": m,
+            "track_count": read_playlist_track_count(path),
+            "url": make_url(r.name, ctx, kind, latest=False),
+        })
+
+    releases.append({
+        "release_id": r.name,
+        "mtime": release_mtime,
+        "contexts": contexts,
+        "url": (f"{BASE_URL}/releases/{r.name}/" if BASE_URL else f"/releases/{r.name}/"),
+    })
+
+# Sort newest-first by mtime then release_id for determinism
+releases.sort(key=lambda e: (e["mtime"], e["release_id"]), reverse=True)
+if MAX_ITEMS > 0:
+    releases = releases[:MAX_ITEMS]
+
+feed = {
+    "schema_version": 1,
+    "generated_at": iso_now(),
+    "root_dir": str(ROOT),
+    "latest": latest_entry(ROOT / "latest"),
+    "releases": releases,
 }
 
-feed = read_json(feed_path, {"ok": True, "items": []})
-items = feed.get("items") or []
-
-# Drop duplicates for same period+context
-items = [x for x in items if not (x.get("period_key")==period_key and x.get("context")==context)]
-items.insert(0, item)
-items = items[:50]
-
-feed = {"ok": True, "items": items}
-feed_path.write_text(json.dumps(feed, indent=2, sort_keys=True), encoding="utf-8")
-print("wrote", feed_path)
+print(json.dumps(feed, indent=2, sort_keys=True) + "\n")
 PY
 
-log "updated feed: $feed_path"
-EOF
+# Validate JSON before replacing existing feed
+python3 -m json.tool "$tmp" >/dev/null 2>&1 || die "generated feed.json is invalid JSON"
 
-chmod +x scripts/publish_release_feed.sh
+# Atomic replace
+mv -f "$tmp" "$OUT_JSON"
+chmod 0644 "$OUT_JSON" || true
+
+log "OK wrote $OUT_JSON ($(wc -c <"$OUT_JSON" | tr -d ' ') bytes)"
