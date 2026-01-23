@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -10,8 +11,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ALWAYS_EXCLUDE_NAMES = {
-    "run", "submission", "web", "bundle", "marketing", "tracks",
-    "evidence", "drop_bundle", "receipts",
+    "run",
+    "submission",
+    "web",
+    "bundle",
+    "marketing",
+    "tracks",
+    "evidence",
+    "drop_bundle",
+    "receipts",
 }
 
 def iso_now() -> str:
@@ -77,6 +85,7 @@ def discover_web_contexts(web_root: Path, *, include_backups: bool) -> List[Tupl
     out: List[Tuple[str, Path]] = []
     if not web_root.exists() or not web_root.is_dir():
         return out
+
     for child in web_root.iterdir():
         if not child.is_dir():
             continue
@@ -85,12 +94,14 @@ def discover_web_contexts(web_root: Path, *, include_backups: bool) -> List[Tupl
             continue
         if looks_like_web_context_dir(child):
             out.append((name, child))
+
     out.sort(key=lambda x: x[0])
     return out
 
 def latest_section(latest_dir: Path, *, base_url: str, include_backups: bool) -> Dict[str, Any]:
     web_root = latest_dir / "web"
-    contexts = []
+    contexts: List[Dict[str, Any]] = []
+
     for ctx, ctx_dir in discover_web_contexts(web_root, include_backups=include_backups):
         contexts.append(
             ContextEntry(
@@ -101,6 +112,7 @@ def latest_section(latest_dir: Path, *, base_url: str, include_backups: bool) ->
                 url=make_url(base_url, f"/latest/web/{ctx}/"),
             ).to_dict()
         )
+
     return {"contexts": contexts}
 
 def is_release_dir(p: Path) -> bool:
@@ -119,7 +131,8 @@ def releases_section(root_dir: Path, *, base_url: str, max_items: int, include_b
 
     for rel in candidates:
         web_root = rel / "web"
-        ctxs = []
+        ctxs: List[Dict[str, Any]] = []
+
         for ctx, ctx_dir in discover_web_contexts(web_root, include_backups=include_backups):
             ctxs.append(
                 ContextEntry(
@@ -130,11 +143,14 @@ def releases_section(root_dir: Path, *, base_url: str, max_items: int, include_b
                     url=make_url(base_url, f"/releases/{rel.name}/web/{ctx}/"),
                 ).to_dict()
             )
+
         if not ctxs:
             continue
+
         rel_mtime = "1970-01-01T00:00:00Z"
         for c in ctxs:
             rel_mtime = max(rel_mtime, c["mtime"])
+
         releases.append(
             {
                 "release_id": rel.name,
@@ -183,8 +199,7 @@ def main() -> int:
     if not args.stable:
         feed["generated_at"] = iso_now()
 
-    content_hash = hashlib.sha256(canonical_content(feed)).hexdigest()
-    feed["content_sha256"] = content_hash
+    feed["content_sha256"] = hashlib.sha256(canonical_content(feed)).hexdigest()
 
     out.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out, feed)
