@@ -550,6 +550,19 @@ def _marketing_teaser_wav(
         return (False, f"teaser failed: {e}")
 
 
+def _relpath_from_out_dir(out_dir: Path, p: str) -> str:
+    """
+    Convert an absolute path under out_dir into a portable, POSIX-style relative path.
+    Falls back to os.path.relpath if the path isn't strictly inside out_dir.
+    """
+    out = Path(out_dir).expanduser().resolve()
+    pp = Path(p).expanduser().resolve()
+    try:
+        return pp.relative_to(out).as_posix()
+    except Exception:
+        import os
+        return Path(os.path.relpath(str(pp), str(out))).as_posix()
+
 def _agents_marketing_plan(
     *,
     drop_dir: Path,
