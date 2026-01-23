@@ -1,30 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generates /var/lib/mgc/releases/feed.json by scanning:
-#   /var/lib/mgc/releases/<release_id>/<context>/...
-#   /var/lib/mgc/releases/<release_id>/web/<context>/...
-# and latest as:
-#   /var/lib/mgc/releases/latest -> /var/lib/mgc/releases/<release_id>
+# publish_release_feed.sh
 #
-# Hardened:
-# - flock to prevent concurrent writers
-# - atomic feed.json write
-# - tolerant of either /web/<context> or /<context> layout
+# Interview-ready internal release feed generator.
+# Writes /var/lib/mgc/releases/feed.json by scanning the release root.
+#
+# IMPORTANT:
+# - This script does NOT publish/copy snapshots. It only generates the feed.
+# - It delegates all feed logic to scripts/release_feed.py (single source of truth).
+#
+# Usage examples:
+#   scripts/publish_release_feed.sh
+#   sudo -E scripts/publish_release_feed.sh
+#   BASE_URL="https://example.com" scripts/publish_release_feed.sh
+#   scripts/publish_release_feed.sh --include-backups
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/publish_release_feed.sh [--root-dir DIR] [--out FILE] [--max-items N] [--base-url URL] [--include-backups]
+
+Defaults:
+  --root-dir   /var/lib/mgc/releases
+  --out        /var/lib/mgc/releases/feed.json
+  --max-items  200
+  --base-url   (empty => relative URLs)
+
+Notes:
+  - Delegates generation to scripts/release_feed.py
+  - Uses flock + atomic write + JSON validation
+  - By default excludes *.bak.* contexts and non-web dirs (run/submission/etc).
+USAGE
+}
+
+log() { printf '%s %s\n' "[release_feed]" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
 
 ROOT_DIR="${ROOT_DIR:-/var/lib/mgc/releases}"
 OUT_JSON="${OUT_JSON:-$ROOT_DIR/feed.json}"
 LOCK_FILE="${LOCK_FILE:-$ROOT_DIR/.feed.lock}"
 MAX_ITEMS="${MAX_ITEMS:-200}"
-BASE_URL="${BASE_URL:-}"   # optional, e.g. https://your-domain.example
+BASE_URL="${BASE_URL:-}"
+INCLUDE_BACKUPS="false"
 
-log() { printf '%s %s\n' "[release_feed]" "$*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
+# Back-compat: accept --context but ignore it (older callers may still pass it)
+CONTEXT_IGNORED=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root-dir) ROOT_DIR="${2:-}"; shift 2 ;;
+    --out) OUT_JSON="${2:-}"; shift 2 ;;
+    --max-items) MAX_ITEMS="${2:-}"; shift 2 ;;
+    --base-url) BASE_URL="${2:-}"; shift 2 ;;
+    --include-backups) INCLUDE_BACKUPS="true"; shift 1 ;;
+    --context) CONTEXT_IGNORED="${2:-}"; shift 2 ;; # ignored
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
 
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
 command -v flock >/dev/null 2>&1 || die "flock not found"
 
-[ -d "$ROOT_DIR" ] || die "ROOT_DIR not found: $ROOT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENERATOR="$SCRIPT_DIR/release_feed.py"
+[[ -f "$GENERATOR" ]] || die "missing generator: $GENERATOR"
+
+[[ -d "$ROOT_DIR" ]] || die "root dir not found: $ROOT_DIR"
 mkdir -p "$(dirname "$OUT_JSON")"
 
 # Lock
@@ -39,162 +81,19 @@ log "ROOT_DIR=$ROOT_DIR"
 log "OUT_JSON=$OUT_JSON"
 log "MAX_ITEMS=$MAX_ITEMS"
 log "BASE_URL=${BASE_URL:-<empty>}"
+if [[ -n "$CONTEXT_IGNORED" ]]; then
+  log "NOTE: --context '$CONTEXT_IGNORED' is ignored (feed is global)"
+fi
 
-python3 - <<PY >"$tmp"
-import json, os
-from pathlib import Path
-from datetime import datetime, timezone
+args=( "--root-dir" "$ROOT_DIR" "--out" "$tmp" "--max-items" "$MAX_ITEMS" )
+if [[ -n "${BASE_URL:-}" ]]; then
+  args+=( "--base-url" "$BASE_URL" )
+fi
+if [[ "$INCLUDE_BACKUPS" == "true" ]]; then
+  args+=( "--include-backups" )
+fi
 
-ROOT = Path(${ROOT_DIR@Q})
-OUT = Path(${OUT_JSON@Q})
-MAX_ITEMS = int(${MAX_ITEMS@Q})
-BASE_URL = (${BASE_URL@Q}).strip().rstrip("/")
-
-def iso_now():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
-
-def is_release_dir(p: Path) -> bool:
-    if not p.is_dir():
-        return False
-    name = p.name
-    if name.startswith("."):
-        return False
-    if name in ("latest",):
-        return False
-    if name == OUT.name:
-        return False
-    return True
-
-def looks_like_context_dir(d: Path) -> bool:
-    if not d.is_dir():
-        return False
-    # minimal: one of these must exist
-    return any((d / fn).exists() for fn in ("index.html", "playlist.json", "web_manifest.json"))
-
-def collect_contexts(release_dir: Path):
-    # Support both layouts:
-    #   release/<context>
-    #   release/web/<context>
-    candidates = []
-    web = release_dir / "web"
-    if web.is_dir():
-        for child in web.iterdir():
-            if looks_like_context_dir(child):
-                candidates.append(("web", child.name, child))
-    for child in release_dir.iterdir():
-        if child.name in ("web", "bundle", "marketing"):
-            continue
-        if looks_like_context_dir(child):
-            candidates.append(("root", child.name, child))
-
-    # de-dupe by context name, prefer /web/<context> if both exist
-    by_ctx = {}
-    for kind, ctx, path in candidates:
-        prev = by_ctx.get(ctx)
-        if prev is None or (prev[0] == "root" and kind == "web"):
-            by_ctx[ctx] = (kind, path)
-
-    out = []
-    for ctx in sorted(by_ctx.keys()):
-        kind, path = by_ctx[ctx]
-        # choose URL prefix matching layout
-        out.append({"context": ctx, "kind": kind})
-    return out, by_ctx
-
-def dir_mtime_iso(p: Path) -> str:
-    try:
-        ts = p.stat().st_mtime
-        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
-    except Exception:
-        return "1970-01-01T00:00:00Z"
-
-def make_url(release_id: str, ctx: str, kind: str, latest: bool):
-    if latest:
-        # Nginx: user said it serves /latest/web and /releases.
-        # If kind == web, use /latest/web/<ctx>/ else /latest/<ctx>/
-        path = f"/latest/web/{ctx}/" if kind == "web" else f"/latest/{ctx}/"
-    else:
-        path = f"/releases/{release_id}/web/{ctx}/" if kind == "web" else f"/releases/{release_id}/{ctx}/"
-    return f"{BASE_URL}{path}" if BASE_URL else path
-
-def read_playlist_track_count(p: Path) -> int:
-    pl = p / "playlist.json"
-    if not pl.exists():
-        return 0
-    try:
-        obj = json.loads(pl.read_text(encoding="utf-8"))
-        tracks = obj.get("tracks") or []
-        return len(tracks) if isinstance(tracks, list) else 0
-    except Exception:
-        return 0
-
-def latest_entry(latest_path: Path):
-    if not latest_path.exists():
-        return {"ok": False, "reason": "latest_missing", "contexts": []}
-    if not latest_path.is_dir():
-        return {"ok": False, "reason": "latest_not_dir", "contexts": []}
-
-    ctx_list, by_ctx = collect_contexts(latest_path)
-    contexts = []
-    for ctx in sorted(by_ctx.keys()):
-        kind, path = by_ctx[ctx]
-        contexts.append({
-            "context": ctx,
-            "kind": kind,
-            "mtime": dir_mtime_iso(path),
-            "track_count": read_playlist_track_count(path),
-            "url": make_url("latest", ctx, kind, latest=True),
-        })
-
-    return {"ok": True, "contexts": contexts}
-
-# Build releases list
-release_dirs = [p for p in ROOT.iterdir() if is_release_dir(p)]
-# deterministic scan order
-release_dirs.sort(key=lambda p: p.name)
-
-releases = []
-for r in release_dirs:
-    ctx_list, by_ctx = collect_contexts(r)
-    if not by_ctx:
-        continue
-
-    contexts = []
-    release_mtime = dir_mtime_iso(r)
-    for ctx in sorted(by_ctx.keys()):
-        kind, path = by_ctx[ctx]
-        m = dir_mtime_iso(path)
-        release_mtime = max(release_mtime, m)
-        contexts.append({
-            "context": ctx,
-            "kind": kind,
-            "mtime": m,
-            "track_count": read_playlist_track_count(path),
-            "url": make_url(r.name, ctx, kind, latest=False),
-        })
-
-    releases.append({
-        "release_id": r.name,
-        "mtime": release_mtime,
-        "contexts": contexts,
-        "url": (f"{BASE_URL}/releases/{r.name}/" if BASE_URL else f"/releases/{r.name}/"),
-    })
-
-# Sort newest-first by mtime then release_id for determinism
-releases.sort(key=lambda e: (e["mtime"], e["release_id"]), reverse=True)
-if MAX_ITEMS > 0:
-    releases = releases[:MAX_ITEMS]
-
-feed = {
-    "schema_version": 1,
-    "generated_at": iso_now(),
-    "root_dir": str(ROOT),
-    "latest": latest_entry(ROOT / "latest"),
-    "releases": releases,
-}
-
-print(json.dumps(feed, indent=2, sort_keys=True) + "\n")
-PY
+python3 "$GENERATOR" "${args[@]}"
 
 # Validate JSON before replacing existing feed
 python3 -m json.tool "$tmp" >/dev/null 2>&1 || die "generated feed.json is invalid JSON"
