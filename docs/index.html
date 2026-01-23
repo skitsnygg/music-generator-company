@@ -1,0 +1,49 @@
+cd ~/music-generator-company
+mkdir -p docs/releases
+
+cat > docs/index.html <<'HTML'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MGC Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; line-height: 1.45; }
+    code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .box { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+    a { text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Music Generator Company (MGC) Demo</h1>
+
+  <div class="box">
+    <h2>Release Feed</h2>
+    <p>
+      <a href="./releases/feed.json">./releases/feed.json</a>
+      <br />
+      This is a static demo feed (GitHub Pages) generated with <code>--stable</code>.
+    </p>
+  </div>
+
+  <div class="box">
+    <h2>What this shows</h2>
+    <ul>
+      <li><strong>VM/Production</strong>: a live feed served by nginx at <code>/releases/feed.json</code>.</li>
+      <li><strong>GitHub Pages</strong>: a static feed served from this site at <code>./releases/feed.json</code>.</li>
+      <li>The feed includes <code>content_sha256</code> so you can prove deterministic content even when timestamps change.</li>
+    </ul>
+  </div>
+
+  <div class="box">
+    <h2>Notes</h2>
+    <p>
+      If you run this locally, your nginx-served feed will be at <code>/releases/feed.json</code>.
+      The Pages feed is just a fixture-backed demo.
+    </p>
+  </div>
+</body>
+</html>
+HTML

@@ -72,14 +72,14 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # We upload ${RELEASE_OUT}/web as the Pages site root.
-          # Put the feed INSIDE that tree so it becomes:
-          #   https://<pages>/releases/feed.json
+          # Pages uploads ${RELEASE_OUT}/web as the site root (see Upload step),
+          # so place the feed *inside* that tree => /releases/feed.json on Pages.
           mkdir -p "${RELEASE_OUT}/web/releases"
 
-          # This must exist in the repo (commit your fixtures).
+          # Fixtures must be present in the repo for CI.
           test -d docs/fixtures/releases
 
+          # NOTE: this assumes scripts/release_feed.py supports --stable.
           python scripts/release_feed.py \
             --root-dir docs/fixtures/releases \
             --out "${RELEASE_OUT}/web/releases/feed.json" \
@@ -87,7 +87,7 @@ jobs:
 
           python -m json.tool "${RELEASE_OUT}/web/releases/feed.json" >/dev/null
 
-          # Determinism proof: regenerate; sha must match
+          # Determinism proof: regenerate; hash must match.
           sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed1.sha256
           python scripts/release_feed.py \
             --root-dir docs/fixtures/releases \
@@ -96,7 +96,7 @@ jobs:
           sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed2.sha256
           diff -u /tmp/feed1.sha256 /tmp/feed2.sha256
 
-          # Avoid Jekyll edge cases
+          # Avoid Jekyll edge cases.
           touch "${RELEASE_OUT}/web/.nojekyll"
 
       - name: Upload Pages artifact

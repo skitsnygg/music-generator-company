@@ -1,105 +1,219 @@
-#!/usr/bin/env bash
-set -euo pipefail
+cd ~/music-generator-company
 
-# publish_release_feed.sh
-#
-# Interview-ready internal release feed generator.
-# Writes /var/lib/mgc/releases/feed.json by scanning the release root.
-#
-# IMPORTANT:
-# - This script does NOT publish/copy snapshots. It only generates the feed.
-# - It delegates all feed logic to scripts/release_feed.py (single source of truth).
-#
-# Usage examples:
-#   scripts/publish_release_feed.sh
-#   sudo -E scripts/publish_release_feed.sh
-#   BASE_URL="https://example.com" scripts/publish_release_feed.sh
-#   scripts/publish_release_feed.sh --include-backups
+cat > scripts/release_feed.py <<'PY'
+#!/usr/bin/env python3
+from __future__ import annotations
 
-usage() {
-  cat <<'USAGE'
-usage: scripts/publish_release_feed.sh [--root-dir DIR] [--out FILE] [--max-items N] [--base-url URL] [--include-backups]
+import argparse
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-Defaults:
-  --root-dir   /var/lib/mgc/releases
-  --out        /var/lib/mgc/releases/feed.json
-  --max-items  200
-  --base-url   (empty => relative URLs)
-
-Notes:
-  - Delegates generation to scripts/release_feed.py
-  - Uses flock + atomic write + JSON validation
-  - By default excludes *.bak.* contexts and non-web dirs (run/submission/etc).
-USAGE
+ALWAYS_EXCLUDE_NAMES = {
+    "run",
+    "submission",
+    "web",          # container dir
+    "bundle",
+    "marketing",
+    "tracks",
+    "evidence",
+    "drop_bundle",
+    "receipts",
 }
 
-log() { printf '%s %s\n' "[release_feed]" "$*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
+def iso_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-ROOT_DIR="${ROOT_DIR:-/var/lib/mgc/releases}"
-OUT_JSON="${OUT_JSON:-$ROOT_DIR/feed.json}"
-LOCK_FILE="${LOCK_FILE:-$ROOT_DIR/.feed.lock}"
-MAX_ITEMS="${MAX_ITEMS:-200}"
-BASE_URL="${BASE_URL:-}"
-INCLUDE_BACKUPS="false"
+def read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-# Back-compat: accept --context but ignore it (older callers may still pass it)
-CONTEXT_IGNORED=""
+def mtime_iso(path: Path) -> str:
+    try:
+        ts = path.stat().st_mtime
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return "1970-01-01T00:00:00Z"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --root-dir) ROOT_DIR="${2:-}"; shift 2 ;;
-    --out) OUT_JSON="${2:-}"; shift 2 ;;
-    --max-items) MAX_ITEMS="${2:-}"; shift 2 ;;
-    --base-url) BASE_URL="${2:-}"; shift 2 ;;
-    --include-backups) INCLUDE_BACKUPS="true"; shift 1 ;;
-    --context) CONTEXT_IGNORED="${2:-}"; shift 2 ;; # ignored
-    -h|--help) usage; exit 0 ;;
-    *) die "unknown arg: $1" ;;
-  esac
-done
+def track_count_from_playlist(dirpath: Path) -> int:
+    p = dirpath / "playlist.json"
+    obj = read_json(p)
+    if not obj:
+        return 0
+    tracks = obj.get("tracks") or []
+    return len(tracks) if isinstance(tracks, list) else 0
 
-command -v python3 >/dev/null 2>&1 || die "python3 not found"
-command -v flock >/dev/null 2>&1 || die "flock not found"
+def looks_like_web_context_dir(d: Path) -> bool:
+    if not d.is_dir():
+        return False
+    return any((d / fn).exists() for fn in ("index.html", "web_manifest.json", "playlist.json"))
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GENERATOR="$SCRIPT_DIR/release_feed.py"
-[[ -f "$GENERATOR" ]] || die "missing generator: $GENERATOR"
+def is_context_name_allowed(name: str, *, include_backups: bool) -> bool:
+    if name in ALWAYS_EXCLUDE_NAMES:
+        return False
+    if not include_backups and ".bak." in name:
+        return False
+    if name.startswith("."):
+        return False
+    return True
 
-[[ -d "$ROOT_DIR" ]] || die "root dir not found: $ROOT_DIR"
-mkdir -p "$(dirname "$OUT_JSON")"
+def make_url(base_url: str, path: str) -> str:
+    base_url = (base_url or "").strip().rstrip("/")
+    return f"{base_url}{path}" if base_url else path
 
-# Lock
-exec 9>"$LOCK_FILE"
-flock -n 9 || die "another feed run is in progress (lock: $LOCK_FILE)"
+@dataclass(frozen=True)
+class ContextEntry:
+    context: str
+    kind: str
+    mtime: str
+    track_count: int
+    url: str
 
-tmp="$(mktemp "${OUT_JSON}.tmp.XXXXXX")"
-cleanup() { rm -f "$tmp" || true; }
-trap cleanup EXIT
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "context": self.context,
+            "kind": self.kind,
+            "mtime": self.mtime,
+            "track_count": self.track_count,
+            "url": self.url,
+        }
 
-log "ROOT_DIR=$ROOT_DIR"
-log "OUT_JSON=$OUT_JSON"
-log "MAX_ITEMS=$MAX_ITEMS"
-log "BASE_URL=${BASE_URL:-<empty>}"
-if [[ -n "$CONTEXT_IGNORED" ]]; then
-  log "NOTE: --context '$CONTEXT_IGNORED' is ignored (feed is global)"
-fi
+def discover_web_contexts(web_root: Path, *, include_backups: bool) -> List[Tuple[str, Path]]:
+    out: List[Tuple[str, Path]] = []
+    if not web_root.exists() or not web_root.is_dir():
+        return out
 
-args=( "--root-dir" "$ROOT_DIR" "--out" "$tmp" "--max-items" "$MAX_ITEMS" )
-if [[ -n "${BASE_URL:-}" ]]; then
-  args+=( "--base-url" "$BASE_URL" )
-fi
-if [[ "$INCLUDE_BACKUPS" == "true" ]]; then
-  args+=( "--include-backups" )
-fi
+    for child in web_root.iterdir():
+        if not child.is_dir():
+            continue
+        name = child.name
+        if not is_context_name_allowed(name, include_backups=include_backups):
+            continue
+        if looks_like_web_context_dir(child):
+            out.append((name, child))
 
-python3 "$GENERATOR" "${args[@]}"
+    out.sort(key=lambda x: x[0])
+    return out
 
-# Validate JSON before replacing existing feed
-python3 -m json.tool "$tmp" >/dev/null 2>&1 || die "generated feed.json is invalid JSON"
+def latest_section(latest_dir: Path, *, base_url: str, include_backups: bool) -> Dict[str, Any]:
+    web_root = latest_dir / "web"
+    contexts: List[Dict[str, Any]] = []
 
-# Atomic replace
-mv -f "$tmp" "$OUT_JSON"
-chmod 0644 "$OUT_JSON" || true
+    for ctx, ctx_dir in discover_web_contexts(web_root, include_backups=include_backups):
+        contexts.append(
+            ContextEntry(
+                context=ctx,
+                kind="web",
+                mtime=mtime_iso(ctx_dir),
+                track_count=track_count_from_playlist(ctx_dir),
+                url=make_url(base_url, f"/latest/web/{ctx}/"),
+            ).to_dict()
+        )
 
-log "OK wrote $OUT_JSON ($(wc -c <"$OUT_JSON" | tr -d ' ') bytes)"
+    return {"contexts": contexts}
+
+def is_release_dir(p: Path) -> bool:
+    if not p.is_dir():
+        return False
+    if p.name.startswith("."):
+        return False
+    if p.name in ("latest", "feed.json"):
+        return False
+    return True
+
+def releases_section(root_dir: Path, *, base_url: str, max_items: int, include_backups: bool) -> List[Dict[str, Any]]:
+    releases: List[Dict[str, Any]] = []
+    candidates = [p for p in root_dir.iterdir() if is_release_dir(p)]
+    candidates.sort(key=lambda p: p.name)
+
+    for rel in candidates:
+        web_root = rel / "web"
+        ctxs: List[Dict[str, Any]] = []
+
+        for ctx, ctx_dir in discover_web_contexts(web_root, include_backups=include_backups):
+            ctxs.append(
+                ContextEntry(
+                    context=ctx,
+                    kind="web",
+                    mtime=mtime_iso(ctx_dir),
+                    track_count=track_count_from_playlist(ctx_dir),
+                    url=make_url(base_url, f"/releases/{rel.name}/web/{ctx}/"),
+                ).to_dict()
+            )
+
+        if not ctxs:
+            continue
+
+        rel_mtime = "1970-01-01T00:00:00Z"
+        for c in ctxs:
+            rel_mtime = max(rel_mtime, c["mtime"])
+
+        releases.append(
+            {
+                "release_id": rel.name,
+                "mtime": rel_mtime,
+                "contexts": ctxs,
+                "url": make_url(base_url, f"/releases/{rel.name}/"),
+            }
+        )
+
+    releases.sort(key=lambda r: (r["mtime"], r["release_id"]), reverse=True)
+    if max_items > 0:
+        releases = releases[:max_items]
+    return releases
+
+def canonical_content(obj: Dict[str, Any]) -> bytes:
+    """
+    Canonical bytes for content hashing:
+    - remove generated_at (timestamp)
+    - remove content_sha256 itself
+    - stable JSON with sort_keys and compact separators
+    """
+    clone = dict(obj)
+    clone.pop("generated_at", None)
+    clone.pop("content_sha256", None)
+    return json.dumps(clone, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    data = json.dumps(obj, indent=2, sort_keys=True) + "\n"
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Generate MGC internal release feed.json")
+    ap.add_argument("--root-dir", default="/var/lib/mgc/releases")
+    ap.add_argument("--out", default="/var/lib/mgc/releases/feed.json")
+    ap.add_argument("--base-url", default="")
+    ap.add_argument("--max-items", type=int, default=200)
+    ap.add_argument("--include-backups", action="store_true")
+    ap.add_argument("--stable", action="store_true", help="Omit generated_at for byte-stable output")
+    args = ap.parse_args()
+
+    root = Path(args.root_dir)
+    out = Path(args.out)
+
+    feed: Dict[str, Any] = {
+        "schema_version": 1,
+        "latest": latest_section(root / "latest", base_url=args.base_url, include_backups=args.include_backups),
+        "releases": releases_section(root, base_url=args.base_url, max_items=args.max_items, include_backups=args.include_backups),
+    }
+
+    if not args.stable:
+        feed["generated_at"] = iso_now()
+
+    feed["content_sha256"] = hashlib.sha256(canonical_content(feed)).hexdigest()
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(out, feed)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
