@@ -113,3 +113,47 @@ jobs:
             /tmp/mgc_prod_autonomous_web/**
             data/submissions/**
           if-no-files-found: warn
+
+      - name: Promote release to /var/lib/mgc/releases
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUT_DIR="/tmp/mgc_prod_autonomous"
+          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
+
+          # Parse drop_id from the autonomous output JSON
+          DROP_ID="$(python - <<'PY'
+
+import json
+p="/tmp/mgc_prod_autonomous/autonomous.json"
+with open(p,"r",encoding="utf-8") as f:
+    obj=json.load(f)
+print(obj["drop"]["ids"]["drop_id"])
+PY
+          )"
+
+          RELEASE_ROOT="/var/lib/mgc/releases"
+          RELEASE_DIR="$RELEASE_ROOT/$DROP_ID"
+
+          sudo mkdir -p "$RELEASE_DIR"
+          sudo mkdir -p "$RELEASE_DIR/web"
+
+          # Copy web bundle
+          sudo rsync -a --delete "$WEB_OUT_DIR/" "$RELEASE_DIR/web/"
+
+          # Copy submission artifacts (zip + receipts)
+          sudo mkdir -p "$RELEASE_DIR/submission"
+          sudo rsync -a "data/submissions/$DROP_ID/" "$RELEASE_DIR/submission/"
+
+          # Copy evidence for convenience
+          sudo rsync -a "$OUT_DIR/" "$RELEASE_DIR/run/"
+
+          # Update latest symlink atomically
+          sudo ln -sfn "$RELEASE_DIR" "$RELEASE_ROOT/latest"
+
+          # Fix perms so the web server can read
+          sudo chmod -R a+rX "$RELEASE_DIR"
+
+          echo "Promoted release: $RELEASE_DIR"
+          echo "Latest -> $(readlink -f "$RELEASE_ROOT/latest")"
