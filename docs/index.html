@@ -1,49 +1,990 @@
-cd ~/music-generator-company
-mkdir -p docs/releases
-
-cat > docs/index.html <<'HTML'
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>MGC Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Music Generator Company — Player</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; line-height: 1.45; }
-    code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 4px; }
-    .box { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
-    a { text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    :root{
+      --bg: #0b0f19;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.09);
+      --border: rgba(255,255,255,0.12);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.62);
+      --muted2: rgba(255,255,255,0.45);
+      --accent: #7c5cff;
+      --accent2: #35d6c7;
+      --danger: #ff5c7a;
+      --ok: #37d67a;
+      --shadow: 0 12px 40px rgba(0,0,0,0.45);
+      --radius: 16px;
+      --radius2: 22px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    @media (prefers-color-scheme: light){
+      :root{
+        --bg:#f6f7fb;
+        --panel: rgba(0,0,0,0.05);
+        --panel2: rgba(0,0,0,0.07);
+        --border: rgba(0,0,0,0.12);
+        --text: rgba(0,0,0,0.88);
+        --muted: rgba(0,0,0,0.60);
+        --muted2: rgba(0,0,0,0.42);
+        --shadow: 0 12px 40px rgba(0,0,0,0.18);
+      }
+    }
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; }
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 700px at 20% 10%, rgba(124,92,255,0.22), transparent 55%),
+        radial-gradient(900px 600px at 80% 20%, rgba(53,214,199,0.16), transparent 60%),
+        radial-gradient(1000px 800px at 50% 110%, rgba(124,92,255,0.14), transparent 60%),
+        var(--bg);
+      color:var(--text);
+      font-family:var(--sans);
+      line-height:1.35;
+    }
+    a{ color:inherit; text-decoration:none; }
+    a:hover{ text-decoration:underline; }
+
+    .wrap{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 26px 18px 40px;
+    }
+    .top{
+      display:flex;
+      gap:16px;
+      align-items:center;
+      justify-content:space-between;
+      margin-bottom: 18px;
+    }
+    .brand{
+      display:flex;
+      gap:14px;
+      align-items:center;
+      min-width: 260px;
+    }
+    .logo{
+      width:44px;height:44px;border-radius:14px;
+      background:
+        linear-gradient(135deg, rgba(124,92,255,0.95), rgba(53,214,199,0.85));
+      box-shadow: var(--shadow);
+    }
+    .brand h1{
+      font-size: 16px;
+      margin:0;
+      letter-spacing:0.2px;
+    }
+    .brand .sub{
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .pillbar{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:8px 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--muted);
+      backdrop-filter: blur(8px);
+    }
+    .pill code{
+      font-family:var(--mono);
+      font-size: 11px;
+      color: var(--text);
+    }
+
+    .grid{
+      display:grid;
+      grid-template-columns: 360px 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 980px){
+      .grid{ grid-template-columns: 1fr; }
+    }
+    .card{
+      background: linear-gradient(180deg, var(--panel), rgba(255,255,255,0.03));
+      border: 1px solid var(--border);
+      border-radius: var(--radius2);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .cardHead{
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--border);
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 10px;
+    }
+    .cardTitle{
+      margin:0;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+    }
+    .cardMeta{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .cardBody{
+      padding: 14px;
+    }
+
+    .row{
+      display:flex;
+      gap:10px;
+      align-items:center;
+    }
+    .spacer{ flex:1; }
+
+    .btn{
+      appearance:none;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      cursor:pointer;
+      transition: transform .06s ease, background .12s ease;
+      user-select:none;
+      display:inline-flex;
+      gap: 8px;
+      align-items:center;
+      justify-content:center;
+      backdrop-filter: blur(8px);
+    }
+    .btn:hover{ background: var(--panel2); }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{
+      border-color: rgba(124,92,255,0.45);
+      background: linear-gradient(135deg, rgba(124,92,255,0.35), rgba(53,214,199,0.12));
+    }
+    .btn.danger{
+      border-color: rgba(255,92,122,0.35);
+    }
+    .btn.small{ padding: 8px 10px; border-radius: 10px; }
+
+    .input{
+      width:100%;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.12);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      outline:none;
+    }
+    @media (prefers-color-scheme: light){
+      .input{ background: rgba(255,255,255,0.55); }
+    }
+
+    .list{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .item{
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.10);
+      border-radius: 14px;
+      padding: 12px;
+      cursor:pointer;
+      transition: background .12s ease, transform .06s ease;
+    }
+    @media (prefers-color-scheme: light){
+      .item{ background: rgba(255,255,255,0.55); }
+    }
+    .item:hover{ background: var(--panel2); }
+    .item:active{ transform: translateY(1px); }
+    .item.active{
+      border-color: rgba(124,92,255,0.55);
+      background: linear-gradient(135deg, rgba(124,92,255,0.20), rgba(53,214,199,0.10));
+    }
+    .itemTop{
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .badge{
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      white-space:nowrap;
+    }
+    .itemTitle{
+      font-size: 13px;
+      margin:0;
+      color: var(--text);
+      letter-spacing:0.1px;
+    }
+    .itemSub{
+      margin-top: 6px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .now{
+      display:flex;
+      gap:14px;
+      align-items:flex-start;
+    }
+    .cover{
+      width: 88px;
+      height: 88px;
+      border-radius: 18px;
+      background:
+        radial-gradient(60px 60px at 30% 30%, rgba(124,92,255,0.55), transparent 60%),
+        radial-gradient(70px 70px at 70% 60%, rgba(53,214,199,0.45), transparent 62%),
+        rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      flex: 0 0 auto;
+    }
+    .now h2{
+      margin:0;
+      font-size: 16px;
+      letter-spacing:0.2px;
+    }
+    .muted{ color: var(--muted); }
+    .mono{ font-family: var(--mono); }
+
+    .player{
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(0,0,0,0.10);
+    }
+    @media (prefers-color-scheme: light){
+      .player{ background: rgba(255,255,255,0.55); }
+    }
+    audio{ width: 100%; }
+
+    .controls{
+      display:flex;
+      gap: 10px;
+      align-items:center;
+      flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    .kbd{
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      padding: 3px 6px;
+      border-radius: 8px;
+    }
+
+    .toast{
+      position: fixed;
+      left: 18px;
+      bottom: 18px;
+      max-width: 520px;
+      padding: 12px 12px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.72);
+      color: rgba(255,255,255,0.92);
+      border: 1px solid rgba(255,255,255,0.16);
+      box-shadow: var(--shadow);
+      display:none;
+      z-index: 9999;
+      backdrop-filter: blur(10px);
+    }
+    .toast.show{ display:block; }
+    .toast .t1{ font-size: 12px; margin:0; }
+    .toast .t2{ font-size: 12px; margin: 6px 0 0; color: rgba(255,255,255,0.70); }
+    @media (prefers-color-scheme: light){
+      .toast{
+        background: rgba(255,255,255,0.92);
+        color: rgba(0,0,0,0.86);
+        border-color: rgba(0,0,0,0.12);
+      }
+      .toast .t2{ color: rgba(0,0,0,0.55); }
+    }
+
+    .hr{
+      height:1px;
+      background: var(--border);
+      margin: 12px 0;
+    }
+
+    .foot{
+      margin-top: 16px;
+      color: var(--muted2);
+      font-size: 12px;
+    }
+    .foot code{ font-family: var(--mono); }
   </style>
 </head>
+
 <body>
-  <h1>Music Generator Company (MGC) Demo</h1>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <h1>Music Generator Company</h1>
+          <div class="sub">Release feed browser + web player</div>
+        </div>
+      </div>
+      <div class="pillbar">
+        <div class="pill">Feed: <code id="pillFeed">/releases/feed.json</code></div>
+        <div class="pill">Mode: <code id="pillMode">auto</code></div>
+        <div class="pill">Context: <code id="pillCtx">—</code></div>
+      </div>
+    </div>
 
-  <div class="box">
-    <h2>Release Feed</h2>
-    <p>
-      <a href="./releases/feed.json">./releases/feed.json</a>
-      <br />
-      This is a static demo feed (GitHub Pages) generated with <code>--stable</code>.
-    </p>
+    <div class="grid">
+      <!-- LEFT: Releases / Contexts -->
+      <div class="card">
+        <div class="cardHead">
+          <div>
+            <p class="cardTitle">Browse latest contexts</p>
+            <div class="cardMeta">Select a context to load its web bundle.</div>
+          </div>
+          <button class="btn small" id="btnReload" title="Reload feed">Reload</button>
+        </div>
+        <div class="cardBody">
+          <div class="row" style="margin-bottom:10px;">
+            <input class="input" id="search" placeholder="Filter contexts (focus, sleep, workout)..." />
+          </div>
+          <div class="list" id="contexts"></div>
+
+          <div class="hr"></div>
+
+          <div class="row" style="gap:8px; flex-wrap:wrap;">
+            <button class="btn small" id="btnCopyLink" title="Copy share link for current context">Copy link</button>
+            <button class="btn small" id="btnOpenBundle" title="Open the bundle folder">Open bundle</button>
+            <div class="spacer"></div>
+            <span class="kbd">J/K</span><span class="kbd">Play/Pause</span><span class="kbd">N/P</span>
+          </div>
+
+          <div class="foot">
+            Works on VM (<code>/releases/feed.json</code>) and GitHub Pages (auto-detects repo base path).
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Player -->
+      <div class="card">
+        <div class="cardHead">
+          <div>
+            <p class="cardTitle">Now playing</p>
+            <div class="cardMeta" id="nowMeta">Choose a context on the left.</div>
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn small" id="btnPrev" title="Previous track">Prev</button>
+            <button class="btn small primary" id="btnPlay" title="Play/Pause">Play</button>
+            <button class="btn small" id="btnNext" title="Next track">Next</button>
+          </div>
+        </div>
+        <div class="cardBody">
+          <div class="now">
+            <div class="cover" id="cover"></div>
+            <div style="min-width:0;">
+              <h2 id="trackTitle">—</h2>
+              <div class="muted" id="trackSub" style="margin-top:6px;">—</div>
+              <div class="muted mono" id="trackPath" style="margin-top:8px; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></div>
+            </div>
+          </div>
+
+          <div class="player">
+            <audio id="audio" controls preload="metadata"></audio>
+            <div class="controls">
+              <button class="btn small" id="btnSeekBack" title="Back 10s">-10s</button>
+              <button class="btn small" id="btnSeekFwd" title="Forward 10s">+10s</button>
+              <div class="spacer"></div>
+              <span class="muted" style="font-size:12px;">Volume</span>
+              <input id="vol" type="range" min="0" max="1" step="0.01" value="0.85" style="width:160px;">
+            </div>
+          </div>
+
+          <div class="hr"></div>
+
+          <div class="row" style="margin-bottom:10px;">
+            <input class="input" id="trackFilter" placeholder="Filter tracks..." />
+          </div>
+          <div class="list" id="tracks"></div>
+
+          <div class="foot" id="bundleFoot"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div class="box">
-    <h2>What this shows</h2>
-    <ul>
-      <li><strong>VM/Production</strong>: a live feed served by nginx at <code>/releases/feed.json</code>.</li>
-      <li><strong>GitHub Pages</strong>: a static feed served from this site at <code>./releases/feed.json</code>.</li>
-      <li>The feed includes <code>content_sha256</code> so you can prove deterministic content even when timestamps change.</li>
-    </ul>
+  <div class="toast" id="toast">
+    <p class="t1" id="toastT1"></p>
+    <p class="t2" id="toastT2"></p>
   </div>
 
-  <div class="box">
-    <h2>Notes</h2>
-    <p>
-      If you run this locally, your nginx-served feed will be at <code>/releases/feed.json</code>.
-      The Pages feed is just a fixture-backed demo.
-    </p>
-  </div>
+  <script>
+    "use strict";
+
+    function $(id){ return document.getElementById(id); }
+
+    function toast(t1, t2){
+      const el = $("toast");
+      $("toastT1").textContent = t1 || "";
+      $("toastT2").textContent = t2 || "";
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 2600);
+    }
+
+    function fmtIso(iso){
+      if (!iso) return "—";
+      try{
+        const d = new Date(iso);
+        return d.toISOString().replace(".000Z","Z");
+      }catch{
+        return iso;
+      }
+    }
+
+    function basePrefix(){
+      // Works on:
+      // - VM: http://host/ -> prefix ""
+      // - Pages: https://host/<repo>/ -> prefix "/<repo>"
+      // Strategy: use the directory containing this index.html as base.
+      // If index is at "/music-generator-company/", prefix is "/music-generator-company".
+      const p = window.location.pathname;
+      if (p.endsWith("/index.html")) return p.slice(0, -"/index.html".length);
+      if (p.endsWith("/")) return p.slice(0, -1);
+      return p;
+    }
+
+    function urlJoin(prefix, path){
+      // prefix like "" or "/music-generator-company"
+      if (!prefix) return path.startsWith("/") ? path : ("/" + path);
+      if (!path.startsWith("/")) path = "/" + path;
+      return prefix + path;
+    }
+
+    function resolveFeedUrl(){
+      const prefix = basePrefix();
+      // prefer absolute path (works on VM); if Pages, prefix is non-empty.
+      return urlJoin(prefix, "/releases/feed.json");
+    }
+
+    async function fetchJson(url){
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+      return await r.json();
+    }
+
+    function pickDefaultContext(feed){
+      // Prefer focus, else first context
+      const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+      const focus = ctxs.find(x => x.context === "focus");
+      return focus || ctxs[0] || null;
+    }
+
+    function isAudioPath(p){
+      return typeof p === "string" && (p.endsWith(".mp3") || p.endsWith(".wav") || p.endsWith(".ogg") || p.endsWith(".m4a"));
+    }
+
+    function playlistTracks(playlist){
+      // Support a few shapes:
+      // - { tracks: [{ path, title, id, ... }...] }
+      // - array of tracks
+      // - { items: [...] }
+      if (!playlist) return [];
+      if (Array.isArray(playlist)) return playlist;
+      if (Array.isArray(playlist.tracks)) return playlist.tracks;
+      if (Array.isArray(playlist.items)) return playlist.items;
+      return [];
+    }
+
+    function trackDisplay(t, idx){
+      const title =
+        t.title ||
+        t.name ||
+        t.track_title ||
+        (t.id ? `Track ${String(t.id).slice(0,8)}` : `Track ${idx+1}`);
+
+      // Try common keys for audio path
+      const path =
+        t.web_path ||
+        t.webPath ||
+        t.dest ||
+        t.path ||
+        t.audio ||
+        t.audio_path ||
+        t.file ||
+        "";
+
+      return { title, path, raw: t };
+    }
+
+    function normalizeBundleBase(ctx){
+      // Feed gives url like "/latest/web/focus/"
+      // On Pages, you probably host bundles under the repo root; for demo you may only have feed+fixtures.
+      // Still, this supports VM and Pages if you choose to publish bundles similarly.
+      const prefix = basePrefix();
+      const u = (ctx && ctx.url) ? ctx.url : "";
+      return urlJoin(prefix, u);
+    }
+
+    function withTrailingSlash(u){
+      return u.endsWith("/") ? u : (u + "/");
+    }
+
+    async function loadBundle(ctx){
+      const bundleBase = withTrailingSlash(normalizeBundleBase(ctx));
+      const playlistUrl = bundleBase + "playlist.json";
+      const manifestUrl = bundleBase + "web_manifest.json";
+
+      const [playlist, manifest] = await Promise.all([
+        fetchJson(playlistUrl),
+        fetchJson(manifestUrl).catch(() => null),
+      ]);
+
+      return { bundleBase, playlistUrl, manifestUrl, playlist, manifest };
+    }
+
+    function setActiveContext(name){
+      $("pillCtx").textContent = name || "—";
+    }
+
+    function setModeLabel(){
+      const p = basePrefix();
+      $("pillMode").textContent = p ? "pages" : "vm";
+    }
+
+    function renderContexts(feed){
+      const list = $("contexts");
+      list.innerHTML = "";
+
+      const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+      const filtered = ctxs.filter(x => x.kind === "web");
+
+      const q = $("search").value.trim().toLowerCase();
+      const shown = q ? filtered.filter(x => (x.context || "").toLowerCase().includes(q)) : filtered;
+
+      if (!shown.length){
+        const div = document.createElement("div");
+        div.className = "muted";
+        div.textContent = "No contexts found.";
+        list.appendChild(div);
+        return;
+      }
+
+      for (const c of shown){
+        const div = document.createElement("div");
+        div.className = "item";
+        div.dataset.context = c.context;
+
+        const mtime = fmtIso(c.mtime);
+        const tracks = (typeof c.track_count === "number") ? c.track_count : null;
+        const url = c.url || "";
+
+        div.innerHTML = `
+          <div class="itemTop">
+            <span class="badge">context</span>
+            <h3 class="itemTitle">${escapeHtml(c.context)}</h3>
+            <span class="spacer"></span>
+            <span class="badge">${tracks === null ? "—" : (tracks + " tracks")}</span>
+          </div>
+          <div class="itemSub">
+            <span>mtime: <span class="mono">${escapeHtml(mtime)}</span></span>
+            <span>url: <span class="mono">${escapeHtml(url)}</span></span>
+          </div>
+        `;
+        list.appendChild(div);
+      }
+    }
+
+    function escapeHtml(s){
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        "\"":"&quot;",
+        "'":"&#039;",
+      }[c]));
+    }
+
+    function renderTracks(state){
+      const list = $("tracks");
+      list.innerHTML = "";
+
+      const q = $("trackFilter").value.trim().toLowerCase();
+      const tracks = state.tracks || [];
+      const shown = q ? tracks.filter(t => (t.title || "").toLowerCase().includes(q)) : tracks;
+
+      if (!shown.length){
+        const div = document.createElement("div");
+        div.className = "muted";
+        div.textContent = "No tracks loaded.";
+        list.appendChild(div);
+        return;
+      }
+
+      for (const t of shown){
+        const div = document.createElement("div");
+        div.className = "item";
+        div.dataset.idx = String(t.idx);
+
+        const active = (state.currentIdx === t.idx);
+        if (active) div.classList.add("active");
+
+        const p = t.path || "—";
+        const badge = isAudioPath(p) ? "audio" : "file";
+
+        div.innerHTML = `
+          <div class="itemTop">
+            <span class="badge">${badge}</span>
+            <h3 class="itemTitle">${escapeHtml(t.title)}</h3>
+            <span class="spacer"></span>
+            <span class="badge">#${t.idx + 1}</span>
+          </div>
+          <div class="itemSub">
+            <span class="mono" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 100%;">${escapeHtml(p)}</span>
+          </div>
+        `;
+        list.appendChild(div);
+      }
+    }
+
+    function setNowPlaying(state){
+      const t = state.tracks && state.tracks[state.currentIdx] ? state.tracks[state.currentIdx] : null;
+
+      if (!t){
+        $("trackTitle").textContent = "—";
+        $("trackSub").textContent = "—";
+        $("trackPath").textContent = "";
+        $("nowMeta").textContent = "Choose a context on the left.";
+        $("bundleFoot").textContent = "";
+        return;
+      }
+
+      $("trackTitle").textContent = t.title;
+      $("trackSub").textContent = state.context ? `context: ${state.context.context}` : "context: —";
+      $("trackPath").textContent = t.src || "";
+
+      const gen = state.feed && state.feed.generated_at ? fmtIso(state.feed.generated_at) : "—";
+      const sha = state.feed && state.feed.content_sha256 ? state.feed.content_sha256.slice(0, 16) + "…" : "—";
+      $("nowMeta").textContent = `feed generated_at: ${gen} • content_sha256: ${sha}`;
+
+      const footBits = [];
+      if (state.bundleBase) footBits.push(`bundle: ${state.bundleBase}`);
+      if (state.playlistUrl) footBits.push(`playlist: ${state.playlistUrl}`);
+      if (state.manifestUrl) footBits.push(`manifest: ${state.manifestUrl}`);
+      $("bundleFoot").textContent = footBits.join(" • ");
+    }
+
+    function setAudioSource(state){
+      const audio = $("audio");
+      const t = state.tracks && state.tracks[state.currentIdx] ? state.tracks[state.currentIdx] : null;
+      if (!t) return;
+
+      audio.src = t.src;
+      audio.load();
+      $("btnPlay").textContent = "Play";
+    }
+
+    function computeTrackSrc(bundleBase, path){
+      if (!path) return "";
+      // If path already absolute or full URL, keep it
+      if (path.startsWith("http://") || path.startsWith("https://")) return path;
+      if (path.startsWith("/")) {
+        // absolute to host; if pages has prefix, map it
+        return urlJoin(basePrefix(), path);
+      }
+      // relative within bundle
+      return withTrailingSlash(bundleBase) + path.replace(/^\.?\//, "");
+    }
+
+    function pickPlayableTrack(list){
+      // pick first that looks like audio
+      const idx = list.findIndex(t => isAudioPath(t.path || ""));
+      return idx >= 0 ? idx : 0;
+    }
+
+    function copyToClipboard(text){
+      return navigator.clipboard.writeText(text);
+    }
+
+    function currentShareUrl(state){
+      const u = new URL(window.location.href);
+      if (state && state.context && state.context.context){
+        u.searchParams.set("context", state.context.context);
+      }
+      return u.toString();
+    }
+
+    function setActiveContextItem(name){
+      const items = $("contexts").querySelectorAll(".item");
+      for (const it of items){
+        it.classList.toggle("active", it.dataset.context === name);
+      }
+    }
+
+    async function loadAndRender(state, ctx){
+      try{
+        setActiveContext(ctx.context);
+        setActiveContextItem(ctx.context);
+        state.context = ctx;
+
+        const bundle = await loadBundle(ctx);
+        state.bundleBase = bundle.bundleBase;
+        state.playlistUrl = bundle.playlistUrl;
+        state.manifestUrl = bundle.manifestUrl;
+        state.playlist = bundle.playlist;
+        state.manifest = bundle.manifest;
+
+        const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
+          const d = trackDisplay(t, i);
+          return { idx: i, title: d.title, path: d.path, raw: d.raw };
+        });
+
+        // Some playlists store file paths in manifest instead; attempt a fallback if all missing
+        const anyPath = rawTracks.some(t => t.path);
+        const tracks = rawTracks.map(t => {
+          const src = computeTrackSrc(bundle.bundleBase, t.path);
+          return { ...t, src };
+        });
+
+        state.tracks = tracks;
+        state.currentIdx = Math.max(0, Math.min(state.currentIdx, tracks.length - 1));
+
+        if (!tracks.length){
+          toast("No tracks", "playlist.json contained no playable tracks.");
+        }else{
+          state.currentIdx = pickPlayableTrack(tracks);
+        }
+
+        renderTracks(state);
+        setNowPlaying(state);
+        setAudioSource(state);
+        toast("Loaded", `context "${ctx.context}"`);
+      }catch (e){
+        console.error(e);
+        toast("Failed to load bundle", String(e && e.message ? e.message : e));
+      }
+    }
+
+    async function loadFeed(state){
+      const feedUrl = resolveFeedUrl();
+      $("pillFeed").textContent = feedUrl.replace(window.location.origin, "");
+      const feed = await fetchJson(feedUrl);
+      state.feed = feed;
+      return feed;
+    }
+
+    function findContextByName(feed, name){
+      const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+      return ctxs.find(x => x.kind === "web" && x.context === name) || null;
+    }
+
+    function moveSelection(state, delta){
+      const ctxs = (state.feed && state.feed.latest && Array.isArray(state.feed.latest.contexts)) ? state.feed.latest.contexts : [];
+      const web = ctxs.filter(x => x.kind === "web");
+      if (!web.length) return;
+
+      const curName = state.context ? state.context.context : null;
+      const i = curName ? web.findIndex(x => x.context === curName) : 0;
+      const j = Math.max(0, Math.min(web.length - 1, i + delta));
+      const next = web[j];
+      if (next) loadAndRender(state, next);
+    }
+
+    function playPause(){
+      const a = $("audio");
+      if (!a.src){
+        toast("No track loaded", "Pick a context first.");
+        return;
+      }
+      if (a.paused){
+        a.play().catch(() => {});
+        $("btnPlay").textContent = "Pause";
+      }else{
+        a.pause();
+        $("btnPlay").textContent = "Play";
+      }
+    }
+
+    function nextTrack(state, delta){
+      if (!state.tracks || !state.tracks.length) return;
+      const n = state.tracks.length;
+      state.currentIdx = (state.currentIdx + delta + n) % n;
+      renderTracks(state);
+      setNowPlaying(state);
+      setAudioSource(state);
+      // Auto-play if already playing
+      const a = $("audio");
+      if (!a.paused){
+        a.play().catch(() => {});
+        $("btnPlay").textContent = "Pause";
+      }
+    }
+
+    function seekBy(seconds){
+      const a = $("audio");
+      if (!isFinite(a.duration)) return;
+      a.currentTime = Math.max(0, Math.min(a.duration, a.currentTime + seconds));
+    }
+
+    async function main(){
+      const state = {
+        feed: null,
+        context: null,
+        playlist: null,
+        manifest: null,
+        tracks: [],
+        currentIdx: 0,
+        bundleBase: "",
+        playlistUrl: "",
+        manifestUrl: "",
+      };
+
+      setModeLabel();
+
+      // Load feed + render list
+      try{
+        const feed = await loadFeed(state);
+        renderContexts(feed);
+
+        // Support ?context=focus
+        const u = new URL(window.location.href);
+        const want = u.searchParams.get("context");
+        const initial = want ? findContextByName(feed, want) : pickDefaultContext(feed);
+
+        if (initial){
+          await loadAndRender(state, initial);
+        }else{
+          toast("No contexts", "Feed had no web contexts.");
+        }
+      }catch (e){
+        console.error(e);
+        toast("Feed load failed", String(e && e.message ? e.message : e));
+      }
+
+      // UI handlers
+      $("btnReload").addEventListener("click", async () => {
+        try{
+          const feed = await loadFeed(state);
+          renderContexts(feed);
+          toast("Feed reloaded", "Loaded latest contexts.");
+        }catch (e){
+          toast("Reload failed", String(e && e.message ? e.message : e));
+        }
+      });
+
+      $("search").addEventListener("input", () => {
+        renderContexts(state.feed);
+      });
+
+      $("contexts").addEventListener("click", async (ev) => {
+        const item = ev.target.closest(".item");
+        if (!item) return;
+        const name = item.dataset.context;
+        const ctx = findContextByName(state.feed, name);
+        if (ctx) await loadAndRender(state, ctx);
+      });
+
+      $("trackFilter").addEventListener("input", () => {
+        renderTracks(state);
+      });
+
+      $("tracks").addEventListener("click", (ev) => {
+        const item = ev.target.closest(".item");
+        if (!item) return;
+        const idx = parseInt(item.dataset.idx || "0", 10);
+        if (!Number.isFinite(idx)) return;
+        state.currentIdx = idx;
+        renderTracks(state);
+        setNowPlaying(state);
+        setAudioSource(state);
+      });
+
+      $("btnPlay").addEventListener("click", () => playPause());
+      $("btnPrev").addEventListener("click", () => nextTrack(state, -1));
+      $("btnNext").addEventListener("click", () => nextTrack(state, +1));
+      $("btnSeekBack").addEventListener("click", () => seekBy(-10));
+      $("btnSeekFwd").addEventListener("click", () => seekBy(+10));
+
+      $("vol").addEventListener("input", (ev) => {
+        const v = parseFloat(ev.target.value);
+        $("audio").volume = Math.max(0, Math.min(1, v));
+      });
+      $("audio").volume = parseFloat($("vol").value);
+
+      $("audio").addEventListener("play", () => { $("btnPlay").textContent = "Pause"; });
+      $("audio").addEventListener("pause", () => { $("btnPlay").textContent = "Play"; });
+      $("audio").addEventListener("ended", () => { nextTrack(state, +1); });
+
+      $("btnCopyLink").addEventListener("click", async () => {
+        try{
+          const u = currentShareUrl(state);
+          await copyToClipboard(u);
+          toast("Copied link", u);
+        }catch{
+          toast("Copy failed", "Your browser blocked clipboard access.");
+        }
+      });
+
+      $("btnOpenBundle").addEventListener("click", () => {
+        if (!state.context || !state.context.url){
+          toast("No bundle", "Pick a context first.");
+          return;
+        }
+        const u = normalizeBundleBase(state.context);
+        window.open(u, "_blank", "noopener");
+      });
+
+      // Keyboard shortcuts:
+      // J/K = move context selection
+      // Space = play/pause
+      // N/P = next/prev track
+      // Left/Right = seek
+      window.addEventListener("keydown", (ev) => {
+        const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
+        const inInput = tag === "input" || tag === "textarea";
+        if (inInput) return;
+
+        if (ev.key === " "){
+          ev.preventDefault();
+          playPause();
+          return;
+        }
+        if (ev.key === "j" || ev.key === "J"){ moveSelection(state, +1); return; }
+        if (ev.key === "k" || ev.key === "K"){ moveSelection(state, -1); return; }
+        if (ev.key === "n" || ev.key === "N"){ nextTrack(state, +1); return; }
+        if (ev.key === "p" || ev.key === "P"){ nextTrack(state, -1); return; }
+        if (ev.key === "ArrowLeft"){ seekBy(-5); return; }
+        if (ev.key === "ArrowRight"){ seekBy(+5); return; }
+      });
+    }
+
+    main();
+  </script>
 </body>
 </html>
-HTML
