@@ -2,7 +2,7 @@ name: Scheduled Drops (Prod)
 
 on:
   schedule:
-    # 09:00 America/Sao_Paulo == 12:00 UTC (but GitHub cron is UTC)
+    # 09:00 America/Sao_Paulo == 12:00 UTC (GitHub cron is UTC)
     - cron: "0 12 * * *"
   workflow_dispatch:
 
@@ -15,12 +15,10 @@ jobs:
     runs-on: [self-hosted, mgc-prod]
 
     env:
-      # Use the persistent prod DB
+      # Persistent prod DB
       MGC_DB: /var/lib/mgc/db.sqlite
 
-      # Keep these set if you want filesystem provider later, but do NOT hard-fail if empty.
-      # If your provider is still stub in prod, leaving these set won't hurt, but they may be unused.
-      MGC_PROVIDER: filesystem
+      # Keep these for later if/when you switch to filesystem provider
       MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
 
       # Ensure scheduled runs use real time (not deterministic CI time)
@@ -69,12 +67,12 @@ jobs:
           python -m mgc.main --db "$MGC_DB" db migrate
           python -m mgc.main --db "$MGC_DB" db status --json
 
-      - name: Provider check
+      - name: Provider check (non-blocking)
         shell: bash
         continue-on-error: true
         run: |
           set -euxo pipefail
-          python -m mgc.main --db "$MGC_DB" providers check --json
+          python -m mgc.main --db "$MGC_DB" providers check --json || true
 
       - name: Run autonomous drop (end-to-end)
         shell: bash
@@ -87,8 +85,7 @@ jobs:
           rm -rf "$OUT_DIR" "$WEB_OUT_DIR"
           mkdir -p "$OUT_DIR" "$WEB_OUT_DIR"
 
-          # Run the full cron-safe pipeline.
-          # - contract local: validates presence + submission_zip without requiring publish contract inputs.
+          # Force stub provider for now (until filesystem audio_pool is populated)
           MGC_PROVIDER=stub python -m mgc.main --db "$MGC_DB" run autonomous \
             --context focus \
             --seed 1 \
@@ -97,7 +94,6 @@ jobs:
             --web-out-dir "$WEB_OUT_DIR" \
             --contract local \
             --json | tee "$OUT_DIR/autonomous.json"
-
 
           echo "Autonomous outputs:"
           find "$OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
@@ -121,38 +117,32 @@ jobs:
 
           OUT_DIR="/tmp/mgc_prod_autonomous"
           WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
+          AUTON_JSON="$OUT_DIR/autonomous.json"
 
-          # Parse drop_id from the autonomous output JSON
-          DROP_ID="$(python - <<'PY'
+          test -f "$AUTON_JSON"
 
-import json
-p="/tmp/mgc_prod_autonomous/autonomous.json"
-with open(p,"r",encoding="utf-8") as f:
-    obj=json.load(f)
-print(obj["drop"]["ids"]["drop_id"])
-PY
-          )"
+          # Parse drop_id from autonomous.json (no heredoc; avoids YAML indentation pitfalls)
+          DROP_ID="$(python -c 'import json; p="'"$AUTON_JSON"'"; obj=json.load(open(p,"r",encoding="utf-8")); print(obj["drop"]["ids"]["drop_id"])')"
+          echo "DROP_ID=$DROP_ID"
 
           RELEASE_ROOT="/var/lib/mgc/releases"
           RELEASE_DIR="$RELEASE_ROOT/$DROP_ID"
 
-          sudo mkdir -p "$RELEASE_DIR"
-          sudo mkdir -p "$RELEASE_DIR/web"
+          sudo mkdir -p "$RELEASE_DIR/web" "$RELEASE_DIR/submission" "$RELEASE_DIR/run"
 
           # Copy web bundle
           sudo rsync -a --delete "$WEB_OUT_DIR/" "$RELEASE_DIR/web/"
 
           # Copy submission artifacts (zip + receipts)
-          sudo mkdir -p "$RELEASE_DIR/submission"
           sudo rsync -a "data/submissions/$DROP_ID/" "$RELEASE_DIR/submission/"
 
-          # Copy evidence for convenience
+          # Copy run evidence for convenience
           sudo rsync -a "$OUT_DIR/" "$RELEASE_DIR/run/"
 
           # Update latest symlink atomically
           sudo ln -sfn "$RELEASE_DIR" "$RELEASE_ROOT/latest"
 
-          # Fix perms so the web server can read
+          # Fix perms so nginx can read
           sudo chmod -R a+rX "$RELEASE_DIR"
 
           echo "Promoted release: $RELEASE_DIR"
