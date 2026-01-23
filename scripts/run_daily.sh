@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Repo root (assumes this script lives under scripts/ in the repo)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 PY="${PYTHON:-python}"
 
-# Defaults (override via env vars if you want)
+# Defaults (override via env vars if desired)
 DB_PATH="${MGC_DB:-data/db.sqlite}"
 OUT_BASE="${MGC_OUT_BASE:-data/evidence}"
 SEED="${MGC_SEED:-1}"
@@ -18,7 +19,7 @@ CONTEXTS=(${MGC_CONTEXTS:-focus workout sleep})
 log() { printf "[run_daily] %s\n" "$*"; }
 die() { printf "[run_daily] ERROR: %s\n" "$*" >&2; exit 2; }
 
-# Prevent overlapping runs (works on macOS + Linux)
+# Prevent overlapping runs (portable: works on macOS + Linux)
 LOCK_DIR="${ROOT}/.run_daily.lock"
 cleanup() { rmdir "${LOCK_DIR}" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
@@ -30,7 +31,7 @@ else
   exit 0
 fi
 
-# Prefer existing venv if present, but don't hard-require it (cron environments vary)
+# Prefer existing venv if present (cron environments vary)
 if [[ -f "${ROOT}/.venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source "${ROOT}/.venv/bin/activate"
