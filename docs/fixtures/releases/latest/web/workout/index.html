@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MGC Player</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:920px}
+    .row{display:flex;gap:12px;align-items:center;margin:10px 0}
+    button{padding:8px 12px}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+  <h1>MGC Player</h1>
+  <p class="muted">Uses <code>/api/catalog</code> and <code>/api/stream/&lt;track_id&gt;</code>.</p>
+
+  <div id="status"></div>
+  <div id="tracks"></div>
+
+  <audio id="player" controls style="width:100%; margin-top:16px;"></audio>
+
+<script>
+(async function(){
+  const elStatus = document.getElementById("status");
+  const elTracks = document.getElementById("tracks");
+  const player = document.getElementById("player");
+
+  function setStatus(msg){ elStatus.textContent = msg; }
+
+  try{
+    const me = await fetch("/api/me").then(r=>r.json());
+    if(!me.ok){ setStatus("API error."); return; }
+    if(!me.entitled){ setStatus("Not entitled. Check token / billing DB."); return; }
+
+    const cat = await fetch("/api/catalog").then(r=>r.json());
+    if(!cat.ok){ setStatus("Catalog error."); return; }
+    const tracks = cat.tracks || [];
+    setStatus("Tier: " + (cat.tier || "unknown") + " | Tracks: " + tracks.length);
+
+    elTracks.innerHTML = "";
+    tracks.forEach(t=>{
+      const row = document.createElement("div");
+      row.className = "row";
+      const btn = document.createElement("button");
+      btn.textContent = "Play";
+      btn.onclick = ()=>{
+        player.src = t.stream_url;
+        player.play().catch(()=>{});
+      };
+      const title = document.createElement("div");
+      title.textContent = (t.title || t.track_id);
+      const small = document.createElement("div");
+      small.className = "muted";
+      small.textContent = t.track_id;
+      const col = document.createElement("div");
+      col.appendChild(title);
+      col.appendChild(small);
+      row.appendChild(btn);
+      row.appendChild(col);
+      elTracks.appendChild(row);
+    });
+  }catch(e){
+    setStatus("Error: " + e);
+  }
+})();
+</script>
+</body>
+</html>

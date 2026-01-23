@@ -67,6 +67,38 @@ jobs:
 
           echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
 
+      - name: Build Pages release feed (stable) + determinism check
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # We upload ${RELEASE_OUT}/web as the Pages site root.
+          # Put the feed INSIDE that tree so it becomes:
+          #   https://<pages>/releases/feed.json
+          mkdir -p "${RELEASE_OUT}/web/releases"
+
+          # This must exist in the repo (commit your fixtures).
+          test -d docs/fixtures/releases
+
+          python scripts/release_feed.py \
+            --root-dir docs/fixtures/releases \
+            --out "${RELEASE_OUT}/web/releases/feed.json" \
+            --stable
+
+          python -m json.tool "${RELEASE_OUT}/web/releases/feed.json" >/dev/null
+
+          # Determinism proof: regenerate; sha must match
+          sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed1.sha256
+          python scripts/release_feed.py \
+            --root-dir docs/fixtures/releases \
+            --out "${RELEASE_OUT}/web/releases/feed.json" \
+            --stable
+          sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed2.sha256
+          diff -u /tmp/feed1.sha256 /tmp/feed2.sha256
+
+          # Avoid Jekyll edge cases
+          touch "${RELEASE_OUT}/web/.nojekyll"
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
