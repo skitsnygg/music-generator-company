@@ -24,6 +24,9 @@ TEASER_SECONDS="${MGC_TEASER_SECONDS:-15}"
 
 PUBLISH_LATEST="${MGC_PUBLISH_LATEST:-1}"  # 1=on, 0=off
 
+PUBLISH_FEED="${MGC_PUBLISH_FEED:-1}"      # 1=on, 0=off (generates /var/lib/mgc/releases/feed.json)
+REQUIRE_FEED="${MGC_REQUIRE_FEED:-0}"      # 1=fail run if feed generation fails
+
 LOCK_DIR="${ROOT}/.run_daily.lock"
 
 log() { printf "[run_daily] %s\n" "$*"; }
@@ -53,6 +56,7 @@ log "Generate count: ${GENERATE_COUNT}"
 log "Contexts: ${CONTEXTS[*]}"
 log "Marketing: ${MARKETING} (teaser_seconds=${TEASER_SECONDS})"
 log "Publish latest web: ${PUBLISH_LATEST}"
+log "Publish release feed: ${PUBLISH_FEED} (require=${REQUIRE_FEED})"
 "${PY}" -V
 
 run_one() {
@@ -93,5 +97,21 @@ run_one() {
 for ctx in "${CONTEXTS[@]}"; do
   run_one "${ctx}"
 done
+
+
+# Update the internal release feed (served by nginx under /releases/feed.json)
+if [[ "${PUBLISH_LATEST}" == "1" && "${PUBLISH_FEED}" == "1" ]]; then
+  if [[ -d "/var/lib/mgc/releases" ]]; then
+    log "Updating release feed..."
+    if ! "${ROOT}/scripts/publish_release_feed.sh"; then
+      if [[ "${REQUIRE_FEED}" == "1" ]]; then
+        die "publish_release_feed failed"
+      fi
+      log "WARN: publish_release_feed failed (continuing)"
+    fi
+  else
+    log "NOTE: /var/lib/mgc/releases not present; skipping feed update"
+  fi
+fi
 
 log "OK"
