@@ -1,98 +1,105 @@
+cat > scripts/publish_release_feed.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish a per-context release folder + update global feed.
-#
-# Inputs:
-#   --context focus|workout|sleep
-#   --period-key YYYY-MM-DD or YYYY-W## (optional; defaults to UTC date)
-#   --src-latest-root /var/lib/mgc/releases/latest/web  (optional)
-#   --dest-releases-root /var/lib/mgc/releases         (optional)
-#   --out-dir <run output dir> (optional; used only to locate teaser + marketing files)
-#
-# Produces:
-#   /var/lib/mgc/releases/<period>/<context>/index.html
-#   /var/lib/mgc/releases/<period>/<context>/release.json
-#   /var/lib/mgc/releases/index.json  (feed)
-
 usage() {
-  echo "usage: $0 --context CONTEXT [--period-key KEY] [--out-dir DIR] [--src-latest-root DIR] [--dest-releases-root DIR]" >&2
-  exit 2
+  cat <<'USAGE'
+usage: ./scripts/publish_release_feed.sh --context CONTEXT [--period-key KEY] [--out-dir DIR] [--src-latest-root DIR] [--dest-releases-root DIR]
+
+Publishes an internal "release" snapshot by copying the already-built latest web bundle
+into a versioned releases directory, and updates a simple feed.json.
+
+Defaults:
+  --src-latest-root      /var/lib/mgc/releases/latest/web
+  --dest-releases-root   /var/lib/mgc/releases
+
+Notes:
+  - Expects that latest bundle exists at: <src-latest-root>/<context>/
+    (Normally created by scripts/publish_latest.sh which run_daily/run_weekly call.)
+  - Writes:
+      <dest-releases-root>/<period-key>/<context>/(index.html, web_manifest.json, playlist.json, tracks/...)
+      <dest-releases-root>/feed.json
+USAGE
 }
 
 CONTEXT=""
-PERIOD_KEY=""
+PERIOD_KEY="$(date -u +%Y-%m-%d)"
 OUT_DIR=""
-SRC_LATEST_ROOT="${MGC_WEB_LATEST_ROOT:-/var/lib/mgc/releases/latest/web}"
-DEST_RELEASES_ROOT="${MGC_RELEASES_ROOT:-/var/lib/mgc/releases}"
-
-now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-date_utc() { date -u +"%Y-%m-%d"; }
+SRC_LATEST_ROOT="/var/lib/mgc/releases/latest/web"
+DEST_RELEASES_ROOT="/var/lib/mgc/releases"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --context) CONTEXT="${2:-}"; shift 2;;
-    --period-key) PERIOD_KEY="${2:-}"; shift 2;;
-    --out-dir) OUT_DIR="${2:-}"; shift 2;;
-    --src-latest-root) SRC_LATEST_ROOT="${2:-}"; shift 2;;
-    --dest-releases-root) DEST_RELEASES_ROOT="${2:-}"; shift 2;;
-    -h|--help) usage;;
-    *) echo "unknown arg: $1" >&2; usage;;
+    --context) CONTEXT="${2:-}"; shift 2 ;;
+    --period-key) PERIOD_KEY="${2:-}"; shift 2 ;;
+    --out-dir) OUT_DIR="${2:-}"; shift 2 ;;
+    --src-latest-root) SRC_LATEST_ROOT="${2:-}"; shift 2 ;;
+    --dest-releases-root) DEST_RELEASES_ROOT="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "[publish_release_feed] unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
 
-[[ -n "$CONTEXT" ]] || usage
-[[ -n "$PERIOD_KEY" ]] || PERIOD_KEY="$(date_utc)"
+if [[ -z "$CONTEXT" ]]; then
+  echo "[publish_release_feed] missing --context" >&2
+  usage
+  exit 2
+fi
 
-SRC_BUNDLE="${SRC_LATEST_ROOT%/}/${CONTEXT}"
-DEST_DIR="${DEST_RELEASES_ROOT%/}/${PERIOD_KEY}/${CONTEXT}"
-FEED_PATH="${DEST_RELEASES_ROOT%/}/index.json"
+log() { echo "[publish_release_feed] $*"; }
 
-if [[ ! -d "$SRC_BUNDLE" ]]; then
-  echo "[publish_release_feed] missing source bundle: $SRC_BUNDLE" >&2
+src_dir="${SRC_LATEST_ROOT%/}/${CONTEXT}"
+dest_dir="${DEST_RELEASES_ROOT%/}/${PERIOD_KEY}/${CONTEXT}"
+feed_path="${DEST_RELEASES_ROOT%/}/feed.json"
+
+if [[ ! -d "$src_dir" ]]; then
+  echo "[publish_release_feed] missing source bundle: $src_dir" >&2
+  echo "[publish_release_feed] hint: run ./scripts/run_daily.sh (or publish_latest) first on this machine" >&2
   exit 1
 fi
 
-mkdir -p "$DEST_DIR"
+mkdir -p "$dest_dir"
 
-# Copy the already-built web bundle (index.html + tracks/ + web_manifest.json + playlist.json)
-# Use rsync for clean overwrite.
-rsync -a --delete "${SRC_BUNDLE%/}/" "${DEST_DIR%/}/"
+# Copy snapshot (atomic-ish via temp dir)
+tmp_root="$(mktemp -d "${DEST_RELEASES_ROOT%/}/.tmp_release_${PERIOD_KEY}_${CONTEXT}_XXXXXX")"
+tmp_dir="${tmp_root}/${CONTEXT}"
+mkdir -p "$tmp_dir"
 
-# Optional: include teaser + marketing plan if they exist in OUT_DIR
-if [[ -n "$OUT_DIR" ]]; then
-  if [[ -f "${OUT_DIR%/}/marketing/teaser.wav" ]]; then
-    mkdir -p "${DEST_DIR%/}/marketing"
-    cp -f "${OUT_DIR%/}/marketing/teaser.wav" "${DEST_DIR%/}/marketing/teaser.wav"
-  fi
-  if [[ -f "${OUT_DIR%/}/marketing/marketing_plan.json" ]]; then
-    mkdir -p "${DEST_DIR%/}/marketing"
-    cp -f "${OUT_DIR%/}/marketing/marketing_plan.json" "${DEST_DIR%/}/marketing/marketing_plan.json"
-  fi
-  if [[ -f "${OUT_DIR%/}/drop_bundle/playlist.json" ]]; then
-    mkdir -p "${DEST_DIR%/}/bundle"
-    cp -f "${OUT_DIR%/}/drop_bundle/playlist.json" "${DEST_DIR%/}/bundle/playlist.json"
-  fi
-fi
+# Copy everything (including tracks/)
+cp -a "$src_dir/." "$tmp_dir/"
 
-# Build release.json from the bundle’s playlist.json (keep it simple + robust).
-python - <<PY
+# Move into place
+rm -rf "$dest_dir"
+mkdir -p "$(dirname "$dest_dir")"
+mv "$tmp_dir" "$dest_dir"
+rm -rf "$tmp_root"
+
+log "published release snapshot: $dest_dir"
+
+# Build/update feed.json (append newest first; keep last 50)
+python3 - <<PY
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
-context = ${CONTEXT!r}
-period_key = ${PERIOD_KEY!r}
-dest_dir = Path(${DEST_DIR!r})
-playlist_path = dest_dir / "playlist.json"  # publish_latest writes this
-wm_path = dest_dir / "web_manifest.json"
+context = ${CONTEXT@Q}
+period_key = ${PERIOD_KEY@Q}
+dest_releases_root = Path(${DEST_RELEASES_ROOT@Q})
+feed_path = dest_releases_root / "feed.json"
+dest_dir = dest_releases_root / period_key / context
 
-playlist = {}
-if playlist_path.exists():
-    playlist = json.loads(playlist_path.read_text(encoding="utf-8"))
+def read_json(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
-release = {
-    "ok": True,
+playlist = read_json(dest_dir / "playlist.json", {})
+wm = read_json(dest_dir / "web_manifest.json", {})
+
+track_count = len((playlist.get("tracks") or []))
+
+item = {
     "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
     "period_key": period_key,
     "context": context,
@@ -101,65 +108,23 @@ release = {
         "playlist_json": f"/releases/{period_key}/{context}/playlist.json",
         "web_manifest_json": f"/releases/{period_key}/{context}/web_manifest.json",
     },
-    "playlist": {
-        "track_count": len(playlist.get("tracks") or []),
-        "tracks": playlist.get("tracks") or [],
-    },
+    "track_count": track_count,
 }
 
-(dest_dir / "release.json").write_text(json.dumps(release, indent=2, sort_keys=True), encoding="utf-8")
-print("wrote", dest_dir / "release.json")
-PY
-
-# Update /var/lib/mgc/releases/index.json (append newest first, de-dupe by period+context)
-python - <<PY
-import json
-from pathlib import Path
-from datetime import datetime, timezone
-
-feed_path = Path(${FEED_PATH!r})
-period_key = ${PERIOD_KEY!r}
-context = ${CONTEXT!r}
-release_rel = f"{period_key}/{context}/release.json"
-release_abs = Path(${DEST_DIR!r}) / "release.json"
-
-release = json.loads(release_abs.read_text(encoding="utf-8"))
-
-feed = {"ok": True, "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"), "items": []}
-if feed_path.exists():
-    try:
-        feed = json.loads(feed_path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-
+feed = read_json(feed_path, {"ok": True, "items": []})
 items = feed.get("items") or []
-key = f"{period_key}:{context}"
 
-def item_key(it):
-    return f"{it.get('period_key','')}:{it.get('context','')}"
-
-# Remove existing
-items = [it for it in items if item_key(it) != key]
-
-# New item (small)
-item = {
-    "period_key": period_key,
-    "context": context,
-    "ts_utc": release.get("ts_utc"),
-    "track_count": (release.get("playlist") or {}).get("track_count", 0),
-    "web": (release.get("paths") or {}).get("web"),
-    "release_json": f"/releases/{release_rel}",
-}
-
+# Drop duplicates for same period+context
+items = [x for x in items if not (x.get("period_key")==period_key and x.get("context")==context)]
 items.insert(0, item)
+items = items[:50]
 
-# Cap feed size
-items = items[:200]
-
-feed["items"] = items
-feed_path.parent.mkdir(parents=True, exist_ok=True)
+feed = {"ok": True, "items": items}
 feed_path.write_text(json.dumps(feed, indent=2, sort_keys=True), encoding="utf-8")
-print("updated", feed_path, "items=", len(items))
+print("wrote", feed_path)
 PY
 
-echo "[publish_release_feed] OK context=${CONTEXT} period_key=${PERIOD_KEY} dest=${DEST_DIR}"
+log "updated feed: $feed_path"
+EOF
+
+chmod +x scripts/publish_release_feed.sh
