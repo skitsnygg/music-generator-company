@@ -99,6 +99,15 @@ jobs:
           # Avoid Jekyll edge cases.
           touch "${RELEASE_OUT}/web/.nojekyll"
 
+      - name: Replace Pages index.html with static feed player
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp docs/index.html "${RELEASE_OUT}/web/index.html"
+          echo "Replaced index.html for Pages"
+          sed -n '1,20p' "${RELEASE_OUT}/web/index.html"
+
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
