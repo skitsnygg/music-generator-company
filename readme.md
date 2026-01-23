@@ -5,6 +5,7 @@
 **Music Generator Company (MGC)** is a deterministic, autonomous release pipeline that demonstrates how generated media can be safely built, validated, approved, and published using modern CI/CD and release-engineering practices.
 
 The project is intentionally designed with clear contracts, reproducible artifacts, explicit approval gates, and auditable outputs — without relying on paid APIs or external infrastructure.
+
 **Live Demo (GitHub Pages):**  
 https://skitsnygg.github.io/music-generator-company/
 
@@ -13,7 +14,7 @@ https://skitsnygg.github.io/music-generator-company/
 ## System Goals
 
 - End-to-end automation from **generation → release bundle → publish**
-- Deterministic, CI-verifiable outputs (byte-for-byte)
+- Deterministic, CI-verifiable outputs
 - Explicit separation between **build** and **publish**
 - Approval-gated releases to prevent accidental shipping
 - Fully auditable artifacts, receipts, and manifests
@@ -98,6 +99,7 @@ CI verifies identical inputs produce identical outputs across full directory tre
 Publishing is blocked unless explicitly approved.
 
 Approval mechanism:
+
 touch <bundle-dir>/APPROVED
 
 Without this file, publishing is refused.
@@ -144,17 +146,18 @@ Publishing never rebuilds or mutates artifacts.
 
 ## Release Bundle Layout
 
-out_dir/
-- contract_report.json
-- drop_evidence.json
-- manifest.json
-- playlist.json
-- tracks/<track_id>.wav
-- marketing/receipts/receipts.jsonl
-- web/index.html
-- web/playlist.json
-- web/web_manifest.json
-- web/tracks/<track_id>.wav
+out_dir/  
+├─ contract_report.json  
+├─ drop_evidence.json  
+├─ manifest.json  
+├─ playlist.json  
+├─ tracks/<track_id>.wav  
+├─ marketing/receipts/receipts.jsonl  
+└─ web/  
+   ├─ index.html  
+   ├─ playlist.json  
+   ├─ web_manifest.json  
+   └─ tracks/<track_id>.wav  
 
 The bundle is portable, auditable, deployable, and deterministic.
 
@@ -173,47 +176,51 @@ No API keys are required for the default stub provider.
 
 ---
 
-## End-to-End Demo
+## End-to-End Demo (One Command)
 
-### Build a Publish-Ready Release
+This repository includes a **single command** that proves the entire system end-to-end.
 
-MGC_PROVIDER=stub python -m mgc.main  
---db fixtures/ci_db.sqlite  
---seed 1  
-run autonomous  
---context focus  
---out-dir /tmp/mgc_release  
---deterministic  
---contract publish
+sudo -E scripts/demo_check.sh
 
----
+This command:
+- Runs the full daily pipeline
+- Publishes `/latest/web/<context>`
+- Regenerates `/releases/feed.json`
+- Verifies nginx is serving the feed
+- Ensures backup contexts are filtered
+- Proves deterministic content via stable hashing
 
-### Approve the Release
-
-touch /tmp/mgc_release/APPROVED
+If this script exits successfully, the entire release surface is valid.
 
 ---
 
-### Publish (Dry Run)
+## Release Feed
 
-python -m mgc.main run publish  
---bundle-dir /tmp/mgc_release  
---dry-run
+MGC exposes a structured release feed describing the latest published web artifacts.
 
----
+**Production / VM**
+- Path: `/var/lib/mgc/releases/feed.json`
+- Served at: `http://<host>/releases/feed.json`
 
-### Publish (Live)
+**GitHub Pages (Demo)**
+- Path: `/releases/feed.json`
+- Generated from fixtures using `--stable` mode and deployed alongside the static web demo
 
-python -m mgc.main run publish  
---bundle-dir /tmp/mgc_release
+### Determinism Guarantee
+
+The feed includes:
+- `generated_at` (production only)
+- `content_sha256` — a hash of canonicalized content
+
+This allows deterministic verification even when timestamps change.
 
 ---
 
 ## CI & GitHub Pages
 
 - CI enforces determinism and contract validation
-- Publish bundles are built on `main`
-- Static web output is deployed to GitHub Pages
+- Web artifacts are built on `main`
+- Static output is deployed to GitHub Pages
 - No secrets or cloud accounts required
 
 Everything is reviewable directly from GitHub.
@@ -222,14 +229,12 @@ Everything is reviewable directly from GitHub.
 
 ## Providers
 
-**Stub Provider (Default)**
-- Fully deterministic
-- Offline
-- CI-safe
+**Stub Provider (Default)**  
+Fully deterministic, offline, CI-safe.
 
 export MGC_PROVIDER=stub
 
-**Optional: Riffusion**
+**Optional: Riffusion**  
 Requires a local inference server.
 
 export MGC_PROVIDER=riffusion  
@@ -248,9 +253,3 @@ This repository demonstrates:
 - Auditable, production-grade workflows
 
 ---
-
-## Summary
-
-This is not a demo script — it is a **release pipeline**.
-
-If you can build it, validate it, approve it, and publish it reproducibly, you can ship anything.
