@@ -288,6 +288,82 @@ def _relpath_smart(*, out_dir: Path, repo_root: Path, p: str) -> str:
     except Exception:
         return s_norm.lstrip("/")
 
+def _find_mp3_start(b: bytes) -> int | None:
+    i = b.find(b"ID3")
+    if i != -1:
+        return i
+    for j in range(len(b) - 1):
+        if b[j] == 0xFF and (b[j + 1] & 0xE0) == 0xE0:
+            return j
+    return None
+
+
+def _sanitize_mp3_bytes_if_needed(b: bytes) -> bytes:
+    start = _find_mp3_start(b)
+    if start is None or start == 0:
+        return b
+    return b[start:]
+
+def _pick_preferred_audio_source(p: Path) -> Path:
+    """Return the preferred on-disk audio file for a track.
+
+    Rules:
+      - Prefer .mp3 when it exists.
+      - Otherwise, fall back to .wav when it exists.
+      - Otherwise, return the original path (caller can error if missing).
+
+    This is intentionally conservative: it never invents new filenames, it only
+    switches to siblings that actually exist on disk.
+    """
+    try:
+        p = Path(p)
+    except Exception:
+        return p  # type: ignore[return-value]
+
+    # If caller passed a path without a suffix, try common audio suffixes.
+    if p.suffix == "":
+        mp3 = p.with_suffix(".mp3")
+        if mp3.exists():
+            return mp3
+        wav = p.with_suffix(".wav")
+        if wav.exists():
+            return wav
+        return p
+
+    # If caller passed a wav, prefer an mp3 sibling when present.
+    if p.suffix.lower() == ".wav":
+        mp3 = p.with_suffix(".mp3")
+        if mp3.exists():
+            return mp3
+        return p
+
+    # If caller passed an mp3, keep it.
+    if p.suffix.lower() == ".mp3":
+        return p
+
+    # Other suffix: if an mp3 sibling exists, prefer it; else wav; else keep.
+    mp3 = p.with_suffix(".mp3")
+    if mp3.exists():
+        return mp3
+    wav = p.with_suffix(".wav")
+    if wav.exists():
+        return wav
+    return p
+
+
+def _copy_track_for_bundle(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if src.suffix.lower() == ".mp3":
+        # Some providers (or older cached files) may include junk bytes before the ID3 header
+        # or before the first frame sync. Strip that prefix to keep web bundling stable.
+        b = src.read_bytes()
+        b2 = _sanitize_mp3_bytes_if_needed(b)
+        dst.write_bytes(b2)
+        return
+
+    # Non-mp3: byte-copy (avoid copy2 metadata for determinism)
+    dst.write_bytes(src.read_bytes())
 
 def _scrub_absolute_paths(obj: object, *, out_dir: Path, repo_root: Path) -> object:
     """Recursively scrub absolute filesystem paths from a JSON-serializable object."""
@@ -2277,11 +2353,14 @@ def _stub_daily_run(
     bundle_tracks_dir = out_dir / "tracks"
     bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
 
-    bundled_name = f"{track_id}{artifact_path.suffix}"
+    # Prefer MP3 if it exists, otherwise WAV.
+    src_pick = _pick_preferred_audio_source(artifact_path)
+
+    bundled_name = f"{track_id}{(src_pick.suffix or '.wav')}"
     bundled_track_rel = Path("tracks") / bundled_name
     bundled_track_path = (out_dir / bundled_track_rel).resolve()
 
-    shutil.copy2(str(artifact_path), str(bundled_track_path))
+    _copy_track_for_bundle(src_pick, bundled_track_path)
 
     playlist_rel = Path("playlist.json")
     playlist_path = (out_dir / playlist_rel).resolve()
@@ -2385,6 +2464,18 @@ def _stub_daily_run(
         "marketing_post_ids": post_ids,
     }
 
+def _db_full_path_for_track(db_path: str, track_id: str) -> str:
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute("SELECT full_path FROM tracks WHERE id=? LIMIT 1", (track_id,)).fetchone()
+            return str(row[0]) if row and row[0] else ""
+        finally:
+            con.close()
+    except Exception:
+        return ""
+
+
 def cmd_run_daily(args: argparse.Namespace) -> int:
     """Build a daily drop bundle from the library DB using the deterministic playlist builder.
 
@@ -2466,6 +2557,9 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     lead = dict(items[0])
     lead_track_id = str(lead.get("track_id") or "")
     full_path = lead.get("full_path") or lead.get("artifact_path")
+    db_full = _db_full_path_for_track(str(db_path), lead_track_id)
+    if db_full:
+        full_path = db_full
     if not lead_track_id or not full_path:
         raise SystemExit("daily playlist lead item missing track_id/full_path")
 
@@ -2476,9 +2570,14 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if not src_path.exists():
         raise SystemExit(f"[run.daily] missing source track file: {src_path}")
 
-    dst = bundle_tracks_dir / f"{lead_track_id}{src_path.suffix or '.wav'}"
-    shutil.copy2(src_path, dst)
+    # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
+    src_pick = _pick_preferred_audio_source(src_path)
 
+    dst = bundle_tracks_dir / f"{lead_track_id}{src_pick.suffix or '.wav'}"
+
+    # Copy the chosen source (mp3 if available, else original).
+    # Copy bytes (not metadata) for determinism/CI stability.
+    _copy_track_for_bundle(src_pick, dst)
     copied = [{"track_id": lead_track_id, "path": f"tracks/{dst.name}"}]
 
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -3250,6 +3349,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
             str(playlist_path),
             "--out-dir",
             str(web_out_dir),
+            "--prefer-mp3",
             "--clean",
             "--fail-if-empty",
             "--fail-if-none-copied",
@@ -3490,6 +3590,54 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
         # Validate bundle before packaging
         validate_bundle(bundle_dir)
+
+        # Keep top-level playlist/tracks in sync with drop_bundle for downstream tooling.
+        # This avoids confusing mismatches where out_dir/playlist.json points at one track
+        # while drop_bundle/playlist.json points at another.
+        try:
+            bundle_playlist = bundle_dir / "playlist.json"
+            top_playlist = out_dir / "playlist.json"
+            if bundle_playlist.exists():
+                # byte-for-byte copy (no metadata) for determinism
+                top_playlist.write_bytes(bundle_playlist.read_bytes())
+
+            bundle_tracks = bundle_dir / "tracks"
+            top_tracks = out_dir / "tracks"
+            if bundle_tracks.is_dir():
+                top_tracks.mkdir(parents=True, exist_ok=True)
+
+                # Remove stale audio siblings to prevent accidental fallback to old files.
+                audio_suffixes = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff")
+                for p in list(top_tracks.iterdir()):
+                    if p.is_file() and p.suffix.lower() in audio_suffixes:
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+
+                wanted_names: list[str] = []
+                try:
+                    po = json.loads(bundle_playlist.read_text(encoding="utf-8")) if bundle_playlist.exists() else {}
+                    for t in (po.get("tracks") or []):
+                        if not isinstance(t, dict):
+                            continue
+                        rel = t.get("path") or ""
+                        if isinstance(rel, str) and rel.startswith("tracks/"):
+                            wanted_names.append(rel.split("/", 1)[1])
+                except Exception:
+                    wanted_names = []
+
+                if wanted_names:
+                    for name in sorted(set(wanted_names)):
+                        src = bundle_tracks / name
+                        if src.is_file():
+                            _copy_track_for_bundle(src, top_tracks / name)
+                else:
+                    for src in sorted([p for p in bundle_tracks.iterdir() if p.is_file()], key=lambda p: p.name):
+                        _copy_track_for_bundle(src, top_tracks / src.name)
+        except Exception:
+            pass
+
 
         # Evidence object for README
         daily_ev_path = bundle_dir / "daily_evidence.json"
@@ -3818,7 +3966,7 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     Outputs:
       - data/tracks/YYYY-MM-DD/<track_id>.<ext>
       - data/tracks/YYYY-MM-DD/<track_id>.json (metadata)
-      - DB row in tracks table
+      - DB row in tracks table (schema: full_path/preview_path)
       - <out_dir>/evidence/generate_evidence.json
 
     JSON contract:
@@ -3831,7 +3979,9 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     context = str(getattr(args, "context", None) or os.environ.get("MGC_CONTEXT") or "focus")
 
     # Evidence root for this run
-    out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
+    out_dir = Path(
+        getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence"
+    ).expanduser().resolve()
     evidence_dir = out_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3883,19 +4033,49 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     )
 
     src_path = Path(track.artifact_path)
-    suffix = src_path.suffix.lower() or ".wav"
 
-    final_artifact = day_dir / f"{track_id}{suffix}"
+    # Determine extension: prefer provider/meta, fall back to source suffix, then .wav.
+    track_meta = dict(getattr(track, "meta", None) or {})
+    ext = str(track_meta.get("ext") or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if not ext:
+        ext = (src_path.suffix or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if not ext:
+        ext = ".wav"
+
+    final_artifact = day_dir / f"{track_id}{ext}"
+
+    # Copy bytes into the canonical library location if needed.
     if src_path.resolve() != final_artifact.resolve():
         final_artifact.write_bytes(src_path.read_bytes())
 
+    # Clean up stale sibling audio files for this track_id (prevents prefer-wav picking old files).
+    audio_suffixes = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff")
+    for suf in audio_suffixes:
+        p = day_dir / f"{track_id}{suf}"
+        if p.exists() and p.resolve() != final_artifact.resolve():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
     sha = sha256_file(final_artifact)
+
+    # Preview path (riffusion writes a jpg via MusicAgent; meta may already include preview_path)
+    preview_path_abs = str(track_meta.get("preview_path") or getattr(track, "preview_path", "") or "").strip()
 
     title = str(getattr(track, "title", "") or f"{context.title()} Track")
     mood = str(getattr(track, "mood", "") or context)
     genre = str(getattr(track, "genre", "") or "unknown")
 
-    meta = dict(getattr(track, "meta", None) or {})
+    # Pull bpm/duration if provider supplied them (riffusion does)
+    bpm = int(track_meta.get("bpm") or track_meta.get("tempo") or 120)
+    duration_sec = float(track_meta.get("duration_sec") or track_meta.get("duration_s") or 0.0)
+
+    meta = dict(track_meta or {})
     meta.update(
         {
             "generated_by": "run.generate",
@@ -3912,6 +4092,13 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     except Exception:
         artifact_rel = str(final_artifact)
 
+    preview_rel = ""
+    if preview_path_abs:
+        try:
+            preview_rel = str(Path(preview_path_abs).expanduser().resolve().relative_to(repo_root))
+        except Exception:
+            preview_rel = preview_path_abs
+
     # Write metadata JSON next to the artifact
     meta_path = day_dir / f"{track_id}.json"
     meta_doc = {
@@ -3924,27 +4111,70 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
         "mood": mood,
         "genre": genre,
         "artifact_path": artifact_rel,
+        "preview_path": preview_rel,
         "sha256": sha,
         "ts": now_iso,
         "meta": meta,
     }
     meta_path.write_text(json.dumps(meta_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    # Register in DB
+    # ---------------------------------------------------------------------
+    # Register in DB (REAL schema: tracks(full_path, preview_path, created_at, ...))
+    # ---------------------------------------------------------------------
     con = db_connect(db_path)
-    ensure_tables_minimal(con)
     try:
-        db_insert_track(
-            con,
-            track_id=str(track_id),
-            ts=now_iso,
-            title=title,
-            provider=str(getattr(track, "provider", provider_name)),
-            mood=mood,
-            genre=genre,
-            artifact_path=artifact_rel,
-            meta=meta,
-        )
+        # Detect schema
+        cols = [r[1] for r in con.execute("PRAGMA table_info(tracks);").fetchall()]
+        cols_set = {c for c in cols if isinstance(c, str)}
+
+        if {"id", "created_at", "title", "mood", "genre", "bpm", "duration_sec", "full_path", "preview_path", "status"}.issubset(
+            cols_set
+        ):
+            # UPSERT into the main schema used by pipeline/web
+            status = "ready"
+            con.execute(
+                """
+                INSERT INTO tracks (id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  created_at=excluded.created_at,
+                  title=excluded.title,
+                  mood=excluded.mood,
+                  genre=excluded.genre,
+                  bpm=excluded.bpm,
+                  duration_sec=excluded.duration_sec,
+                  full_path=excluded.full_path,
+                  preview_path=excluded.preview_path,
+                  status=excluded.status
+                """,
+                (
+                    str(track_id),
+                    str(now_iso),
+                    str(title),
+                    str(mood),
+                    str(genre),
+                    int(bpm),
+                    float(duration_sec),
+                    str(artifact_rel),
+                    str(preview_rel),
+                    str(status),
+                ),
+            )
+        else:
+            # Fallback to your minimal schema helpers (older/alternate DBs)
+            ensure_tables_minimal(con)
+            db_insert_track(
+                con,
+                track_id=str(track_id),
+                ts=now_iso,
+                title=title,
+                provider=str(getattr(track, "provider", provider_name)),
+                mood=mood,
+                genre=genre,
+                artifact_path=artifact_rel,
+                meta=meta,
+            )
+
         con.commit()
     finally:
         con.close()
@@ -3971,11 +4201,6 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
         _eprint(f"[run.generate] ok track_id={track_id} artifact={artifact_rel}")
 
     return 0
-
-# ---------------------------------------------------------------------------
-# Weekly run (7 dailies + publish + manifest + consolidated evidence)
-# ---------------------------------------------------------------------------
-
 
 # ---------------------------------------------------------------------------
 # Weekly run (playlist builder + copy existing tracks into a bundle)
@@ -4079,6 +4304,9 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     for it in items:
         track_id = str(it.get("track_id"))
         full_path = it.get("full_path") or it.get("artifact_path")
+        db_full = _db_full_path_for_track(str(db_path), track_id)
+        if db_full:
+            full_path = db_full
         if not full_path:
             raise SystemExit(f"playlist item missing full_path for track_id={track_id}")
 
@@ -4090,8 +4318,13 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         if not src.exists():
             raise SystemExit(f"[run.weekly] missing source track file: {src}")
 
-        dst = bundle_tracks_dir / f"{track_id}{src.suffix or '.wav'}"
-        shutil.copy2(src, dst)
+        # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
+        src_pick = _pick_preferred_audio_source(src)
+
+        dst = bundle_tracks_dir / f"{track_id}{src_pick.suffix or '.wav'}"
+
+        # Copy the chosen source (mp3 if available, else original wav)
+        _copy_track_for_bundle(src_pick, dst)
         copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
     lead_track_id = str(items[0].get("track_id"))
@@ -5329,13 +5562,16 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
 
     # Tracks: at least one bundle track in out_dir/tracks/*.wav
     tracks_dir = out_dir / "tracks"
-    track_files: list[str] = []
-    if tracks_dir.exists() and tracks_dir.is_dir():
-        track_files = sorted([str(p.relative_to(out_dir)) for p in tracks_dir.glob("*.wav") if p.is_file()])
+    audio_globs = ["*.wav", "*.mp3", "*.m4a", "*.aac", "*.flac", "*.ogg", "*.aif", "*.aiff"]
+    track_paths = []
+    for g in audio_globs:
+        track_paths.extend([p for p in tracks_dir.glob(g) if p.is_file()])
+    track_files = sorted([str(p.relative_to(out_dir)) for p in track_paths])
+
     if track_files:
-        present.append("tracks/*.wav")
+        present.append("tracks/*.(audio)")
     else:
-        missing.append("tracks/*.wav")
+        missing.append("tracks/*.(audio)")
 
     # Submission zip must exist unless dry-run
     submission_ok = True
