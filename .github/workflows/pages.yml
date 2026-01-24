@@ -79,7 +79,6 @@ jobs:
           # Fixtures must be present in the repo for CI.
           test -d docs/fixtures/releases
 
-          # NOTE: this assumes scripts/release_feed.py supports --stable.
           python scripts/release_feed.py \
             --root-dir docs/fixtures/releases \
             --out "${RELEASE_OUT}/web/releases/feed.json" \
@@ -110,12 +109,12 @@ jobs:
 
           echo "Deployed title:"
           python3 - <<PY
-import re, pathlib
-p = pathlib.Path("${RELEASE_OUT}/web/index.html")
-s = p.read_text("utf-8", errors="replace")
-m = re.search(r"<title>(.*?)</title>", s, flags=re.IGNORECASE|re.DOTALL)
-print(m.group(1).strip() if m else "(no title)")
-PY
+          import re, pathlib
+          p = pathlib.Path("${RELEASE_OUT}/web/index.html")
+          s = p.read_text("utf-8", errors="replace")
+          m = re.search(r"<title>(.*?)</title>", s, flags=re.IGNORECASE|re.DOTALL)
+          print(m.group(1).strip() if m else "(no title)")
+          PY
 
       - name: Publish fixture bundles at /latest/web/* (required by feed.json URLs)
         shell: bash
