@@ -79,6 +79,7 @@ jobs:
           # Fixtures must be present in the repo for CI.
           test -d docs/fixtures/releases
 
+          # NOTE: this assumes scripts/release_feed.py supports --stable.
           python scripts/release_feed.py \
             --root-dir docs/fixtures/releases \
             --out "${RELEASE_OUT}/web/releases/feed.json" \
@@ -102,40 +103,43 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
+          # Use the repo-authored static player as the Pages root.
           test -s docs/index.html
           cp docs/index.html "${RELEASE_OUT}/web/index.html"
+
           echo "Deployed title:"
-          python3 - <<'PY'
-          import re, pathlib
-          s = pathlib.Path("${RELEASE_OUT}/web/index.html").read_text("utf-8", errors="replace")
-          m = re.search(r"<title>(.*?)</title>", s, flags=re.IGNORECASE|re.DOTALL)
-          print(m.group(1).strip() if m else "(no title)")
-          PY
+          python3 - <<PY
+import re, pathlib
+p = pathlib.Path("${RELEASE_OUT}/web/index.html")
+s = p.read_text("utf-8", errors="replace")
+m = re.search(r"<title>(.*?)</title>", s, flags=re.IGNORECASE|re.DOTALL)
+print(m.group(1).strip() if m else "(no title)")
+PY
 
       - name: Publish fixture bundles at /latest/web/* (required by feed.json URLs)
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Feed points to /latest/web/<context>/... so those paths must exist in the deployed tree.
-          # Copy the fixture web bundles into the Pages artifact.
+          # Your feed.json URLs are like /latest/web/<context>/...
+          # Those must exist in the deployed site root.
           SRC="docs/fixtures/releases/latest/web"
           DST="${RELEASE_OUT}/web/latest/web"
 
           test -d "${SRC}"
           mkdir -p "${DST}"
 
-          # Copy each context directory (focus, sleep, workout, etc.)
+          # Copy all contexts (focus, sleep, workout, etc.)
           cp -R "${SRC}/." "${DST}/"
 
-          # Sanity checks: we expect playlist.json + web_manifest.json in each context dir
           echo "Contexts published under ${DST}:"
           find "${DST}" -maxdepth 2 -type d -print | sort
 
-          echo "Required files:"
+          echo "Required files (playlist.json / web_manifest.json):"
           find "${DST}" -maxdepth 3 -type f \( -name "playlist.json" -o -name "web_manifest.json" \) -print | sort
 
-          # Fail fast if the expected 3 contexts are missing (adjust if you add more)
+          # Fail fast if the known contexts are missing (adjust as you add more).
           test -s "${DST}/focus/playlist.json"
           test -s "${DST}/focus/web_manifest.json"
           test -s "${DST}/sleep/playlist.json"
