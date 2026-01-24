@@ -35,7 +35,7 @@ jobs:
           python -m pip install -U pip
           pip install -e .
 
-      - name: Build release bundle + web (publish contract)
+      - name: Build web bundles for Pages (focus/sleep/workout) with tracks
         shell: bash
         run: |
           set -euxo pipefail
@@ -52,61 +52,59 @@ jobs:
           printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
             > artifacts/run/marketing/receipts.jsonl
 
-          MGC_PROVIDER=stub python -m mgc.main \
-            --db "${DB}" \
-            --seed 1 \
-            run autonomous \
-            --context focus \
-            --out-dir "${OUT}" \
-            --deterministic \
-            --contract publish
-
-          test -s "${OUT}/web/index.html"
-          test -s "${OUT}/web/web_manifest.json"
-          test -s "${OUT}/web/playlist.json"
-
           echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
 
-      - name: Build Pages release feed (stable) + determinism check
-        shell: bash
-        run: |
-          set -euxo pipefail
+          # Build three contexts so /latest/web/* exists with tracks.
+          for CTX in focus sleep workout; do
+            CTX_OUT="${OUT}/pages_build/${CTX}"
+            rm -rf "${CTX_OUT}"
+            mkdir -p "${CTX_OUT}"
 
-          # Pages uploads ${RELEASE_OUT}/web as the site root (see Upload step),
-          # so place the feed *inside* that tree => /releases/feed.json on Pages.
-          mkdir -p "${RELEASE_OUT}/web/releases"
+            MGC_PROVIDER=stub python -m mgc.main \
+              --db "${DB}" \
+              --seed 1 \
+              run autonomous \
+              --context "${CTX}" \
+              --out-dir "${CTX_OUT}" \
+              --deterministic \
+              --contract publish
 
-          # Fixtures must be present in the repo for CI.
-          test -d docs/fixtures/releases
+            # Each run should emit a web bundle under CTX_OUT/web with playlist + manifest + tracks.
+            test -s "${CTX_OUT}/web/playlist.json"
+            test -s "${CTX_OUT}/web/web_manifest.json"
 
+            # Fail fast if we didn't get any audio payload.
+            test -d "${CTX_OUT}/web/tracks"
+            test -n "$(find "${CTX_OUT}/web/tracks" -maxdepth 1 -type f | head -n 1)"
+          done
+
+          # Create the site root structure we deploy.
+          mkdir -p "${OUT}/web/latest/web"
+
+          # Copy each context bundle into /latest/web/<ctx>/
+          for CTX in focus sleep workout; do
+            rm -rf "${OUT}/web/latest/web/${CTX}"
+            cp -R "${OUT}/pages_build/${CTX}/web" "${OUT}/web/latest/web/${CTX}"
+          done
+
+          # Provide a stable feed that points at /latest/web/<ctx>/
+          mkdir -p "${OUT}/web/releases"
           python scripts/release_feed.py \
-            --root-dir docs/fixtures/releases \
-            --out "${RELEASE_OUT}/web/releases/feed.json" \
+            --root-dir "${OUT}/web/latest" \
+            --out "${OUT}/web/releases/feed.json" \
             --stable
 
-          python -m json.tool "${RELEASE_OUT}/web/releases/feed.json" >/dev/null
+          python -m json.tool "${OUT}/web/releases/feed.json" >/dev/null
 
-          # Determinism proof: regenerate; hash must match.
-          sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed1.sha256
-          python scripts/release_feed.py \
-            --root-dir docs/fixtures/releases \
-            --out "${RELEASE_OUT}/web/releases/feed.json" \
-            --stable
-          sha256sum "${RELEASE_OUT}/web/releases/feed.json" | tee /tmp/feed2.sha256
-          diff -u /tmp/feed1.sha256 /tmp/feed2.sha256
-
-          # Avoid Jekyll edge cases.
-          touch "${RELEASE_OUT}/web/.nojekyll"
+          # Avoid Jekyll edge cases
+          touch "${OUT}/web/.nojekyll"
 
       - name: Replace Pages index.html with static feed player
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Use the repo-authored static player as the Pages root.
           test -s docs/index.html
           cp docs/index.html "${RELEASE_OUT}/web/index.html"
-
           echo "Deployed title:"
           python3 - <<PY
           import re, pathlib
@@ -116,35 +114,20 @@ jobs:
           print(m.group(1).strip() if m else "(no title)")
           PY
 
-      - name: Publish fixture bundles at /latest/web/* (required by feed.json URLs)
+      - name: Sanity check deployed paths (playlists + tracks exist)
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Your feed.json URLs are like /latest/web/<context>/...
-          # Those must exist in the deployed site root.
-          SRC="docs/fixtures/releases/latest/web"
-          DST="${RELEASE_OUT}/web/latest/web"
+          for CTX in focus sleep workout; do
+            test -s "${RELEASE_OUT}/web/latest/web/${CTX}/playlist.json"
+            test -s "${RELEASE_OUT}/web/latest/web/${CTX}/web_manifest.json"
+            test -d "${RELEASE_OUT}/web/latest/web/${CTX}/tracks"
+            test -n "$(find "${RELEASE_OUT}/web/latest/web/${CTX}/tracks" -maxdepth 1 -type f | head -n 1)"
+          done
 
-          test -d "${SRC}"
-          mkdir -p "${DST}"
-
-          # Copy all contexts (focus, sleep, workout, etc.)
-          cp -R "${SRC}/." "${DST}/"
-
-          echo "Contexts published under ${DST}:"
-          find "${DST}" -maxdepth 2 -type d -print | sort
-
-          echo "Required files (playlist.json / web_manifest.json):"
-          find "${DST}" -maxdepth 3 -type f \( -name "playlist.json" -o -name "web_manifest.json" \) -print | sort
-
-          # Fail fast if the known contexts are missing (adjust as you add more).
-          test -s "${DST}/focus/playlist.json"
-          test -s "${DST}/focus/web_manifest.json"
-          test -s "${DST}/sleep/playlist.json"
-          test -s "${DST}/sleep/web_manifest.json"
-          test -s "${DST}/workout/playlist.json"
-          test -s "${DST}/workout/web_manifest.json"
+          echo "Sample track files:"
+          find "${RELEASE_OUT}/web/latest/web/focus/tracks" -maxdepth 1 -type f | head -n 5
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
