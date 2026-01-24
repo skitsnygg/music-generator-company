@@ -50,3 +50,14 @@ data/
 data/playlists/_manifest.playlists.json
 data/playlists/*.json
 tracks/
+
+# local venv
+.venv/
+venv/
+.env/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/

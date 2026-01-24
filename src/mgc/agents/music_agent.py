@@ -4,14 +4,24 @@ src/mgc/agents/music_agent.py
 
 Music Agent: generates tracks via the provider registry.
 
-Aligned with the project's current provider contract:
-- mgc.providers.get_provider(name) -> provider
-- provider.generate(...) -> dict with:
-    artifact_path, sha256, track_id, provider, meta, genre, mood, title
+Provider contract:
+- provider.generate(...) -> dict (preferred) or dataclass/GenerateResult-like object with keys/fields like:
+    artifact_path, artifact_bytes, sha256, track_id, provider, meta, genre, mood, title, ext, mime
+- optional preview:
+    preview_path OR preview_bytes (+ preview_ext/preview_mime)
 
-Key rules:
-- No direct imports of provider implementations here.
-- Deterministic mode must not depend on wall clock randomness.
+Rules:
+- If provider returns bytes (artifact_bytes), materialize to disk under out_dir/<track_id>.<ext>.
+- ext selection order:
+    1) art["ext"]
+    2) mime (art["mime"] or art["meta"]["mime"])
+    3) default ".wav"
+- If provider returns preview_bytes, materialize to out_dir/<track_id>.<preview_ext> (default .jpg)
+  and set meta["preview_path"].
+
+MP3 normalization:
+- Some providers may write an MP3 file with leading junk bytes before the first real MP3 header.
+- If artifact is .mp3, scan the first few KB for "ID3" or MPEG frame sync and trim leading bytes in-place.
 """
 
 from __future__ import annotations
@@ -48,6 +58,94 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _infer_ext_from_mime(mime: str) -> str:
+    m = (mime or "").strip().lower()
+    if m in ("audio/mpeg", "audio/mp3"):
+        return ".mp3"
+    if m in ("audio/wav", "audio/x-wav", "audio/wave", "audio/x-pn-wav"):
+        return ".wav"
+    if m == "audio/flac":
+        return ".flac"
+    if m == "audio/aac":
+        return ".aac"
+    if m in ("audio/mp4", "audio/x-m4a", "audio/m4a"):
+        return ".m4a"
+    if m in ("audio/ogg", "application/ogg"):
+        return ".ogg"
+    if m in ("audio/aiff", "audio/x-aiff"):
+        return ".aiff"
+    return ""
+
+
+def _pick_ext_for_materialize(art: Dict[str, Any]) -> str:
+    # 1) explicit ext
+    ext = str(art.get("ext") or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if ext:
+        return ext
+
+    # 2) infer from mime / meta mime
+    mime = str(art.get("mime") or "").strip().lower()
+    meta_mime = str((art.get("meta") or {}).get("mime") or "").strip().lower()
+    inferred = _infer_ext_from_mime(mime or meta_mime)
+    if inferred:
+        return inferred
+
+    # 3) default
+    return ".wav"
+
+
+def _pick_preview_ext(art: Dict[str, Any]) -> str:
+    ext = str(art.get("preview_ext") or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if ext:
+        return ext
+
+    mime = str(art.get("preview_mime") or "").strip().lower()
+    if mime in ("image/jpeg", "image/jpg"):
+        return ".jpg"
+    if mime == "image/png":
+        return ".png"
+    return ".jpg"
+
+
+def _normalize_mp3_in_place(path: Path, *, scan_bytes: int = 4096) -> None:
+    """
+    Trim any leading junk bytes before the first real MP3 header.
+
+    Heuristics:
+    - "ID3" tag header
+    - MPEG frame sync bytes: 0xFF 0xFB / 0xF3 / 0xF2
+    """
+    if path.suffix.lower() != ".mp3":
+        return
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"mp3 normalize: missing file: {path}")
+
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"mp3 normalize: empty file: {path}")
+
+    limit = min(len(data), int(scan_bytes))
+    header_off: Optional[int] = None
+
+    for i in range(limit):
+        if data[i : i + 3] == b"ID3":
+            header_off = i
+            break
+        if data[i : i + 2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+            header_off = i
+            break
+
+    if header_off is None:
+        raise ValueError(f"mp3 normalize: no MP3 header found in first {limit} bytes: {path}")
+
+    if header_off > 0:
+        path.write_bytes(data[header_off:])
+
+
 @dataclass(frozen=True)
 class TrackArtifact:
     track_id: str
@@ -58,7 +156,7 @@ class TrackArtifact:
     mood: str
     genre: str
     meta: Dict[str, Any]
-    preview_path: str = ""  # optional; can be set later by pipeline/web tools
+    preview_path: str = ""
 
 
 @dataclass
@@ -68,22 +166,6 @@ class MusicAgentConfig:
 
 
 class MusicAgent:
-    """
-    Generates a TrackArtifact via provider registry.
-
-    Expected workflow:
-      agent = MusicAgent(provider="stub")
-      track = agent.generate(
-          track_id=...,
-          context="focus",
-          seed=1,
-          deterministic=True,
-          schedule="daily",
-          period_key="2020-01-01",
-          out_dir="artifacts/run"
-      )
-    """
-
     def __init__(self, provider: Optional[str] = None, *, strict_provider: Optional[bool] = None):
         p = (provider or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
         strict = _env_bool("MGC_STRICT_PROVIDER", False) if strict_provider is None else bool(strict_provider)
@@ -130,7 +212,7 @@ class MusicAgent:
             period_key=str(period_key),
         )
 
-        # Providers may return either a dict (preferred) or a dataclass/GenerateResult-like object.
+        # Normalize provider return -> dict
         if isinstance(art, dict):
             art_dict = art
         elif is_dataclass(art):
@@ -142,21 +224,36 @@ class MusicAgent:
 
         art = art_dict
 
+        out_dir_p = Path(out_dir).expanduser().resolve()
+        out_dir_p.mkdir(parents=True, exist_ok=True)
 
-        # If provider returned bytes instead of a path, materialize to disk under out_dir.
+        # Materialize audio if needed
         if (not art.get("artifact_path")) and art.get("artifact_bytes"):
-            out_dir_p = Path(out_dir).expanduser().resolve()
-            out_dir_p.mkdir(parents=True, exist_ok=True)
-
-            ext = str(art.get("ext") or "").strip().lower()
-            if ext and not ext.startswith("."):
-                ext = "." + ext
-            if not ext:
-                ext = ".wav"
-
+            ext = _pick_ext_for_materialize(art)
             out_path = out_dir_p / f"{track_id}{ext}"
-            out_path.write_bytes(art["artifact_bytes"])
+            b = art["artifact_bytes"]
+            if isinstance(b, bytearray):
+                b = bytes(b)
+            out_path.write_bytes(b)
             art["artifact_path"] = str(out_path)
+
+            # Preserve ext/mime for downstream consumers
+            art.setdefault("ext", ext)
+            if not art.get("mime"):
+                if ext == ".mp3":
+                    art["mime"] = "audio/mpeg"
+                elif ext == ".wav":
+                    art["mime"] = "audio/wav"
+
+        # Materialize preview if provided as bytes (and preview_path not already set)
+        if (not art.get("preview_path")) and art.get("preview_bytes"):
+            prev_ext = _pick_preview_ext(art)
+            prev_path = out_dir_p / f"{track_id}{prev_ext}"
+            pb = art["preview_bytes"]
+            if isinstance(pb, bytearray):
+                pb = bytes(pb)
+            prev_path.write_bytes(pb)
+            art["preview_path"] = str(prev_path)
 
         if not art.get("artifact_path"):
             raise TypeError(
@@ -166,6 +263,13 @@ class MusicAgent:
         artifact_path = str(art.get("artifact_path") or "")
         if not artifact_path:
             raise ValueError("Provider artifact missing artifact_path")
+
+        # Normalize MP3s in-place (trim any leading junk before ID3/frame sync)
+        ap = Path(artifact_path)
+        if ap.suffix.lower() == ".mp3":
+            # default ON; allow opt-out if needed
+            if _env_bool("MGC_NORMALIZE_MP3", True):
+                _normalize_mp3_in_place(ap)
 
         sha = str(art.get("sha256") or "")
         if not sha:
@@ -177,6 +281,14 @@ class MusicAgent:
         meta.setdefault("schedule", schedule)
         meta.setdefault("period_key", period_key)
         meta.setdefault("deterministic", bool(deterministic))
+
+        # Carry ext/mime and preview_path into meta for downstream tools
+        if art.get("ext") and not meta.get("ext"):
+            meta["ext"] = str(art.get("ext"))
+        if art.get("mime") and not meta.get("mime"):
+            meta["mime"] = str(art.get("mime"))
+        if art.get("preview_path") and not meta.get("preview_path"):
+            meta["preview_path"] = str(art.get("preview_path"))
 
         return TrackArtifact(
             track_id=str(art.get("track_id") or track_id),
