@@ -54,7 +54,7 @@ jobs:
 
           echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
 
-          # Build three contexts so /latest/web/* exists with tracks.
+          # Build each context into its own output dir, then we’ll publish under /latest/web/<ctx>
           for CTX in focus sleep workout; do
             CTX_OUT="${OUT}/pages_build/${CTX}"
             rm -rf "${CTX_OUT}"
@@ -69,28 +69,36 @@ jobs:
               --deterministic \
               --contract publish
 
-            # Each run should emit a web bundle under CTX_OUT/web with playlist + manifest + tracks.
+            # Must have playlist + manifest
             test -s "${CTX_OUT}/web/playlist.json"
             test -s "${CTX_OUT}/web/web_manifest.json"
 
-            # Fail fast if we didn't get any audio payload.
+            # Must have audio payload
             test -d "${CTX_OUT}/web/tracks"
             test -n "$(find "${CTX_OUT}/web/tracks" -maxdepth 1 -type f | head -n 1)"
           done
 
-          # Create the site root structure we deploy.
+          # Site root we deploy (upload-pages-artifact will upload OUT/web)
           mkdir -p "${OUT}/web/latest/web"
 
-          # Copy each context bundle into /latest/web/<ctx>/
+          # Copy bundles into /latest/web/<ctx>/
           for CTX in focus sleep workout; do
             rm -rf "${OUT}/web/latest/web/${CTX}"
             cp -R "${OUT}/pages_build/${CTX}/web" "${OUT}/web/latest/web/${CTX}"
           done
 
-          # Provide a stable feed that points at /latest/web/<ctx>/
+          # Create a release-root layout for release_feed.py to scan.
+          # We mimic: <root>/latest/web/<ctx>/...
+          FEED_ROOT="${OUT}/feed_root"
+          rm -rf "${FEED_ROOT}"
+          mkdir -p "${FEED_ROOT}"
+          cp -R "${OUT}/web/latest" "${FEED_ROOT}/latest"
+
           mkdir -p "${OUT}/web/releases"
+
+          # Generate feed from a root that contains "latest/..."
           python scripts/release_feed.py \
-            --root-dir "${OUT}/web/latest" \
+            --root-dir "${FEED_ROOT}" \
             --out "${OUT}/web/releases/feed.json" \
             --stable
 
@@ -114,10 +122,23 @@ jobs:
           print(m.group(1).strip() if m else "(no title)")
           PY
 
-      - name: Sanity check deployed paths (playlists + tracks exist)
+      - name: Sanity check feed + paths exist (contexts + tracks)
         shell: bash
         run: |
           set -euxo pipefail
+
+          test -s "${RELEASE_OUT}/web/releases/feed.json"
+          echo "Feed contexts:"
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("${RELEASE_OUT}/web/releases/feed.json")
+          obj = json.loads(p.read_text("utf-8"))
+          ctxs = obj.get("latest", {}).get("contexts", [])
+          web = [c for c in ctxs if c.get("kind") == "web"]
+          print("web contexts:", len(web))
+          for c in web:
+            print(c.get("context"), c.get("url"))
+          PY
 
           for CTX in focus sleep workout; do
             test -s "${RELEASE_OUT}/web/latest/web/${CTX}/playlist.json"
@@ -125,9 +146,6 @@ jobs:
             test -d "${RELEASE_OUT}/web/latest/web/${CTX}/tracks"
             test -n "$(find "${RELEASE_OUT}/web/latest/web/${CTX}/tracks" -maxdepth 1 -type f | head -n 1)"
           done
-
-          echo "Sample track files:"
-          find "${RELEASE_OUT}/web/latest/web/focus/tracks" -maxdepth 1 -type f | head -n 5
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
