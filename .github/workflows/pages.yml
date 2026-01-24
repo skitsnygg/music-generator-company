@@ -35,7 +35,7 @@ jobs:
           python -m pip install -U pip
           pip install -e .
 
-      - name: Build web bundles for Pages (focus/sleep/workout) with tracks
+      - name: Build web bundles with tracks (focus / sleep / workout)
         shell: bash
         run: |
           set -euxo pipefail
@@ -54,9 +54,9 @@ jobs:
 
           echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
 
-          # Build each context into its own output dir
+          # Build each context into its own output dir (must include playlist + manifest + tracks)
           for CTX in focus sleep workout; do
-            CTX_OUT="${OUT}/pages_build/${CTX}"
+            CTX_OUT="${OUT}/build_${CTX}"
             rm -rf "${CTX_OUT}"
             mkdir -p "${CTX_OUT}"
 
@@ -75,20 +75,25 @@ jobs:
             test -n "$(find "${CTX_OUT}/web/tracks" -maxdepth 1 -type f | head -n 1)"
           done
 
-          # Site root we deploy (we upload OUT/web)
+          # Site root we deploy (upload-pages-artifact will upload OUT/web)
           mkdir -p "${OUT}/web/latest/web"
 
-          # Copy bundles into /latest/web/<ctx>/
+          # Publish bundles into /latest/web/<ctx>/ (copy contents of each CTX_OUT/web)
           for CTX in focus sleep workout; do
-            rm -rf "${OUT}/web/latest/web/${CTX}"
-            cp -R "${OUT}/pages_build/${CTX}/web" "${OUT}/web/latest/web/${CTX}"
+            DST="${OUT}/web/latest/web/${CTX}"
+            rm -rf "${DST}"
+            mkdir -p "${DST}"
+            cp -R "${OUT}/build_${CTX}/web/." "${DST}/"
+            test -s "${DST}/playlist.json"
+            test -s "${DST}/web_manifest.json"
+            test -d "${DST}/tracks"
           done
 
-          # Generate feed.json from a root that contains "latest/..."
+          # Generate releases/feed.json from a root containing "latest/..."
           FEED_ROOT="${OUT}/feed_root"
           rm -rf "${FEED_ROOT}"
-          mkdir -p "${FEED_ROOT}"
-          cp -R "${OUT}/web/latest" "${FEED_ROOT}/latest"
+          mkdir -p "${FEED_ROOT}/latest"
+          cp -R "${OUT}/web/latest/." "${FEED_ROOT}/latest/"
 
           mkdir -p "${OUT}/web/releases"
           python scripts/release_feed.py \
@@ -107,35 +112,19 @@ jobs:
           set -euxo pipefail
           test -s docs/index.html
           cp docs/index.html "${RELEASE_OUT}/web/index.html"
+          echo "Deployed title line:"
+          grep -i -m 1 "<title>" "${RELEASE_OUT}/web/index.html" || true
 
-          echo "Deployed title:"
-          python3 - "${RELEASE_OUT}/web/index.html" <<'PY'
-import re, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-s = p.read_text("utf-8", errors="replace")
-m = re.search(r"<title>(.*?)</title>", s, flags=re.IGNORECASE|re.DOTALL)
-print(m.group(1).strip() if m else "(no title)")
-PY
-
-      - name: Sanity check feed + deployed paths exist (contexts + tracks)
+      - name: Sanity check feed + deployed bundle paths
         shell: bash
         run: |
           set -euxo pipefail
 
-          FEED_PATH="${RELEASE_OUT}/web/releases/feed.json"
-          test -s "${FEED_PATH}"
+          FEED="${RELEASE_OUT}/web/releases/feed.json"
+          test -s "${FEED}"
 
-          echo "Feed contexts:"
-          python3 - "${FEED_PATH}" <<'PY'
-import json, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-obj = json.loads(p.read_text("utf-8"))
-ctxs = obj.get("latest", {}).get("contexts", [])
-web = [c for c in ctxs if c.get("kind") == "web"]
-print("web contexts:", len(web))
-for c in web:
-  print(c.get("context"), c.get("url"))
-PY
+          echo "Feed web contexts:"
+          python3 -c 'import json,sys; o=json.load(open(sys.argv[1],"r",encoding="utf-8")); w=[c for c in o.get("latest",{}).get("contexts",[]) if c.get("kind")=="web"]; print("web contexts:",len(w)); [print(c.get("context"),c.get("url")) for c in w]' "${FEED}"
 
           for CTX in focus sleep workout; do
             test -s "${RELEASE_OUT}/web/latest/web/${CTX}/playlist.json"
@@ -144,7 +133,7 @@ PY
             test -n "$(find "${RELEASE_OUT}/web/latest/web/${CTX}/tracks" -maxdepth 1 -type f | head -n 1)"
           done
 
-          echo "Sample track files:"
+          echo "Sample focus track files:"
           find "${RELEASE_OUT}/web/latest/web/focus/tracks" -maxdepth 1 -type f | head -n 5
 
       - name: Upload Pages artifact
