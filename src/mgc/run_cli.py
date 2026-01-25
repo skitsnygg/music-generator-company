@@ -1566,6 +1566,13 @@ def db_insert_track(
     preview_col = _pick_first_existing(cols, ["preview_path", "preview", "teaser_path"])
     bpm_col = _pick_first_existing(cols, ["bpm", "tempo"])
 
+    # tracks.genre is NOT NULL in our canonical schema.
+    # If provider doesn't supply it, deterministically fall back to context/mood.
+    genre_norm = (genre or "").strip()
+    if not genre_norm:
+        genre_norm = (mood or "").strip().lower() or "unknown"
+    genre = genre_norm
+
     data: Dict[str, Any] = {
         "id": track_id,
         "track_id": track_id,
@@ -2245,9 +2252,25 @@ def _stub_daily_run(
             artifact_path = (Path.cwd() / artifact_rel).resolve()
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
-    artifact_bytes = getattr(result, "artifact_bytes", None) or b""
-    artifact_path.write_bytes(artifact_bytes)
+    # If the provider wrote a sibling file (e.g. <id>.wav) but our base path
+    # (<id> with no suffix) is empty/missing, prefer the real produced file.
+    def _nonempty_file(p: Path) -> bool:
+        try:
+            return p.exists() and p.is_file() and p.stat().st_size > 0
+        except Exception:
+            return False
 
+    if not _nonempty_file(artifact_path):
+        for _ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff"):
+            _cand = artifact_path.with_suffix(_ext)
+            if _nonempty_file(_cand):
+                artifact_path = _cand
+                artifact_rel = artifact_rel.with_suffix(_ext)
+                break
+
+    artifact_bytes = getattr(result, "artifact_bytes", None)
+    if isinstance(artifact_bytes, (bytes, bytearray)) and len(artifact_bytes) > 0:
+        artifact_path.write_bytes(bytes(artifact_bytes))
     db_insert_track(
         con,
         track_id=track_id,
@@ -3506,11 +3529,30 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
         bundle = (daily or {}).get("bundle") if isinstance(daily, dict) else None
         if isinstance(bundle, dict):
+            # Prefer actual bundled audio under drop_bundle/tracks over legacy bundle["track_path"].
+            bundle_track_path = ""
+            bundle_track_sha256 = ""
+            try:
+                tracks_dir = (out_dir / "drop_bundle" / "tracks")
+                if tracks_dir.exists():
+                    exts = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff"]
+                    candidates = []
+                    for ext in exts:
+                        candidates.extend(sorted([p for p in tracks_dir.glob(f"*{ext}") if p.is_file()]))
+                    if not candidates:
+                        candidates = sorted([p for p in tracks_dir.iterdir() if p.is_file()])
+                    if candidates:
+                        pick = candidates[0]
+                        bundle_track_path = _posix(pick.relative_to(out_dir))
+                        bundle_track_sha256 = _sha256_file(pick)
+            except Exception:
+                bundle_track_path = ""
+                bundle_track_sha256 = ""
             evidence_obj["paths"].update(
                 {
                     "bundle_dir": str(bundle.get("out_dir") or str(out_dir)),
-                    "bundle_track_path": str(bundle.get("track_path") or ""),
-                    "bundle_track_sha256": str(bundle.get("track_sha256") or ""),
+                    "bundle_track_path": (bundle_track_path or str(bundle.get("track_path") or "")),
+                    "bundle_track_sha256": (bundle_track_sha256 or str(bundle.get("track_sha256") or "")),
                     "playlist_path": str(bundle.get("playlist_path") or (out_dir / "playlist.json")),
                     "playlist_sha256": str(bundle.get("playlist_sha256") or ""),
                 }
@@ -5678,14 +5720,69 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
         "ids": {"drop_id": drop_id, "run_id": run_id},
     }
 
+    # Persist contract report deterministically (best effort, but we still return JSON to stdout).
     try:
         (out_dir / "contract_report.json").write_text(_stable_json(contract_report), encoding="utf-8")
     except Exception:
         pass
 
+    # Back-compat alias used by older callers; also used below when emitting autonomous.json.
+    contract: Dict[str, Any] = contract_report
+
+    # Reconcile printed drop.daily.bundle_track_path with what the contract scanner found.
+    
+    # Normalize contract expected audio pattern (always use tracks/*.(audio))
+    try:
+        exp = contract_report.get("expected") if isinstance(contract_report, dict) else None
+        if isinstance(exp, dict):
+            req = exp.get("required")
+            if isinstance(req, list):
+                new_req = []
+                for item in req:
+                    s = str(item)
+                    if s.startswith("tracks/") and (s.endswith(".wav") or s.endswith(".mp3") or s.endswith("*.wav") or s.endswith("*.mp3")):
+                        # Replace extension-specific expectations with audio wildcard
+                        s = "tracks/*.(audio)"
+                    new_req.append(s)
+                # Ensure wildcard present at least once
+                if not any(str(x) == "tracks/*.(audio)" for x in new_req):
+                    # If contract had any tracks/* requirement, force it in; otherwise leave list unchanged
+                    if any(str(x).startswith("tracks/") for x in new_req):
+                        new_req = [x for x in new_req if not str(x).startswith("tracks/")]
+                        new_req.append("tracks/*.(audio)")
+                exp["required"] = new_req
+    except Exception:
+        pass
+
+# Drop object from evidence (used for final JSON output and bundle_track_path adjustment)
+    drop = evidence_obj.get("drop") if isinstance(evidence_obj.get("drop"), dict) else None
+    if drop is None:
+        daily = evidence_obj.get("daily")
+        if isinstance(daily, dict):
+            drop = {"daily": daily}
+        else:
+            drop = {}
+
+
+    # contract_report["actual"]["track_files"][0] reflects what is truly present under out_dir/tracks.
+    try:
+        tf0 = ""
+        actual = contract_report.get("actual")
+        if isinstance(actual, dict):
+            tfs = actual.get("track_files") or []
+            if isinstance(tfs, (list, tuple)) and tfs:
+                tf0 = str(tfs[0])
+        if tf0 and isinstance(drop, dict):
+            d = drop.get("daily")
+            if isinstance(d, dict):
+                d["bundle_track_path"] = tf0
+    except Exception:
+        pass
     out: Dict[str, Any] = {
         "ok": (verify_ok in (None, True)) and contract_ok,
         "cmd": "run.autonomous",
+        "contract": contract_report,
+        "drop": drop,
         "ids": {"drop_id": drop_id, "run_id": run_id},
         "paths": {
             "out_dir": ".",
@@ -5699,9 +5796,37 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
             "web_manifest": contract_report["paths"].get("web_manifest"),
         },
         "verify": {"skipped": verify_skipped, "ok": verify_ok, "error": verify_error},
-        "contract": contract_report,
-        "drop": evidence_obj,
     }
+
+    # Force printed drop.daily.bundle_track_path to match contract actual track_files[0]
+    try:
+        tf0 = ""
+        c = out.get("contract") if isinstance(out, dict) else None
+        if isinstance(c, dict):
+            a = c.get("actual")
+            if isinstance(a, dict):
+                tfs = a.get("track_files") or []
+                if isinstance(tfs, (list, tuple)) and tfs:
+                    tf0 = str(tfs[0])
+
+        if tf0 and isinstance(out, dict):
+            dr = out.get("drop")
+            if isinstance(dr, dict):
+                dy = dr.get("daily")
+                if isinstance(dy, dict):
+                    dy["bundle_track_path"] = tf0
+    except Exception:
+        pass
+
+    # Persist autonomous.json alongside printing to stdout (callers rely on both).
+    # This must be deterministic: stable JSON and atomic write.
+    try:
+        tmp = out_dir / "autonomous.json.tmp"
+        final = out_dir / "autonomous.json"
+        tmp.write_text(_stable_json(out), encoding="utf-8")
+        tmp.replace(final)
+    except Exception as e:
+        raise SystemExit(f"[run.autonomous] failed to write autonomous.json: {e}")
 
     sys.stdout.write(_stable_json(out))
     return 0 if ((verify_ok in (None, True)) and contract_ok) else 2
