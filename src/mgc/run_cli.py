@@ -365,6 +365,95 @@ def _copy_track_for_bundle(src: Path, dst: Path) -> None:
     # Non-mp3: byte-copy (avoid copy2 metadata for determinism)
     dst.write_bytes(src.read_bytes())
 
+def _require_nonempty_file(p: Path) -> None:
+    try:
+        if (not p.exists()) or (not p.is_file()):
+            raise FileNotFoundError(str(p))
+        if p.stat().st_size == 0:
+            raise ValueError("zero-byte file")
+    except Exception as e:
+        raise SystemExit(f"[bundle] invalid artifact {p}: {e}")
+
+def _ffmpeg_available() -> bool:
+    try:
+        return shutil.which("ffmpeg") is not None
+    except Exception:
+        return False
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    # Deterministic settings: no progress output, no metadata, consistent mapping.
+    env = os.environ.copy()
+    env.setdefault("LC_ALL", "C")
+    env.setdefault("LANG", "C")
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode("utf-8", errors="replace")[-2000:])
+
+def _transcode_wav_to_mp3(src_wav: Path, dst_mp3: Path) -> None:
+    dst_mp3.parent.mkdir(parents=True, exist_ok=True)
+    _require_nonempty_file(src_wav)
+
+    # Use ffmpeg if available; otherwise fail back to copying wav elsewhere.
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg not found")
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", str(src_wav),
+        "-vn",
+        "-map_metadata", "-1",
+        "-write_id3v2", "0",
+        "-codec:a", "libmp3lame",
+        "-b:a", "192k",
+        str(dst_mp3),
+    ]
+    _run_ffmpeg(cmd)
+    _require_nonempty_file(dst_mp3)
+
+    # Apply existing sanitation logic (strip junk prefixes + clean headers if available).
+    try:
+        b = dst_mp3.read_bytes()
+        b2 = _sanitize_mp3_bytes_if_needed(b)
+        if b2 != b:
+            dst_mp3.write_bytes(b2)
+    except Exception:
+        pass
+
+    try:
+        from mgc.clean_mp3_headers import clean_mp3_headers  # type: ignore
+        clean_mp3_headers(str(dst_mp3))
+    except Exception:
+        pass
+
+    _require_nonempty_file(dst_mp3)
+
+def _bundle_track_to_dir(out_dir: Path, track_id: str, src_pick: Path) -> tuple[Path, Path]:
+    tracks_dir = out_dir / "tracks"
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    prefer_mp3 = True
+    if prefer_mp3 and src_pick.suffix.lower() == ".wav":
+        # Prefer mp3 output even when repo storage is wav.
+        try:
+            rel = Path("tracks") / f"{track_id}.mp3"
+            dst = (out_dir / rel).resolve()
+            _transcode_wav_to_mp3(src_pick, dst)
+            return rel, dst
+        except Exception:
+            # fall back to wav copy
+            pass
+
+    bundled_name = f"{track_id}{(src_pick.suffix or '.wav')}"
+    rel = Path("tracks") / bundled_name
+    dst = (out_dir / rel).resolve()
+    _copy_track_for_bundle(src_pick, dst)
+    _require_nonempty_file(dst)
+    return rel, dst
+
+
 def _scrub_absolute_paths(obj: object, *, out_dir: Path, repo_root: Path) -> object:
     """Recursively scrub absolute filesystem paths from a JSON-serializable object."""
 
@@ -2379,11 +2468,7 @@ def _stub_daily_run(
     # Prefer MP3 if it exists, otherwise WAV.
     src_pick = _pick_preferred_audio_source(artifact_path)
 
-    bundled_name = f"{track_id}{(src_pick.suffix or '.wav')}"
-    bundled_track_rel = Path("tracks") / bundled_name
-    bundled_track_path = (out_dir / bundled_track_rel).resolve()
-
-    _copy_track_for_bundle(src_pick, bundled_track_path)
+    bundled_track_rel, bundled_track_path = _bundle_track_to_dir(out_dir, track_id, src_pick)
 
     playlist_rel = Path("playlist.json")
     playlist_path = (out_dir / playlist_rel).resolve()
@@ -2596,11 +2681,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
     src_pick = _pick_preferred_audio_source(src_path)
 
-    dst = bundle_tracks_dir / f"{lead_track_id}{src_pick.suffix or '.wav'}"
-
-    # Copy the chosen source (mp3 if available, else original).
-    # Copy bytes (not metadata) for determinism/CI stability.
-    _copy_track_for_bundle(src_pick, dst)
+    _rel, dst = _bundle_track_to_dir(bundle_dir, lead_track_id, src_pick)
     copied = [{"track_id": lead_track_id, "path": f"tracks/{dst.name}"}]
 
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -4363,10 +4444,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
         src_pick = _pick_preferred_audio_source(src)
 
-        dst = bundle_tracks_dir / f"{track_id}{src_pick.suffix or '.wav'}"
-
-        # Copy the chosen source (mp3 if available, else original wav)
-        _copy_track_for_bundle(src_pick, dst)
+        _rel, dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
         copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
     lead_track_id = str(items[0].get("track_id"))
