@@ -41,6 +41,34 @@ WEB_MANIFEST_SCHEMA = "mgc.web_manifest.v3"
 AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg")
 
 
+def _find_mp3_start(b: bytes) -> Optional[int]:
+    i = b.find(b"ID3")
+    if i != -1:
+        return i
+    # MPEG frame sync: 0xFF followed by a byte whose top 3 bits are 1 (0xE0..0xFF)
+    for j in range(max(0, len(b) - 1)):
+        if b[j] == 0xFF and (b[j + 1] & 0xE0) == 0xE0:
+            return j
+    return None
+
+
+def _sanitize_mp3_file_inplace(p: Path) -> None:
+    """Best-effort MP3 header cleanup (deterministic)."""
+    # 1) Strip any prefix before ID3 or MPEG frame sync.
+    try:
+        b = p.read_bytes()
+        start = _find_mp3_start(b)
+        if start is not None and start > 0:
+            p.write_bytes(b[start:])
+    except Exception:
+        pass
+    # 2) Use existing project logic if available.
+    try:
+        from mgc.clean_mp3_headers import clean_mp3_headers  # type: ignore
+        clean_mp3_headers(str(p))
+    except Exception:
+        pass
+
 # ---------------------------
 # Utilities
 # ---------------------------
@@ -383,74 +411,1187 @@ def _validate_web_manifest(out_dir: Path, manifest: Dict[str, Any]) -> None:
 # Embedded index.html fallback
 # ---------------------------
 
-_EMBEDDED_INDEX_HTML = """<!doctype html>
+_EMBEDDED_INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>MGC Player</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Music Generator Company — Player</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:920px}
-    .row{display:flex;gap:12px;align-items:center;margin:10px 0}
-    button{padding:8px 12px}
-    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
-    .muted{color:#666}
+    :root{
+      --bg: #000000;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.10);
+      --border: rgba(255,255,255,0.14);
+      --text: rgba(255,255,255,0.94);
+      --muted: rgba(255,255,255,0.62);
+      --muted2: rgba(255,255,255,0.45);
+      --accent: #7c5cff;
+      --accent2: #35d6c7;
+      --danger: #ff5c7a;
+      --ok: #37d67a;
+      --shadow: 0 10px 28px rgba(0,0,0,0.65);
+      --radius: 14px;
+      --radius2: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; }
+    body{
+      margin:0;
+      background: var(--bg);
+      color:var(--text);
+      font-family:var(--sans);
+      line-height:1.35;
+    }
+    a{ color:inherit; text-decoration:none; }
+    a:hover{ text-decoration:underline; }
+
+    .wrap{
+      max-width: 1300px;
+      margin: 0 auto;
+      padding: 22px 16px 40px;
+    }
+    .top{
+      display:flex;
+      gap:14px;
+      align-items:center;
+      justify-content:space-between;
+      margin-bottom: 14px;
+      flex-wrap:wrap;
+    }
+    .brand{
+      display:flex;
+      gap:12px;
+      align-items:center;
+      min-width: 280px;
+    }
+    .logo{
+      width:42px;height:42px;border-radius:12px;
+      background: linear-gradient(135deg, rgba(124,92,255,0.95), rgba(53,214,199,0.85));
+      box-shadow: var(--shadow);
+    }
+    .brand h1{
+      font-size: 16px;
+      margin:0;
+      letter-spacing:0.2px;
+    }
+    .brand .sub{
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .pillbar{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:7px 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pill code{
+      font-family:var(--mono);
+      font-size: 11px;
+      color: var(--text);
+    }
+
+    .grid{
+      display:grid;
+      grid-template-columns: 380px 1fr;
+      gap: 14px;
+    }
+    @media (max-width: 980px){
+      .grid{ grid-template-columns: 1fr; }
+    }
+
+    .card{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius2);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .cardHead{
+      padding: 12px 12px 10px;
+      border-bottom: 1px solid var(--border);
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 10px;
+    }
+    .cardTitle{
+      margin:0;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+    }
+    .cardMeta{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .cardBody{
+      padding: 12px;
+    }
+
+    .row{
+      display:flex;
+      gap:10px;
+      align-items:center;
+    }
+    .spacer{ flex:1; }
+
+    .btn{
+      appearance:none;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 9px 11px;
+      border-radius: 12px;
+      font-size: 12px;
+      cursor:pointer;
+      transition: transform .06s ease, background .12s ease, border-color .12s ease;
+      user-select:none;
+      display:inline-flex;
+      gap: 8px;
+      align-items:center;
+      justify-content:center;
+    }
+    .btn:hover{ background: var(--panel2); }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{
+      border-color: rgba(124,92,255,0.55);
+      background: rgba(124,92,255,0.12);
+    }
+    .btn.small{ padding: 7px 9px; border-radius: 10px; }
+
+    .input{
+      width:100%;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 10px 11px;
+      border-radius: 12px;
+      font-size: 13px;
+      outline:none;
+    }
+
+    .list{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .item{
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      border-radius: 14px;
+      padding: 11px;
+      cursor:pointer;
+      transition: background .12s ease, transform .06s ease, border-color .12s ease;
+    }
+    .item:hover{ background: rgba(255,255,255,0.06); }
+    .item:active{ transform: translateY(1px); }
+    .item.active{
+      border-color: rgba(124,92,255,0.65);
+      background: rgba(124,92,255,0.10);
+    }
+    .itemTop{
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .badge{
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      white-space:nowrap;
+    }
+    .itemTitle{
+      font-size: 13px;
+      margin:0;
+      color: var(--text);
+      letter-spacing:0.1px;
+    }
+    .itemSub{
+      margin-top: 6px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .now{
+      display:flex;
+      gap:12px;
+      align-items:flex-start;
+    }
+    .cover{
+      width: 86px;
+      height: 86px;
+      border-radius: 16px;
+      background:
+        radial-gradient(60px 60px at 30% 30%, rgba(124,92,255,0.55), transparent 60%),
+        radial-gradient(70px 70px at 70% 60%, rgba(53,214,199,0.45), transparent 62%),
+        rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      flex: 0 0 auto;
+    }
+    .now h2{
+      margin:0;
+      font-size: 16px;
+      letter-spacing:0.2px;
+    }
+    .muted{ color: var(--muted); }
+    .mono{ font-family: var(--mono); }
+
+    .player{
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+    audio{ width: 100%; }
+
+    .controls{
+      display:flex;
+      gap: 10px;
+      align-items:center;
+      flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    .kbd{
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      padding: 3px 6px;
+      border-radius: 8px;
+    }
+
+    .toast{
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      max-width: 560px;
+      padding: 12px 12px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.84);
+      color: rgba(255,255,255,0.92);
+      border: 1px solid rgba(255,255,255,0.18);
+      box-shadow: var(--shadow);
+      display:none;
+      z-index: 9999;
+    }
+    .toast.show{ display:block; }
+    .toast .t1{ font-size: 12px; margin:0; }
+    .toast .t2{ font-size: 12px; margin: 6px 0 0; color: rgba(255,255,255,0.70); }
+
+    .hr{
+      height:1px;
+      background: var(--border);
+      margin: 12px 0;
+    }
+
+    .foot{
+      margin-top: 12px;
+      color: var(--muted2);
+      font-size: 12px;
+    }
+    .foot code{ font-family: var(--mono); }
+
+    .toggle{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      color: var(--muted);
+      font-size: 12px;
+      user-select:none;
+      white-space:nowrap;
+    }
+    .toggle input{ transform: translateY(1px); }
   </style>
 </head>
+
 <body>
-  <h1>MGC Player</h1>
-  <p class="muted">Uses <code>/api/catalog</code> and <code>/api/stream/&lt;track_id&gt;</code>.</p>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <h1>Music Generator Company</h1>
+          <div class="sub">All playlists + all tracks • feed-driven web player</div>
+        </div>
+      </div>
+      <div class="pillbar">
+        <div class="pill">Feed: <code id="pillFeed">/releases/feed.json</code></div>
+        <div class="pill">Mode: <code id="pillMode">auto</code></div>
+        <div class="pill">Playlists: <code id="pillPl">0</code></div>
+        <div class="pill">Tracks: <code id="pillTr">0</code></div>
+      </div>
+    </div>
 
-  <div id="status"></div>
-  <div id="tracks"></div>
+    <div class="grid">
+      <!-- LEFT: Playlists -->
+      <div class="card">
+        <div class="cardHead">
+          <div>
+            <p class="cardTitle">Playlists</p>
+            <div class="cardMeta" id="plMeta">Loading feed…</div>
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn small" id="btnReload" title="Reload feed + playlists">Reload</button>
+          </div>
+        </div>
+        <div class="cardBody">
+          <div class="row" style="margin-bottom:10px;">
+            <input class="input" id="plSearch" placeholder="Filter playlists (focus, sleep, workout)..." />
+          </div>
 
-  <audio id="player" controls style="width:100%; margin-top:16px;"></audio>
+          <div class="list" id="playlists"></div>
 
-<script>
-(async function(){
-  const elStatus = document.getElementById("status");
-  const elTracks = document.getElementById("tracks");
-  const player = document.getElementById("player");
+          <div class="hr"></div>
 
-  function setStatus(msg){ elStatus.textContent = msg; }
+          <div class="row" style="gap:8px; flex-wrap:wrap;">
+            <button class="btn small" id="btnCopyLink" title="Copy share link">Copy link</button>
+            <button class="btn small" id="btnOpenBundle" title="Open selected playlist bundle">Open bundle</button>
+            <div class="spacer"></div>
+            <span class="kbd">J/K</span><span class="kbd">Space</span><span class="kbd">N/P</span>
+          </div>
 
-  try{
-    const me = await fetch("/api/me").then(r=>r.json());
-    if(!me.ok){ setStatus("API error."); return; }
-    if(!me.entitled){ setStatus("Not entitled. Check token / billing DB."); return; }
+          <div class="foot">
+            Works on VM (<code>/releases/feed.json</code>) and GitHub Pages (auto-detects repo base path).
+          </div>
+        </div>
+      </div>
 
-    const cat = await fetch("/api/catalog").then(r=>r.json());
-    if(!cat.ok){ setStatus("Catalog error."); return; }
-    const tracks = cat.tracks || [];
-    setStatus("Tier: " + (cat.tier || "unknown") + " | Tracks: " + tracks.length);
+      <!-- RIGHT: Player + All tracks -->
+      <div class="card">
+        <div class="cardHead">
+          <div>
+            <p class="cardTitle">Now playing</p>
+            <div class="cardMeta" id="nowMeta">Loading…</div>
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn small" id="btnPrev" title="Previous track">Prev</button>
+            <button class="btn small primary" id="btnPlay" title="Play/Pause">Play</button>
+            <button class="btn small" id="btnNext" title="Next track">Next</button>
+          </div>
+        </div>
 
-    elTracks.innerHTML = "";
-    tracks.forEach(t=>{
-      const row = document.createElement("div");
-      row.className = "row";
-      const btn = document.createElement("button");
-      btn.textContent = "Play";
-      btn.onclick = ()=>{
-        player.src = t.stream_url;
-        player.play().catch(()=>{});
+        <div class="cardBody">
+          <div class="now">
+            <div class="cover" id="cover"></div>
+            <div style="min-width:0;">
+              <h2 id="trackTitle">—</h2>
+              <div class="muted" id="trackSub" style="margin-top:6px;">—</div>
+              <div class="muted mono" id="trackPath" style="margin-top:8px; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></div>
+            </div>
+          </div>
+
+          <div class="player">
+            <audio id="audio" controls preload="metadata"></audio>
+            <div class="controls">
+              <button class="btn small" id="btnSeekBack" title="Back 10s">-10s</button>
+              <button class="btn small" id="btnSeekFwd" title="Forward 10s">+10s</button>
+              <div class="spacer"></div>
+
+              <label class="toggle" title="Show only audio-looking files (.mp3/.wav/.ogg/.m4a)">
+                <input type="checkbox" id="audioOnly" />
+                Audio only
+              </label>
+
+              <span class="muted" style="font-size:12px;">Volume</span>
+              <input id="vol" type="range" min="0" max="1" step="0.01" value="0.85" style="width:160px;">
+            </div>
+          </div>
+
+          <div class="hr"></div>
+
+          <div class="row" style="margin-bottom:10px;">
+            <input class="input" id="trSearch" placeholder="Filter tracks (title, playlist, path)..." />
+          </div>
+
+          <div class="list" id="tracks"></div>
+
+          <div class="foot" id="bundleFoot"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">
+    <p class="t1" id="toastT1"></p>
+    <p class="t2" id="toastT2"></p>
+  </div>
+
+  <script>
+    "use strict";
+
+    function $(id){ return document.getElementById(id); }
+
+    function toast(t1, t2){
+      const el = $("toast");
+      $("toastT1").textContent = t1 || "";
+      $("toastT2").textContent = t2 || "";
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 2600);
+    }
+
+    function fmtIso(iso){
+      if (!iso) return "—";
+      try{
+        const d = new Date(iso);
+        return d.toISOString().replace(".000Z","Z");
+      }catch{
+        return iso;
+      }
+    }
+
+    function escapeHtml(s){
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        "\"":"&quot;",
+        "'":"&#039;",
+      }[c]));
+    }
+
+    function basePrefix(){
+      // Directory containing this index.html
+      const p = window.location.pathname;
+      if (p.endsWith("/index.html")) return p.slice(0, -"/index.html".length);
+      if (p.endsWith("/")) return p.slice(0, -1);
+      return p;
+    }
+
+    function urlJoin(prefix, path){
+      // prefix like "" or "/music-generator-company"
+      if (!prefix) return path.startsWith("/") ? path : ("/" + path);
+      if (!path.startsWith("/")) path = "/" + path;
+      return prefix + path;
+    }
+
+    function resolveFeedUrl(){
+      const prefix = basePrefix();
+      return urlJoin(prefix, "/releases/feed.json");
+    }
+
+    async function fetchJson(url){
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+      return await r.json();
+    }
+
+    function isAudioPath(p){
+      return typeof p === "string" && (p.endsWith(".mp3") || p.endsWith(".wav") || p.endsWith(".ogg") || p.endsWith(".m4a"));
+    }
+
+    function playlistTracks(playlist){
+      if (!playlist) return [];
+      if (Array.isArray(playlist)) return playlist;
+      if (Array.isArray(playlist.tracks)) return playlist.tracks;
+      if (Array.isArray(playlist.items)) return playlist.items;
+      return [];
+    }
+
+    function trackDisplay(t, idx){
+      const title =
+        t.title ||
+        t.name ||
+        t.track_title ||
+        (t.id ? `Track ${String(t.id).slice(0,8)}` : `Track ${idx+1}`);
+
+      const path =
+        t.web_path ||
+        t.webPath ||
+        t.dest ||
+        t.path ||
+        t.audio ||
+        t.audio_path ||
+        t.file ||
+        "";
+
+      return { title, path, raw: t };
+    }
+
+    function normalizeBundleBase(ctx){
+      const prefix = basePrefix();
+      const u = (ctx && ctx.url) ? ctx.url : "";
+      return urlJoin(prefix, u);
+    }
+
+    function withTrailingSlash(u){
+      return u.endsWith("/") ? u : (u + "/");
+    }
+
+    function computeTrackSrc(bundleBase, path){
+      if (!path) return "";
+      if (path.startsWith("http://") || path.startsWith("https://")) return path;
+      if (path.startsWith("/")) return urlJoin(basePrefix(), path);
+      return withTrailingSlash(bundleBase) + path.replace(/^\.?\//, "");
+    }
+
+    async function loadBundle(ctx){
+      const bundleBase = withTrailingSlash(normalizeBundleBase(ctx));
+      const playlistUrl = bundleBase + "playlist.json";
+      const manifestUrl = bundleBase + "web_manifest.json";
+
+      const [playlist, manifest] = await Promise.all([
+        fetchJson(playlistUrl),
+        fetchJson(manifestUrl).catch(() => null),
+      ]);
+
+      return { bundleBase, playlistUrl, manifestUrl, playlist, manifest };
+    }
+
+    function setModeLabel(){
+      const p = basePrefix();
+      $("pillMode").textContent = p ? "pages" : "vm";
+    }
+
+    function setCounts(state){
+      $("pillPl").textContent = String(state.playlists.length);
+      $("pillTr").textContent = String(state.allTracks.length);
+    }
+
+    function currentShareUrl(state){
+      const u = new URL(window.location.href);
+      if (state && state.selected && state.selected.context){
+        u.searchParams.set("playlist", state.selected.context);
+      }else{
+        u.searchParams.delete("playlist");
+      }
+      return u.toString();
+    }
+
+    function setActivePlaylistItem(name){
+      const items = $("playlists").querySelectorAll(".item");
+      for (const it of items){
+        it.classList.toggle("active", it.dataset.context === name);
+      }
+    }
+
+    function renderPlaylists(state){
+      const list = $("playlists");
+      list.innerHTML = "";
+
+      const q = $("plSearch").value.trim().toLowerCase();
+      const shown = q
+        ? state.playlists.filter(p => (p.context || "").toLowerCase().includes(q))
+        : state.playlists;
+
+      // Always show an "All" pseudo-playlist
+      const allDiv = document.createElement("div");
+      allDiv.className = "item";
+      allDiv.dataset.context = "__all__";
+      if (!state.selected) allDiv.classList.add("active");
+      allDiv.innerHTML = `
+        <div class="itemTop">
+          <span class="badge">all</span>
+          <h3 class="itemTitle">All playlists</h3>
+          <span class="spacer"></span>
+          <span class="badge">${state.allTracks.length} tracks</span>
+        </div>
+        <div class="itemSub">
+          <span class="mono">Includes every loaded playlist + track</span>
+        </div>
+      `;
+      list.appendChild(allDiv);
+
+      if (!shown.length){
+        const div = document.createElement("div");
+        div.className = "muted";
+        div.style.padding = "6px 2px";
+        div.textContent = "No playlists found.";
+        list.appendChild(div);
+        return;
+      }
+
+      for (const p of shown){
+        const div = document.createElement("div");
+        div.className = "item";
+        div.dataset.context = p.context;
+
+        const mtime = fmtIso(p.mtime);
+        const tracks = p.tracks ? p.tracks.length : 0;
+        const url = p.url || "";
+
+        if (state.selected && state.selected.context === p.context) div.classList.add("active");
+
+        div.innerHTML = `
+          <div class="itemTop">
+            <span class="badge">playlist</span>
+            <h3 class="itemTitle">${escapeHtml(p.context)}</h3>
+            <span class="spacer"></span>
+            <span class="badge">${tracks} tracks</span>
+          </div>
+          <div class="itemSub">
+            <span>mtime: <span class="mono">${escapeHtml(mtime)}</span></span>
+            <span>url: <span class="mono">${escapeHtml(url)}</span></span>
+          </div>
+        `;
+        list.appendChild(div);
+      }
+    }
+
+    function filteredTracks(state){
+      const q = $("trSearch").value.trim().toLowerCase();
+      const audioOnly = $("audioOnly").checked;
+
+      let base = state.allTracks;
+      if (state.selected){
+        base = base.filter(t => t.playlist_context === state.selected.context);
+      }
+
+      if (audioOnly){
+        base = base.filter(t => isAudioPath(t.path || ""));
+      }
+
+      if (!q) return base;
+
+      return base.filter(t => {
+        const hay = [
+          t.title || "",
+          t.playlist_context || "",
+          t.path || "",
+          t.src || "",
+        ].join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+
+    function renderTracks(state){
+      const list = $("tracks");
+      list.innerHTML = "";
+
+      const shown = filteredTracks(state);
+
+      if (!shown.length){
+        const div = document.createElement("div");
+        div.className = "muted";
+        div.textContent = "No tracks match your filters.";
+        list.appendChild(div);
+        return;
+      }
+
+      for (let i = 0; i < shown.length; i++){
+        const t = shown[i];
+        const div = document.createElement("div");
+        div.className = "item";
+        div.dataset.gidx = String(t.global_idx);
+
+        const active = (state.current && state.current.global_idx === t.global_idx);
+        if (active) div.classList.add("active");
+
+        const badge = isAudioPath(t.path || "") ? "audio" : "file";
+        div.innerHTML = `
+          <div class="itemTop">
+            <span class="badge">${badge}</span>
+            <h3 class="itemTitle">${escapeHtml(t.title || "—")}</h3>
+            <span class="spacer"></span>
+            <span class="badge">${escapeHtml(t.playlist_context || "—")}</span>
+          </div>
+          <div class="itemSub">
+            <span class="mono" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 100%;">${escapeHtml(t.path || "—")}</span>
+          </div>
+        `;
+        list.appendChild(div);
+      }
+    }
+
+    function setNowPlaying(state){
+      const t = state.current || null;
+      if (!t){
+        $("trackTitle").textContent = "—";
+        $("trackSub").textContent = "—";
+        $("trackPath").textContent = "";
+        $("nowMeta").textContent = "Pick a track from the list.";
+        $("bundleFoot").textContent = "";
+        return;
+      }
+
+      $("trackTitle").textContent = t.title || "—";
+      $("trackSub").textContent = `playlist: ${t.playlist_context || "—"}`;
+      $("trackPath").textContent = t.src || "";
+
+      const gen = state.feed && state.feed.generated_at ? fmtIso(state.feed.generated_at) : "—";
+      const sha = state.feed && state.feed.content_sha256 ? state.feed.content_sha256.slice(0, 16) + "…" : "—";
+      $("nowMeta").textContent = `feed generated_at: ${gen} • content_sha256: ${sha}`;
+
+      const footBits = [];
+      if (t.bundleBase) footBits.push(`bundle: ${t.bundleBase}`);
+      if (t.playlistUrl) footBits.push(`playlist: ${t.playlistUrl}`);
+      if (t.manifestUrl) footBits.push(`manifest: ${t.manifestUrl}`);
+      $("bundleFoot").textContent = footBits.join(" • ");
+    }
+
+    function setAudioSource(state){
+      const a = $("audio");
+      const t = state.current || null;
+      if (!t || !t.src){
+        a.removeAttribute("src");
+        a.load();
+        $("btnPlay").textContent = "Play";
+        return;
+      }
+      a.src = t.src;
+      a.load();
+      $("btnPlay").textContent = "Play";
+    }
+
+    function playPause(){
+      const a = $("audio");
+      if (!a.src){
+        toast("No track loaded", "Pick a track first.");
+        return;
+      }
+      if (a.paused){
+        a.play().catch(() => {});
+        $("btnPlay").textContent = "Pause";
+      }else{
+        a.pause();
+        $("btnPlay").textContent = "Play";
+      }
+    }
+
+    function seekBy(seconds){
+      const a = $("audio");
+      if (!isFinite(a.duration)) return;
+      a.currentTime = Math.max(0, Math.min(a.duration, a.currentTime + seconds));
+    }
+
+    function pickPlayable(tracks){
+      const idx = tracks.findIndex(t => isAudioPath(t.path || "") && t.src);
+      return idx >= 0 ? tracks[idx] : (tracks[0] || null);
+    }
+
+    function nextPrev(state, delta){
+      const shown = filteredTracks(state);
+      if (!shown.length) return;
+
+      const cur = state.current ? shown.findIndex(x => x.global_idx === state.current.global_idx) : -1;
+      const j = (cur < 0) ? 0 : (cur + delta + shown.length) % shown.length;
+
+      state.current = shown[j];
+      setNowPlaying(state);
+      setAudioSource(state);
+
+      renderTracks(state);
+
+      const a = $("audio");
+      if (!a.paused){
+        a.play().catch(() => {});
+        $("btnPlay").textContent = "Pause";
+      }
+    }
+
+    async function loadAllPlaylists(state){
+      // Primary mode: GitHub Pages feed (/releases/feed.json).
+      // Fallback mode: local bundle in the same directory as index.html (./playlist.json + ./web_manifest.json).
+      const feedUrl = resolveFeedUrl();
+      $("pillFeed").textContent = feedUrl.replace(window.location.origin, "");
+
+      let feed = null;
+      let webCtxs = [];
+      try{
+        feed = await fetchJson(feedUrl);
+        state.feed = feed;
+
+        const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+        webCtxs = ctxs.filter(x => x.kind === "web");
+      }catch(e){
+        // Fallback to local bundle
+        state.feed = null;
+        const path = (window.location && window.location.pathname) ? window.location.pathname : "/";
+        const basePath = path.endsWith(".html") ? path.replace(/[^\/]+$/, "") : path;
+        const localUrl = basePath || "/";
+        $("pillFeed").textContent = "(local bundle)";
+        $("plMeta").textContent = "Feed unavailable. Loading local bundle…";
+
+        webCtxs = [{
+          context: "local",
+          kind: "web",
+          mtime: null,
+          track_count: null,
+          url: localUrl,
+        }];
+      }
+
+      if (!webCtxs.length){
+        $("plMeta").textContent = "No web playlists found in feed.";
+        state.playlists = [];
+        state.allTracks = [];
+        setCounts(state);
+        renderPlaylists(state);
+        renderTracks(state);
+        return;
+      }
+
+      $("plMeta").textContent = `Found ${webCtxs.length} playlist${webCtxs.length === 1 ? "" : "s"}. Loading bundles…`;
+
+      // Load each bundle with a small concurrency limit to avoid a burst
+      const limit = 4;
+      const q = webCtxs.slice();
+      const out = [];
+      let active = 0;
+
+      async function worker(){
+        while (q.length){
+          const ctx = q.shift();
+          if (!ctx) break;
+          active++;
+          try{
+            const b = await loadBundle(ctx);
+            out.push({ ctx, ...b });
+          }catch(err){
+            console.warn("Failed to load bundle:", ctx, err);
+          }finally{
+            active--;
+          }
+        }
+      }
+
+      const workers = [];
+      for (let i=0; i<limit; i++) workers.push(worker());
+      await Promise.all(workers);
+
+      // Sort stable: by context then url
+      out.sort((a,b) => {
+        const ac = (a.ctx && a.ctx.context) ? String(a.ctx.context) : "";
+        const bc = (b.ctx && b.ctx.context) ? String(b.ctx.context) : "";
+        if (ac !== bc) return ac < bc ? -1 : 1;
+        const au = (a.ctx && a.ctx.url) ? String(a.ctx.url) : "";
+        const bu = (b.ctx && b.ctx.url) ? String(b.ctx.url) : "";
+        return au < bu ? -1 : (au > bu ? 1 : 0);
+      });
+
+      // Normalize playlists to a consistent shape for rendering
+      state.playlists = out.map(o => {
+        const name = (o.playlist && (o.playlist.title || o.playlist.name)) ? (o.playlist.title || o.playlist.name) : (o.ctx.context || "playlist");
+        return {
+          name,
+          context: o.ctx.context || name,
+          bundleBase: o.bundleBase,
+          playlistUrl: o.playlistUrl,
+          manifestUrl: o.manifestUrl,
+          playlist: o.playlist,
+          manifest: o.manifest,
+        };
+      });
+
+      // Flatten tracks
+      state.allTracks = [];
+      for (const pl of state.playlists){
+        const pts = playlistTracks(pl.playlist);
+        for (const t of pts){
+          const webPath = t.web_path || t.path || t.url || "";
+          if (!isAudioPath(webPath)) continue;
+          const src = computeTrackSrc(pl.bundleBase, webPath);
+          state.allTracks.push({
+            ...t,
+            _playlist: pl,
+            _src: src,
+            web_path: webPath,
+          });
+        }
+      }
+
+      // Stable order: by playlist name then track display
+      state.allTracks.sort((a,b) => {
+        const ap = (a._playlist && a._playlist.name) ? String(a._playlist.name) : "";
+        const bp = (b._playlist && b._playlist.name) ? String(b._playlist.name) : "";
+        if (ap !== bp) return ap < bp ? -1 : 1;
+        const ad = trackDisplay(a);
+        const bd = trackDisplay(b);
+        return ad < bd ? -1 : (ad > bd ? 1 : 0);
+      });
+
+      setCounts(state);
+      renderPlaylists(state);
+      renderTracks(state);
+
+      $("plMeta").textContent = `Loaded ${state.playlists.length} playlist${state.playlists.length === 1 ? "" : "s"} • ${state.allTracks.length} track${state.allTracks.length === 1 ? "" : "s"}.`;
+    };
+            });
+
+            out.push({
+              context: ctx.context,
+              mtime: ctx.mtime,
+              url: ctx.url,
+              track_count: ctx.track_count,
+              bundleBase: bundle.bundleBase,
+              playlistUrl: bundle.playlistUrl,
+              manifestUrl: bundle.manifestUrl,
+              manifest: bundle.manifest,
+              tracks: rawTracks,
+            });
+          }catch (e){
+            failed++;
+            console.error("Failed to load playlist:", ctx && ctx.context, e);
+          }
+        }
+      }
+
+      const workers = [];
+      for (let i = 0; i < Math.min(limit, webCtxs.length); i++){
+        workers.push(worker());
+      }
+      await Promise.all(workers);
+
+      // Sort playlists (context name)
+      out.sort((a,b) => String(a.context).localeCompare(String(b.context)));
+
+      state.playlists = out;
+
+      // Flatten tracks
+      const all = [];
+      let g = 0;
+      for (const p of out){
+        for (let i = 0; i < (p.tracks || []).length; i++){
+          const t = p.tracks[i];
+          all.push({
+            global_idx: g++,
+            playlist_context: p.context,
+            playlist_idx: i,
+            title: t.title,
+            path: t.path,
+            src: t.src,
+            bundleBase: p.bundleBase,
+            playlistUrl: p.playlistUrl,
+            manifestUrl: p.manifestUrl,
+          });
+        }
+      }
+      state.allTracks = all;
+
+      setCounts(state);
+
+      const msg = failed ? `Loaded ${out.length}/${webCtxs.length} playlists (${failed} failed).` : `Loaded ${out.length} playlists.`;
+      $("plMeta").textContent = msg;
+
+      if (!state.current){
+        const pick = pickPlayable(state.allTracks);
+        state.current = pick;
+        setNowPlaying(state);
+        setAudioSource(state);
+      }
+    }
+
+    function findPlaylistByName(state, name){
+      return state.playlists.find(p => p.context === name) || null;
+    }
+
+    function setSelectedPlaylist(state, pl){
+      state.selected = pl;
+      renderPlaylists(state);
+      renderTracks(state);
+
+      if (pl){
+        toast("Playlist selected", pl.context);
+      }else{
+        toast("Playlist selected", "All playlists");
+      }
+
+      // If current track isn't in the selected playlist anymore, pick the first playable in view
+      const shown = filteredTracks(state);
+      if (!shown.length){
+        state.current = null;
+        setNowPlaying(state);
+        setAudioSource(state);
+        return;
+      }
+      if (!state.current || !shown.some(x => state.current && x.global_idx === state.current.global_idx)){
+        state.current = pickPlayable(shown);
+        setNowPlaying(state);
+        setAudioSource(state);
+      }
+    }
+
+    function movePlaylistSelection(state, delta){
+      if (!state.playlists.length) return;
+
+      // When "All" is selected, treat it as index -1; J selects first playlist
+      const curName = state.selected ? state.selected.context : null;
+      const i = curName ? state.playlists.findIndex(p => p.context === curName) : -1;
+      const j = Math.max(-1, Math.min(state.playlists.length - 1, i + delta));
+
+      if (j < 0) setSelectedPlaylist(state, null);
+      else setSelectedPlaylist(state, state.playlists[j]);
+    }
+
+    async function main(){
+      const state = {
+        feed: null,
+        playlists: [],
+        allTracks: [],
+        selected: null, // null = All
+        current: null,
       };
-      const title = document.createElement("div");
-      title.textContent = (t.title || t.track_id);
-      const small = document.createElement("div");
-      small.className = "muted";
-      small.textContent = t.track_id;
-      const col = document.createElement("div");
-      col.appendChild(title);
-      col.appendChild(small);
-      row.appendChild(btn);
-      row.appendChild(col);
-      elTracks.appendChild(row);
-    });
-  }catch(e){
-    setStatus("Error: " + e);
-  }
-})();
-</script>
+
+      setModeLabel();
+
+      try{
+        await loadAllPlaylists(state);
+        renderPlaylists(state);
+        renderTracks(state);
+
+        // Support ?playlist=focus
+        const u = new URL(window.location.href);
+        const want = u.searchParams.get("playlist");
+        if (want){
+          const pl = findPlaylistByName(state, want);
+          if (pl) setSelectedPlaylist(state, pl);
+        }
+
+        toast("Ready", "Loaded playlists and tracks.");
+      }catch (e){
+        console.error(e);
+        $("plMeta").textContent = "Failed to load feed/playlists.";
+        toast("Load failed", String(e && e.message ? e.message : e));
+      }
+
+      $("btnReload").addEventListener("click", async () => {
+        try{
+          $("plMeta").textContent = "Reloading…";
+          state.feed = null;
+          state.playlists = [];
+          state.allTracks = [];
+          state.selected = null;
+          state.current = null;
+          await loadAllPlaylists(state);
+          renderPlaylists(state);
+          renderTracks(state);
+          toast("Reloaded", "Loaded latest playlists and tracks.");
+        }catch (e){
+          toast("Reload failed", String(e && e.message ? e.message : e));
+        }
+      });
+
+      $("plSearch").addEventListener("input", () => renderPlaylists(state));
+      $("trSearch").addEventListener("input", () => renderTracks(state));
+      $("audioOnly").addEventListener("change", () => {
+        renderTracks(state);
+        // keep current sane
+        const shown = filteredTracks(state);
+        if (state.current && !shown.some(x => x.global_idx === state.current.global_idx)){
+          state.current = pickPlayable(shown);
+          setNowPlaying(state);
+          setAudioSource(state);
+        }
+      });
+
+      $("playlists").addEventListener("click", (ev) => {
+        const item = ev.target.closest(".item");
+        if (!item) return;
+        const name = item.dataset.context;
+
+        if (name === "__all__"){
+          setSelectedPlaylist(state, null);
+          return;
+        }
+        const pl = findPlaylistByName(state, name);
+        if (pl) setSelectedPlaylist(state, pl);
+      });
+
+      $("tracks").addEventListener("click", (ev) => {
+        const item = ev.target.closest(".item");
+        if (!item) return;
+        const gidx = parseInt(item.dataset.gidx || "-1", 10);
+        if (!Number.isFinite(gidx) || gidx < 0) return;
+
+        const t = state.allTracks.find(x => x.global_idx === gidx);
+        if (!t) return;
+
+        state.current = t;
+        setNowPlaying(state);
+        setAudioSource(state);
+        renderTracks(state);
+      });
+
+      $("btnPlay").addEventListener("click", () => playPause());
+      $("btnPrev").addEventListener("click", () => nextPrev(state, -1));
+      $("btnNext").addEventListener("click", () => nextPrev(state, +1));
+      $("btnSeekBack").addEventListener("click", () => seekBy(-10));
+      $("btnSeekFwd").addEventListener("click", () => seekBy(+10));
+
+      $("vol").addEventListener("input", (ev) => {
+        const v = parseFloat(ev.target.value);
+        $("audio").volume = Math.max(0, Math.min(1, v));
+      });
+      $("audio").volume = parseFloat($("vol").value);
+
+      $("audio").addEventListener("play", () => { $("btnPlay").textContent = "Pause"; });
+      $("audio").addEventListener("pause", () => { $("btnPlay").textContent = "Play"; });
+      $("audio").addEventListener("ended", () => { nextPrev(state, +1); });
+
+      $("btnCopyLink").addEventListener("click", async () => {
+        try{
+          const u = currentShareUrl(state);
+          await navigator.clipboard.writeText(u);
+          toast("Copied link", u);
+        }catch{
+          toast("Copy failed", "Your browser blocked clipboard access.");
+        }
+      });
+
+      $("btnOpenBundle").addEventListener("click", () => {
+        const pl = state.selected;
+        if (!pl){
+          toast("No bundle", "Select a playlist first.");
+          return;
+        }
+        const u = normalizeBundleBase({ url: pl.url });
+        window.open(u, "_blank", "noopener");
+      });
+
+      // Keyboard shortcuts:
+      // J/K = move playlist selection (includes "All")
+      // Space = play/pause
+      // N/P = next/prev track (in the currently filtered track list)
+      // Left/Right = seek
+      window.addEventListener("keydown", (ev) => {
+        const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
+        const inInput = tag === "input" || tag === "textarea";
+        if (inInput) return;
+
+        if (ev.key === " "){
+          ev.preventDefault();
+          playPause();
+          return;
+        }
+        if (ev.key === "j" || ev.key === "J"){ movePlaylistSelection(state, +1); return; }
+        if (ev.key === "k" || ev.key === "K"){ movePlaylistSelection(state, -1); return; }
+        if (ev.key === "n" || ev.key === "N"){ nextPrev(state, +1); return; }
+        if (ev.key === "p" || ev.key === "P"){ nextPrev(state, -1); return; }
+        if (ev.key === "ArrowLeft"){ seekBy(-5); return; }
+        if (ev.key === "ArrowRight"){ seekBy(+5); return; }
+      });
+    }
+
+    main();
+  </script>
 </body>
 </html>
 """
@@ -460,8 +1601,20 @@ _EMBEDDED_INDEX_HTML = """<!doctype html>
 # web build
 # ---------------------------
 
+def _normalize_playlist_path_arg(p: Path) -> Path:
+    """Allow passing a run output directory instead of a playlist.json path."""
+    if p.exists() and p.is_dir():
+        cand = p / "playlist.json"
+        if cand.exists():
+            return cand
+        cand2 = p / "drop_bundle" / "playlist.json"
+        if cand2.exists():
+            return cand2
+    return p
+
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(getattr(args, "playlist"))).expanduser().resolve()
+    playlist_path = _normalize_playlist_path_arg(playlist_path)
     out_dir = Path(str(getattr(args, "out_dir"))).expanduser().resolve()
 
     if getattr(args, "clean", False) and out_dir.exists():
@@ -1351,7 +2504,7 @@ def register_web_subcommand(subparsers: argparse._SubParsersAction) -> None:
     ws = web.add_subparsers(dest="web_cmd", required=True)
 
     build = ws.add_parser("build", help="Build a static web bundle")
-    build.add_argument("--playlist", required=True, help="Playlist JSON path")
+    build.add_argument("--playlist", required=True, help="Playlist JSON path OR run output dir")
     build.add_argument("--out-dir", required=True, help="Output directory for the web bundle")
     build.add_argument("--db", default="", help="DB path (optional; used to resolve track_id -> full_path/preview_path when bundling audio)")
     build.add_argument("--repo-root", default=".", help="Repo root used for resolving relative paths (default: .)")

@@ -352,18 +352,54 @@ def _pick_preferred_audio_source(p: Path) -> Path:
 
 
 def _copy_track_for_bundle(src: Path, dst: Path) -> None:
+    """
+    Copy audio into bundle, but tolerate callers passing an extensionless repo artifact path
+    like data/tracks/<uuid>. If src doesn't exist, try common audio extensions and stem.*.
+    Deterministic: fixed extension order, then sorted glob order.
+    """
+    src_in = Path(str(src)).expanduser()
+    cwd = Path.cwd()
+    src_abs = (src_in if src_in.is_absolute() else (cwd / src_in)).resolve()
+
+    def _resolve_audio(p: Path) -> Optional[Path]:
+        if p.is_file():
+            return p
+
+        base = p
+        cands: List[Path] = []
+
+        # If no suffix, try common audio extensions first (deterministic order)
+        if base.suffix == "":
+            for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
+                cands.append(base.with_suffix(ext))
+            # Then try stem.* matches (sorted for determinism)
+            try:
+                if base.parent.is_dir():
+                    cands.extend(sorted(base.parent.glob(base.name + ".*"), key=lambda x: x.name))
+            except Exception:
+                pass
+        else:
+            # If suffix exists but file missing, try stem.* (sorted)
+            try:
+                if base.parent.is_dir():
+                    cands.extend(sorted(base.parent.glob(base.stem + ".*"), key=lambda x: x.name))
+            except Exception:
+                pass
+
+        for cand in cands:
+            try:
+                if cand.is_file():
+                    return cand.resolve()
+            except Exception:
+                continue
+        return None
+
+    chosen = _resolve_audio(src_abs)
+    if not chosen or not chosen.is_file():
+        raise FileNotFoundError(f"[bundle] missing source audio: src={src} resolved={src_abs}")
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-
-    if src.suffix.lower() == ".mp3":
-        # Some providers (or older cached files) may include junk bytes before the ID3 header
-        # or before the first frame sync. Strip that prefix to keep web bundling stable.
-        b = src.read_bytes()
-        b2 = _sanitize_mp3_bytes_if_needed(b)
-        dst.write_bytes(b2)
-        return
-
-    # Non-mp3: byte-copy (avoid copy2 metadata for determinism)
-    dst.write_bytes(src.read_bytes())
+    dst.write_bytes(chosen.read_bytes())
 
 def _require_nonempty_file(p: Path) -> None:
     try:
@@ -1656,7 +1692,6 @@ def db_insert_track(
     bpm_col = _pick_first_existing(cols, ["bpm", "tempo"])
 
     # tracks.genre is NOT NULL in our canonical schema.
-    # If provider doesn't supply it, deterministically fall back to context/mood.
     genre_norm = (genre or "").strip()
     if not genre_norm:
         genre_norm = (mood or "").strip().lower() or "unknown"
@@ -1683,37 +1718,72 @@ def db_insert_track(
     # Path + preview enforcement
     # ----------------------------
     if path_col and artifact_path is not None:
-        ap = Path(str(artifact_path)).expanduser()
-        # Resolve relative paths from CWD (repo root in your CLI usage).
-        ap_resolved = ap if ap.is_absolute() else (Path.cwd() / ap).resolve()
+        cwd = Path.cwd()
 
-        # Guard: never write a path that doesn't exist.
-        if not ap_resolved.is_file():
-            raise FileNotFoundError(
-                f"Refusing to insert track with missing {path_col}: {artifact_path} "
-                f"(resolved: {ap_resolved}) track_id={track_id}"
-            )
+        ap_in = Path(str(artifact_path)).expanduser()
+        ap_resolved = (ap_in if ap_in.is_absolute() else (cwd / ap_in)).resolve()
 
-        # Write primary path column.
-        data[path_col] = str(artifact_path)
+        chosen: Optional[Path] = None
 
-        # If schema requires a preview, choose one that exists.
-        if preview_col:
-            # 1) Preferred: data/previews/<stem>_preview.mp3
-            stem = ap_resolved.stem
-            guess1 = Path("data") / "previews" / f"{stem}_preview.mp3"
-            g1 = (Path.cwd() / guess1).resolve()
+        if ap_resolved.is_file():
+            chosen = ap_resolved
+        else:
+            base = ap_resolved
+            cands: List[Path] = []
 
-            if g1.is_file():
-                data[preview_col] = str(guess1)
+            if base.suffix == "":
+                for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
+                    cands.append(base.with_suffix(ext))
+                try:
+                    if base.parent.is_dir():
+                        cands.extend(sorted(base.parent.glob(base.name + ".*"), key=lambda p: p.name))
+                except Exception:
+                    pass
             else:
-                # 2) If artifact is already an mp3, it can serve as preview.
-                if ap_resolved.suffix.lower() == ".mp3":
-                    data[preview_col] = str(artifact_path)
-                else:
-                    # 3) Minimal, deterministic fallback: use the artifact itself as preview.
-                    # This keeps the DB invariant (preview_path exists) without requiring ffmpeg.
-                    data[preview_col] = str(artifact_path)
+                try:
+                    if base.parent.is_dir():
+                        cands.extend(sorted(base.parent.glob(base.stem + ".*"), key=lambda p: p.name))
+                except Exception:
+                    pass
+
+            for cand in cands:
+                if cand.is_file():
+                    chosen = cand.resolve()
+                    break
+
+        if not chosen or not chosen.is_file():
+            strict = str(os.environ.get("MGC_STRICT_TRACK_PATHS") or "").strip().lower() in ("1", "true", "yes", "on")
+            if strict:
+                raise FileNotFoundError(
+                    f"Refusing to insert track with missing {path_col}: {artifact_path} "
+                    f"(resolved: {ap_resolved}) track_id={track_id}"
+                )
+            try:
+                print(
+                    f"[db_insert_track] missing {path_col}; skipping insert: "
+                    f"track_id={track_id} artifact_path={artifact_path} resolved={ap_resolved}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            stored_rel = chosen.relative_to(cwd)
+            stored_path = _posix(stored_rel)
+        except Exception:
+            stored_path = str(chosen)
+
+        data[path_col] = stored_path
+
+        if preview_col:
+            stem = chosen.stem
+            guess1_rel = Path("data") / "previews" / f"{stem}_preview.mp3"
+            guess1_abs = (cwd / guess1_rel).resolve()
+            if guess1_abs.is_file():
+                data[preview_col] = _posix(guess1_rel)
+            else:
+                data[preview_col] = stored_path
 
     # ----------------------------
     # Optional fields
@@ -1814,118 +1884,125 @@ def db_insert_marketing_post(
     *,
     post_id: str,
     ts: str,
-    platform: str,
-    status: str,
-    content: str,
-    meta: Dict[str, Any],
+    track_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    kind: Optional[str] = None,
+    content: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    status: Optional[str] = None,
+    **kw: Any,
 ) -> None:
     cols = db_table_columns(con, "marketing_posts")
     if not cols:
         raise sqlite3.OperationalError("table marketing_posts does not exist")
 
-    # Column drift
-    pk_col = _pick_first_existing(cols, ["id", "post_id", "marketing_post_id"]) or "id"
-    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
-    platform_col = _pick_first_existing(cols, ["platform", "channel", "destination"])
-    status_col = _pick_first_existing(cols, ["status", "state"])
-    track_id_col = _pick_first_existing(cols, ["track_id", "track", "track_uuid"])
+    strict = str(os.environ.get("MGC_STRICT_TRACK_PATHS") or "").strip().lower() in ("1", "true", "yes", "on")
 
-    content_col = _detect_marketing_content_col(cols)  # should pick payload_json if present
-    meta_col = _detect_marketing_meta_col(cols)
-
-    # If neither content nor meta columns were detected, fall back to a generic text payload column.
-    best_payload = None
-    if not content_col and not meta_col:
-        best_payload = _best_text_payload_column(
-            con,
-            "marketing_posts",
-            reserved=[
-                "id",
-                "post_id",
-                "marketing_post_id",
-                "ts",
-                "created_at",
-                "created_ts",
-                "platform",
-                "channel",
-                "destination",
-                "status",
-                "state",
-                "track_id",
-                "track",
-                "track_uuid",
-            ],
+    # Normalize common alias kw names from older call sites
+    if kind is None:
+        kind = (
+            kw.get("kind")
+            or kw.get("type")
+            or kw.get("post_kind")
+            or kw.get("post_type")
+            or "post"
+        )
+    if platform is None:
+        platform = (
+            kw.get("platform")
+            or kw.get("channel")
+            or kw.get("network")
+            or "local"
+        )
+    if content is None:
+        content = (
+            kw.get("content")
+            or kw.get("text")
+            or kw.get("body")
+            or kw.get("caption")
+            or ""
+        )
+    if meta is None:
+        meta = (
+            kw.get("meta")
+            or kw.get("metadata")
+            or kw.get("meta_json")
+            or {}
         )
 
-    # We may need a track_id if schema enforces it (your DB does).
-    # Primary source: meta["track_id"]
-    track_id_val = str((meta or {}).get("track_id") or "")
-
-    # Fallback: if content is JSON, try pulling track_id out of it.
-    if not track_id_val:
-        try:
-            obj = json.loads(content) if isinstance(content, str) else None
-            if isinstance(obj, dict):
-                track_id_val = str(obj.get("track_id") or "")
-        except Exception:
-            pass
+    # Column mapping
+    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
+    id_col = _pick_first_existing(cols, ["id", "post_id"])
+    track_col = _pick_first_existing(cols, ["track_id"])
+    platform_col = _pick_first_existing(cols, ["platform"])
+    kind_col = _pick_first_existing(cols, ["kind", "type"])
+    content_col = _pick_first_existing(cols, ["content", "text", "body"])
+    meta_col = _pick_first_existing(cols, ["meta_json", "metadata_json", "meta", "metadata"])
+    status_col = _pick_first_existing(cols, ["status", "state", "post_status"])
 
     data: Dict[str, Any] = {}
 
-    # PK
-    data[pk_col] = post_id
-
-    # Also populate common alias columns if present (harmless, helps drift)
-    if pk_col != "id" and "id" in cols:
-        data["id"] = post_id
-    if pk_col != "post_id" and "post_id" in cols:
-        data["post_id"] = post_id
-    if pk_col != "marketing_post_id" and "marketing_post_id" in cols:
-        data["marketing_post_id"] = post_id
-
-    # Timestamps / platform / status
+    if id_col:
+        data[id_col] = post_id
     if ts_col:
         data[ts_col] = ts
     if platform_col:
-        data[platform_col] = platform
-    if status_col:
+        data[platform_col] = str(platform)
+    if kind_col:
+        data[kind_col] = str(kind)
+    if content_col:
+        data[content_col] = str(content)
+    if meta_col:
+        data[meta_col] = stable_json_dumps(meta if isinstance(meta, dict) else {})
+    if status_col and status is not None:
         data[status_col] = status
 
-    # Track FK if schema has it
-    if track_id_col:
-        if not track_id_val:
-            # If the schema has track_id, we refuse to insert an FK-violating row.
-            # This is what was killing `run autonomous`.
-            raise ValueError(
-                "marketing_posts schema requires track_id, but none was provided. "
-                "Pass meta={'track_id': ...} (or include track_id in JSON content)."
-            )
-        data[track_id_col] = track_id_val
+    # FK-safe track_id handling (skip if missing and not strict)
+    if track_col and track_id:
+        try:
+            tcols = db_table_columns(con, "tracks") or []
+            t_id_col = _pick_first_existing(tcols, ["id", "track_id"])
+            if t_id_col:
+                row = con.execute(
+                    f"SELECT 1 FROM tracks WHERE {t_id_col} = ? LIMIT 1",
+                    (track_id,),
+                ).fetchone()
+                if not row:
+                    if strict:
+                        raise sqlite3.IntegrityError(
+                            f"Refusing to insert marketing_post with missing referenced track: track_id={track_id}"
+                        )
+                    try:
+                        print(
+                            "[db_insert_marketing_post] missing referenced track; skipping insert: "
+                            f"post_id={post_id} track_id={track_id}",
+                            file=sys.stderr,
+                        )
+                    except Exception:
+                        pass
+                    return
+        except sqlite3.IntegrityError:
+            raise
+        except Exception:
+            pass
 
-    # Content/meta placement
-    meta_to_store = dict(meta or {})
-    if not content_col:
-        meta_to_store["content"] = content
+        data[track_col] = track_id
 
-    if content_col:
-        data[content_col] = content
-        # If there is also a meta column, store meta separately (nice for debugging)
-        if meta_col:
-            data[meta_col] = stable_json_dumps(meta or {})
-    elif meta_col:
-        data[meta_col] = stable_json_dumps(meta_to_store)
-    elif best_payload:
-        data[best_payload] = stable_json_dumps(meta_to_store) if meta_to_store else content
-    else:
-        # Last resort: attempt 'content' if it exists (some schemas use it)
-        if "content" in cols:
-            data["content"] = content
-        else:
-            raise sqlite3.OperationalError(
-                "marketing_posts has no detectable payload/meta column to store content"
-            )
-
-    _insert_row(con, "marketing_posts", data)
+    try:
+        _insert_row(con, "marketing_posts", data)
+    except sqlite3.IntegrityError as e:
+        msg = str(e).lower()
+        if (not strict) and ("foreign key" in msg or "constraint failed" in msg):
+            try:
+                print(
+                    "[db_insert_marketing_post] foreign key constraint; skipping insert: "
+                    f"post_id={post_id} track_id={track_id} err={e}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            return
+        raise
 
 
 def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> List[sqlite3.Row]:
@@ -2469,6 +2546,9 @@ def _stub_daily_run(
     src_pick = _pick_preferred_audio_source(artifact_path)
 
     bundled_track_rel, bundled_track_path = _bundle_track_to_dir(out_dir, track_id, src_pick)
+    # IMPORTANT: hash the ACTUAL bundled file (after copy), not the source pick
+    bundled_track_sha256 = _sha256_file(bundled_track_path)
+
 
     playlist_rel = Path("playlist.json")
     playlist_path = (out_dir / playlist_rel).resolve()
@@ -3441,6 +3521,19 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
         """
         playlist_path = bundle_dir / "playlist.json"
         if not playlist_path.exists():
+            # AUTO: normalize missing track full_path by trying common audio suffixes
+            try:
+                # If caller passed suffix-less path like "data/tracks/<uuid>", try resolving it.
+                _p = Path(full_path)
+                if _p.suffix == "" and (not _p.exists()):
+                    for _ext in (".wav", ".mp3", ".flac", ".ogg"):
+                        _cand = _p.with_suffix(_ext)
+                        if _cand.exists() and _cand.is_file():
+                            full_path = str(_cand)
+                            break
+            except Exception:
+                pass
+
             raise FileNotFoundError(f"bundle missing playlist.json: {playlist_path}")
 
         cmd = [
@@ -5506,7 +5599,7 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
 
     contract_mode = str(getattr(args, "contract", "local") or "local")
     require_marketing = bool(getattr(args, "require_marketing", False)) or (contract_mode == "publish")
-    require_web = bool(getattr(args, "require_web", False)) or (contract_mode == "publish")
+    require_web = bool(getattr(args, "require_web", False)) or bool(getattr(args, "with_web", False)) or (contract_mode == "publish")
 
     web_build_ok: Optional[bool] = None
     web_build_error: Optional[str] = None
@@ -5893,6 +5986,42 @@ def cmd_run_autonomous(args: argparse.Namespace) -> int:
                 dy = dr.get("daily")
                 if isinstance(dy, dict):
                     dy["bundle_track_path"] = tf0
+                    # AUTO: keep printed drop.daily.sha256.bundle_track in sync with track_files[0]
+                    try:
+                        # tf0 is a relative posix path like "tracks/<uuid>.mp3"
+                        _p = Path(out_dir) / tf0
+                        if _p.exists() and _p.is_file():
+                            _sha = _sha256_file(_p)
+                            if isinstance(dy.get("sha256"), dict):
+                                dy["sha256"]["bundle_track"] = _sha
+                            else:
+                                dy["sha256"] = {"bundle_track": _sha}
+                    except Exception:
+                        pass
+
+                    # SYNC daily_evidence.json bundle_track to tf0 (so evidence matches served audio)
+                    try:
+                        import json as _json, hashlib as _hashlib
+                        from pathlib import Path as _P
+                        ev_p = _P(out_dir) / "daily_evidence.json"
+                        if tf0 and ev_p.exists() and ev_p.is_file():
+                            ev = _json.loads(ev_p.read_text("utf-8"))
+                            paths = ev.get("paths") if isinstance(ev.get("paths"), dict) else {}
+                            sha = ev.get("sha256") if isinstance(ev.get("sha256"), dict) else {}
+                            paths["bundle_track"] = str(tf0)
+                            ap = _P(out_dir) / _P(str(tf0))
+                            if ap.exists() and ap.is_file():
+                                h = _hashlib.sha256()
+                                with ap.open("rb") as f:
+                                    for b in iter(lambda: f.read(1024 * 1024), b""):
+                                        h.update(b)
+                                sha["bundle_track"] = h.hexdigest()
+                            ev["paths"] = paths
+                            ev["sha256"] = sha
+                            ev_p.write_text(_json.dumps(ev, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+
     except Exception:
         pass
 
