@@ -67,3 +67,6 @@ __pycache__/
 *.bak
 *.bak_*
 src/mgc/run_cli00.py
+
+# local / generated sqlite
+fixtures/ci_db.sqlite
