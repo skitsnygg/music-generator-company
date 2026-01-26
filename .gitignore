@@ -1,72 +1,73 @@
+# =========================
+# Python / venv / caches
+# =========================
 .venv/
+venv/
+.venv-riffusion/
 __pycache__/
-*.pyc
-.DS_Store
-/artifacts/
-/*.log
-
-data/db.sqlite
-data/tracks/
-data/previews/
-data/posts/
-
-logs/*.log
-.env
-.idea/
-.idea/
-
-# Python
-.venv/
-__pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
 .dist/
 build/
 
-# Env / secrets
-.env
-
-# Runtime artifacts
-data/
-logs/
-*.db
-*.sqlite
-*.sqlite3
-
+# =========================
 # OS / IDE
+# =========================
 .DS_Store
 .idea/
 .vscode/
 
-# data
+# =========================
+# Env / secrets
+# =========================
+.env
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+logs/*.log
+
+# =========================
+# Databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+data/db.sqlite
+fixtures/ci_db.sqlite
+
+# =========================
+# Runtime artifacts
+# =========================
+/artifacts/
+data/tracks/
+data/previews/
+data/posts/
+
+# Keep playlists manifest tracked (and ONLY what you explicitly allow)
 data/
-# but keep the playlists manifest tracked
 !data/playlists/
 !data/playlists/_manifest.playlists.json
 
-# Generated playlists artifacts (committed only when explicitly forced)
-data/playlists/_manifest.playlists.json
+# If you still want to ignore generated playlist jsons:
 data/playlists/*.json
-tracks/
+!data/playlists/_manifest.playlists.json
 
-# local venv
-.venv/
-venv/
-.env/
-
-# python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.venv-riffusion/
-
-# local backups / scratch
+# =========================
+# Local backups / scratch
+# =========================
 *.bak
 *.bak_*
 src/mgc/run_cli00.py
 
-# local / generated sqlite
-fixtures/ci_db.sqlite
+# =========================
+# GH Pages: allow web audio tracks (IMPORTANT)
+# =========================
+!docs/**/tracks/
+!docs/**/tracks/*.mp3
