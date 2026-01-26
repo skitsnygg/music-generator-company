@@ -1,9 +1,8 @@
-# =========================
-# Python / venv / caches
-# =========================
+# ----------------------------
+# Python / virtualenv / caches
+# ----------------------------
 .venv/
 venv/
-.venv-riffusion/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -14,60 +13,57 @@ __pycache__/
 .dist/
 build/
 
-# =========================
+# ----------------------------
 # OS / IDE
-# =========================
+# ----------------------------
 .DS_Store
 .idea/
 .vscode/
-
-# =========================
-# Env / secrets
-# =========================
 .env
 
-# =========================
+# ----------------------------
 # Logs
-# =========================
+# ----------------------------
 *.log
 logs/
 logs/*.log
 
-# =========================
-# Databases
-# =========================
+# ----------------------------
+# Runtime / local data (default: ignore)
+# ----------------------------
+data/
 *.db
 *.sqlite
 *.sqlite3
-data/db.sqlite
-fixtures/ci_db.sqlite
 
-# =========================
-# Runtime artifacts
-# =========================
-/artifacts/
-data/tracks/
-data/previews/
-data/posts/
-
-# Keep playlists manifest tracked (and ONLY what you explicitly allow)
-data/
+# Keep playlists directory + manifest tracked (if you use it)
 !data/playlists/
 !data/playlists/_manifest.playlists.json
 
-# If you still want to ignore generated playlist jsons:
+# If you want to keep generated playlist jsons untracked:
 data/playlists/*.json
-!data/playlists/_manifest.playlists.json
 
-# =========================
+# ----------------------------
+# Project artifacts
+# ----------------------------
+/artifacts/
+
+# Repo-root generated audio cache (this is what is breaking CI)
+# IMPORTANT: this is anchored to repo root, not docs/**/tracks
+/tracks/
+
+# ----------------------------
 # Local backups / scratch
-# =========================
+# ----------------------------
 *.bak
 *.bak_*
 src/mgc/run_cli00.py
 
-# =========================
-# GH Pages: allow web audio tracks (IMPORTANT)
-# =========================
-!docs/**/tracks/
+# Local / generated sqlite
+fixtures/ci_db.sqlite
+
+# ----------------------------
+# GitHub Pages output
+# ----------------------------
+# We *do* want to commit mp3s under docs/**/tracks for Pages
 !docs/**/tracks/*.mp3
