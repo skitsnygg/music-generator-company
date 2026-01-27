@@ -1,137 +1,142 @@
-name: scheduled_drops_ci
+name: scheduled_drops_prod
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *" # 06:00 America/Sao_Paulo approx; runner uses UTC
 
 jobs:
-  ci_scheduled_drops:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  scheduled_drops_prod:
+    runs-on: self-hosted
+    timeout-minutes: 120
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # CI must be self-contained and never depend on riffusion or repo-stored audio.
-      MGC_PROVIDER: "stub"
-      MGC_DETERMINISTIC: "1"
-      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
-
-      # Force any default outputs away from the repo so "git clean" checks don't fail.
-      MGC_ARTIFACTS_DIR: "/tmp/mgc_artifacts"
-      MGC_EVIDENCE_DIR: "/tmp/mgc_evidence"
-      MGC_TRACKS_DIR: "/tmp/mgc_tracks"
+      # Prod can be riffusion, but the workflow must not assume repo-stored tracks.
+      # Set this on the runner environment if you want riffusion:
+      #   export MGC_PROVIDER=riffusion
+      #   export MGC_RIFFUSION_URL=...
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
+      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install
+      - name: Prepare venv
         shell: bash
         run: |
           set -euxo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Compile check
+      - name: Compute vars
+        id: vars
         shell: bash
         run: |
           set -euxo pipefail
-          python -m py_compile src/mgc/main.py
-          python -m py_compile src/mgc/run_cli.py
-          python -m py_compile src/mgc/web_cli.py
+          echo "context=focus" >> "$GITHUB_OUTPUT"
 
-      - name: Run weekly (stub) + verify playlist track files + build web
+      - name: Run weekly drop
         shell: bash
         run: |
           set -euxo pipefail
+          . .venv/bin/activate
 
-          OUT="/tmp/mgc_ci_weekly"
-          WEB_OUT="/tmp/mgc_ci_web"
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
 
-          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
-          mkdir -p "$OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
 
           python -m mgc.main \
-            --db fixtures/ci_db.sqlite \
+            --db data/db.sqlite \
             --seed 1 \
-            --no-resume \
             run weekly \
-              --context focus \
-              --period-key 2020-W01 \
+              --context "$CONTEXT" \
+              --period-key "${DATE_UTC}" \
               --out-dir "$OUT" \
-              --deterministic \
               --web \
               --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
 
-          cat > /tmp/check_playlist_tracks.py <<'PY'
+      - name: Assert playlist track files exist (inside OUT)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
+
+          cat > /tmp/check_playlist_tracks_prod.py <<'PY'
 import json
 import os
 import sys
 
-PLAYLIST = "/tmp/mgc_ci_weekly/drop_bundle/playlist.json"
+playlist = os.environ["PLAYLIST_PATH"]
+out_dir = os.environ["OUT"]
 
-with open(PLAYLIST, "r", encoding="utf-8") as f:
+with open(playlist, "r", encoding="utf-8") as f:
     obj = json.load(f)
 
-base = os.path.dirname(PLAYLIST)
 tracks = obj.get("tracks") or []
+missing = []
 
-def get_path(t):
+def extract_path(t: dict) -> str:
     for k in ("path", "file", "audio_path", "audio", "src"):
         v = t.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
 
-missing = []
 for t in tracks:
     if not isinstance(t, dict):
         continue
-    path = get_path(t)
-    if not path:
+    rel = extract_path(t)
+    if not rel:
         continue
-    resolved = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
-    if not os.path.exists(resolved):
-        missing.append({"track_id": t.get("id"), "path": path, "resolved": resolved})
+
+    resolved = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(playlist), rel))
+    resolved_abs = os.path.abspath(resolved)
+    out_abs = os.path.abspath(out_dir)
+
+    if not resolved_abs.startswith(out_abs + os.sep) and resolved_abs != out_abs:
+        missing.append(
+            {
+                "track_id": t.get("id"),
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "path_outside_out_dir",
+            }
+        )
+        continue
+
+    if not os.path.exists(resolved_abs):
+        missing.append(
+            {
+                "track_id": t.get("id"),
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "missing_file",
+            }
+        )
 
 if missing:
-    print("ERROR: playlist references missing track files:")
+    print("ERROR: playlist track paths invalid/missing:")
     for m in missing[:200]:
         print(m)
     sys.exit(2)
 
-print("OK: all playlist track files exist")
+print("OK: playlist track files exist (and are inside OUT)")
 PY
 
-          python /tmp/check_playlist_tracks.py
-
-          rm -rf "$WEB_OUT"
-          python -m mgc.main web build \
-            --playlist "$OUT/drop_bundle/playlist.json" \
-            --out-dir "$WEB_OUT" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json
-
-          python -m mgc.main web validate --out-dir "$WEB_OUT"
-
-      - name: Upload CI artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mgc_ci_weekly
-          path: |
-            /tmp/mgc_ci_weekly
-            /tmp/mgc_ci_web
-          if-no-files-found: error
+          OUT="$OUT" PLAYLIST_PATH="$PLAYLIST_PATH" python /tmp/check_playlist_tracks_prod.py
