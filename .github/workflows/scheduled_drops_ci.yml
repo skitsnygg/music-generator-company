@@ -76,8 +76,7 @@ jobs:
               --context focus \
               --out-dir "$OUT" \
               --deterministic \
-              --with-web \
-              --submission
+              --with-web
 
           test -s "$OUT/drop_bundle/playlist.json"
 
