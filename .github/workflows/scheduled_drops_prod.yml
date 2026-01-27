@@ -13,9 +13,11 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
+
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
+      # Keep any accidental outputs away from the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
       MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
@@ -81,9 +83,65 @@ jobs:
 
           test -s "$PLAYLIST_PATH"
 
-          OUT="$OUT" PLAYLIST_PATH="$PLAYLIST_PATH" python -c "import os,json,sys; p=os.environ['PLAYLIST_PATH']; out=os.path.abspath(os.environ['OUT']); obj=json.load(open(p,'r',encoding='utf-8')); miss=[]; tracks=obj.get('tracks') or []; keys=('path','file','audio_path','audio','src'); \
-for t in tracks: \
-  d=t if isinstance(t,dict) else {}; rel=''; \
-  [rel:=d.get(k).strip() for k in keys if isinstance(d.get(k),str) and d.get(k).strip() and not rel]; \
-  (lambda rel=rel,d=d: (None if not rel else (lambda rabs: (miss.append({'track_id':d.get('id'),'path':rel,'resolved':rabs,'reason':'path_outside_out_dir'}) if not (rabs==out or rabs.startswith(out+os.sep)) else (miss.append({'track_id':d.get('id'),'path':rel,'resolved':rabs,'reason':'missing_file'}) if not os.path.exists(rabs) else None)))(os.path.abspath(rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(p),rel))))))(); \
-print('OK: playlist track files exist (and are inside OUT)') if not miss else (print('ERROR: invalid/missing track files:', *miss[:50], sep='\\n') or sys.exit(2))"
+          python - "$PLAYLIST_PATH" "$OUT" <<'PY'
+import json
+import os
+import sys
+
+playlist = sys.argv[1]
+out_dir = os.path.abspath(sys.argv[2])
+
+with open(playlist, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+
+tracks = obj.get("tracks") or []
+missing = []
+
+def extract_path(t: dict) -> str:
+    if not isinstance(t, dict):
+        return ""
+    for k in ("path", "file", "audio_path", "audio", "src"):
+        v = t.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+playlist_dir = os.path.dirname(playlist)
+
+for t in tracks:
+    rel = extract_path(t)
+    if not rel:
+        continue
+
+    resolved = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(playlist_dir, rel))
+    resolved_abs = os.path.abspath(resolved)
+
+    if not (resolved_abs == out_dir or resolved_abs.startswith(out_dir + os.sep)):
+        missing.append(
+            {
+                "track_id": t.get("id") if isinstance(t, dict) else None,
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "path_outside_out_dir",
+            }
+        )
+        continue
+
+    if not os.path.exists(resolved_abs):
+        missing.append(
+            {
+                "track_id": t.get("id") if isinstance(t, dict) else None,
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "missing_file",
+            }
+        )
+
+if missing:
+    print("ERROR: invalid/missing track files:")
+    for m in missing[:200]:
+        print(m)
+    sys.exit(2)
+
+print("OK: playlist track files exist (and are inside OUT)")
+PY
