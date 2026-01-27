@@ -62,7 +62,7 @@ src/mgc/run_cli00.py
 # Local / generated sqlite
 fixtures/ci_db.sqlite
 
-# ----------------------------
+# -----------------------   -----
 # GitHub Pages output
 # ----------------------------
 # We *do* want to commit mp3s under docs/**/tracks for Pages

@@ -351,55 +351,42 @@ def _pick_preferred_audio_source(p: Path) -> Path:
     return p
 
 
-def _copy_track_for_bundle(src: Path, dst: Path) -> None:
+def _copy_track_for_bundle(src: str, dst: str) -> None:
     """
-    Copy audio into bundle, but tolerate callers passing an extensionless repo artifact path
-    like data/tracks/<uuid>. If src doesn't exist, try common audio extensions and stem.*.
-    Deterministic: fixed extension order, then sorted glob order.
+    Copy an audio file into a bundle. Be tolerant of extensionless src paths,
+    because some providers/store layers may record audio paths without suffix.
     """
-    src_in = Path(str(src)).expanduser()
-    cwd = Path.cwd()
-    src_abs = (src_in if src_in.is_absolute() else (cwd / src_in)).resolve()
+    import os, shutil
 
-    def _resolve_audio(p: Path) -> Optional[Path]:
-        if p.is_file():
+    def _resolve(p: str) -> str:
+        # Already exists as-is
+        if os.path.isfile(p):
             return p
 
-        base = p
-        cands: List[Path] = []
+        # If p has no extension, try common audio extensions
+        root, ext = os.path.splitext(p)
+        if ext == "":
+            for suf in (".mp3", ".wav", ".flac", ".m4a", ".ogg"):
+                cand = p + suf
+                if os.path.isfile(cand):
+                    return cand
 
-        # If no suffix, try common audio extensions first (deterministic order)
-        if base.suffix == "":
-            for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
-                cands.append(base.with_suffix(ext))
-            # Then try stem.* matches (sorted for determinism)
-            try:
-                if base.parent.is_dir():
-                    cands.extend(sorted(base.parent.glob(base.name + ".*"), key=lambda x: x.name))
-            except Exception:
-                pass
-        else:
-            # If suffix exists but file missing, try stem.* (sorted)
-            try:
-                if base.parent.is_dir():
-                    cands.extend(sorted(base.parent.glob(base.stem + ".*"), key=lambda x: x.name))
-            except Exception:
-                pass
+        # If p had an extension but missing, try the sibling without extension + common ones
+        for suf in (".mp3", ".wav", ".flac", ".m4a", ".ogg"):
+            cand = root + suf
+            if os.path.isfile(cand):
+                return cand
 
-        for cand in cands:
-            try:
-                if cand.is_file():
-                    return cand.resolve()
-            except Exception:
-                continue
-        return None
+        return p  # fall back; caller will error with good message
 
-    chosen = _resolve_audio(src_abs)
-    if not chosen or not chosen.is_file():
+    src_abs = os.path.abspath(src)
+    src_abs = _resolve(src_abs)
+
+    if not os.path.isfile(src_abs):
         raise FileNotFoundError(f"[bundle] missing source audio: src={src} resolved={src_abs}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(chosen.read_bytes())
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src_abs, dst)
 
 def _require_nonempty_file(p: Path) -> None:
     try:
@@ -1880,129 +1867,90 @@ def db_drop_mark_published(
 
 
 def db_insert_marketing_post(
-    con: sqlite3.Connection,
+    con: "sqlite3.Connection",
     *,
     post_id: str,
     ts: str,
-    track_id: Optional[str] = None,
-    platform: Optional[str] = None,
-    kind: Optional[str] = None,
-    content: Optional[str] = None,
+    platform: str,
+    status: str,
+    content: Any,
     meta: Optional[Dict[str, Any]] = None,
-    status: Optional[str] = None,
-    **kw: Any,
-) -> None:
-    cols = db_table_columns(con, "marketing_posts")
-    if not cols:
-        raise sqlite3.OperationalError("table marketing_posts does not exist")
+    track_id: Optional[str] = None,
+    **_ignored: Any,
+) -> bool:
+    """
+    Insert or update a marketing post row (idempotent).
 
-    strict = str(os.environ.get("MGC_STRICT_TRACK_PATHS") or "").strip().lower() in ("1", "true", "yes", "on")
+    Schema:
+      marketing_posts(id, created_at, track_id, platform, payload_json, status)
+    """
+    import json
+    import sqlite3
 
-    # Normalize common alias kw names from older call sites
-    if kind is None:
-        kind = (
-            kw.get("kind")
-            or kw.get("type")
-            or kw.get("post_kind")
-            or kw.get("post_type")
-            or "post"
-        )
-    if platform is None:
-        platform = (
-            kw.get("platform")
-            or kw.get("channel")
-            or kw.get("network")
-            or "local"
-        )
-    if content is None:
-        content = (
-            kw.get("content")
-            or kw.get("text")
-            or kw.get("body")
-            or kw.get("caption")
-            or ""
-        )
     if meta is None:
-        meta = (
-            kw.get("meta")
-            or kw.get("metadata")
-            or kw.get("meta_json")
-            or {}
+        meta = {}
+
+    # Derive track_id if missing
+    if not track_id:
+        if isinstance(meta, dict):
+            track_id = meta.get("track_id") or meta.get("trackId")
+        if not track_id and isinstance(content, dict):
+            track_id = content.get("track_id") or content.get("trackId")
+
+    if not track_id:
+        print(
+            "[db_insert_marketing_post] missing referenced track; skipping insert: "
+            f"post_id={post_id}"
         )
+        return False
 
-    # Column mapping
-    ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
-    id_col = _pick_first_existing(cols, ["id", "post_id"])
-    track_col = _pick_first_existing(cols, ["track_id"])
-    platform_col = _pick_first_existing(cols, ["platform"])
-    kind_col = _pick_first_existing(cols, ["kind", "type"])
-    content_col = _pick_first_existing(cols, ["content", "text", "body"])
-    meta_col = _pick_first_existing(cols, ["meta_json", "metadata_json", "meta", "metadata"])
-    status_col = _pick_first_existing(cols, ["status", "state", "post_status"])
-
-    data: Dict[str, Any] = {}
-
-    if id_col:
-        data[id_col] = post_id
-    if ts_col:
-        data[ts_col] = ts
-    if platform_col:
-        data[platform_col] = str(platform)
-    if kind_col:
-        data[kind_col] = str(kind)
-    if content_col:
-        data[content_col] = str(content)
-    if meta_col:
-        data[meta_col] = stable_json_dumps(meta if isinstance(meta, dict) else {})
-    if status_col and status is not None:
-        data[status_col] = status
-
-    # FK-safe track_id handling (skip if missing and not strict)
-    if track_col and track_id:
-        try:
-            tcols = db_table_columns(con, "tracks") or []
-            t_id_col = _pick_first_existing(tcols, ["id", "track_id"])
-            if t_id_col:
-                row = con.execute(
-                    f"SELECT 1 FROM tracks WHERE {t_id_col} = ? LIMIT 1",
-                    (track_id,),
-                ).fetchone()
-                if not row:
-                    if strict:
-                        raise sqlite3.IntegrityError(
-                            f"Refusing to insert marketing_post with missing referenced track: track_id={track_id}"
-                        )
-                    try:
-                        print(
-                            "[db_insert_marketing_post] missing referenced track; skipping insert: "
-                            f"post_id={post_id} track_id={track_id}",
-                            file=sys.stderr,
-                        )
-                    except Exception:
-                        pass
-                    return
-        except sqlite3.IntegrityError:
-            raise
-        except Exception:
-            pass
-
-        data[track_col] = track_id
+    # Build payload_json ONCE, outside any try
+    payload_obj = {"content": content, "meta": meta}
+    try:
+        payload_json = json.dumps(
+            payload_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    except Exception:
+        payload_json = json.dumps(
+            {"content_repr": repr(content), "meta": meta},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
 
     try:
-        _insert_row(con, "marketing_posts", data)
+        con.execute(
+            """
+            INSERT INTO marketing_posts (id, created_at, track_id, platform, payload_json, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                created_at=excluded.created_at,
+                track_id=excluded.track_id,
+                platform=excluded.platform,
+                payload_json=excluded.payload_json,
+                status=excluded.status
+            """,
+            (post_id, ts, track_id, platform, payload_json, status),
+        )
+        return True
+
     except sqlite3.IntegrityError as e:
-        msg = str(e).lower()
-        if (not strict) and ("foreign key" in msg or "constraint failed" in msg):
-            try:
-                print(
-                    "[db_insert_marketing_post] foreign key constraint; skipping insert: "
-                    f"post_id={post_id} track_id={track_id} err={e}",
-                    file=sys.stderr,
-                )
-            except Exception:
-                pass
-            return
-        raise
+        # FK / NOT NULL issues only (duplicate PK no longer errors)
+        print(
+            "[db_insert_marketing_post] integrity error; skipping insert: "
+            f"post_id={post_id} track_id={track_id} err={e}"
+        )
+        return False
+
+    except Exception as e:
+        print(
+            "[db_insert_marketing_post] insert failed; skipping insert: "
+            f"post_id={post_id} track_id={track_id} err={e}"
+        )
+        return False
 
 
 def db_marketing_posts_pending(con: sqlite3.Connection, *, limit: int = 50) -> List[sqlite3.Row]:
