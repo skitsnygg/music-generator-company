@@ -63,13 +63,19 @@ jobs:
 
           OUT="/tmp/mgc_ci_autonomous"
           WEB_OUT="/tmp/mgc_ci_web"
+          DB_SRC="fixtures/ci_db.sqlite"
+          DB_TMP="/tmp/mgc_ci_db.sqlite"
 
           rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
           rm -rf data/evidence tracks || true
           mkdir -p "$OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
 
+          # Critical: never let CI mutate the repo fixture DB
+          cp -f "$DB_SRC" "$DB_TMP"
+          ls -la "$DB_TMP"
+
           python -m mgc.main \
-            --db fixtures/ci_db.sqlite \
+            --db "$DB_TMP" \
             --seed 1 \
             --no-resume \
             run autonomous \
@@ -91,6 +97,8 @@ jobs:
           python -m mgc.main web validate --out-dir "$WEB_OUT"
 
           rm -rf data/evidence tracks || true
+
+          # Repo must remain clean
           test -z "$(git status --porcelain)"
 
       - name: Upload artifacts
