@@ -45,6 +45,68 @@ jobs:
           ls -la data
           ls -la fixtures | head -n 50
 
+      - name: Ensure stub source track files exist (from DB)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import os, sqlite3, wave, struct
+          db_path = "data/db.sqlite"
+          con = sqlite3.connect(db_path)
+          cur = con.cursor()
+
+          # Collect any file paths that MGC might expect to exist.
+          paths = set()
+          for col in ("full_path", "preview_path"):
+            try:
+              rows = cur.execute(f"SELECT {col} FROM tracks").fetchall()
+            except Exception:
+              rows = []
+            for (p,) in rows:
+              if not p:
+                continue
+              paths.add(str(p))
+
+          con.close()
+
+          def write_silent_wav(path: str, seconds: float = 1.0, sr: int = 44100) -> None:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            nframes = int(sr * seconds)
+            with wave.open(path, "wb") as wf:
+              wf.setnchannels(1)
+              wf.setsampwidth(2)  # 16-bit
+              wf.setframerate(sr)
+              # Write silence
+              chunk = struct.pack("<h", 0) * 1024
+              remaining = nframes
+              while remaining > 0:
+                take = min(remaining, 1024)
+                wf.writeframes(chunk[: take * 2])
+                remaining -= take
+
+          created = []
+          for p in sorted(paths):
+            # Only handle relative paths inside the repo workspace.
+            # If a path is absolute, we skip it for safety in GH-hosted runners.
+            if os.path.isabs(p):
+              continue
+            if os.path.exists(p):
+              continue
+            ext = os.path.splitext(p)[1].lower()
+            if ext == ".wav":
+              write_silent_wav(p)
+            else:
+              os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+              with open(p, "wb") as f:
+                f.write(b"")
+            created.append(p)
+
+          print(f"seeded_missing_track_files={len(created)}")
+          for p in created[:50]:
+            print("  created:", p)
+          PY
+
       - name: Prepare evidence/artifacts dirs
         shell: bash
         run: |
@@ -61,7 +123,6 @@ jobs:
         run: |
           set -euxo pipefail
           python -m mgc.main run drop --context focus --seed 1 --limit 50 > artifacts/runs/drop.json
-      
 
       - name: Manifest
         shell: bash
