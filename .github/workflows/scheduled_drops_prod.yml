@@ -2,7 +2,6 @@ name: scheduled_drops_prod
 
 on:
   schedule:
-    # Adjust as desired; this is daily at 03:15 UTC.
     - cron: "15 3 * * *"
   workflow_dispatch:
     inputs:
@@ -15,35 +14,29 @@ on:
         required: false
         default: "daily"
       period_key:
-        description: "Weekly period key (e.g. 2026-W04). Only used when schedule_kind=weekly"
+        description: "Weekly period key (e.g. 2026-W04). Used when schedule_kind=weekly"
         required: false
         default: ""
       provider:
-        description: "Provider to use in prod schedule (riffusion recommended)"
+        description: "Provider for prod scheduled runs"
         required: false
         default: "riffusion"
 
 jobs:
   prod_scheduled_drops:
-    # Your self-hosted runner (as you described previously).
     runs-on: [self-hosted, linux]
     timeout-minutes: 90
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
-
-      # Default to riffusion for prod scheduled drops, but keep it overridable.
       MGC_PROVIDER: ${{ inputs.provider || 'riffusion' }}
 
-      # Riffusion connection details must come from secrets on the runner / GH.
-      # If you store these elsewhere (runner env), that's fine too.
       MGC_RIFFUSION_URL: ${{ secrets.MGC_RIFFUSION_URL }}
       MGC_RIFFUSION_CONNECT_TIMEOUT: ${{ secrets.MGC_RIFFUSION_CONNECT_TIMEOUT }}
       MGC_RIFFUSION_READ_TIMEOUT: ${{ secrets.MGC_RIFFUSION_READ_TIMEOUT }}
       MGC_RIFFUSION_RETRIES: ${{ secrets.MGC_RIFFUSION_RETRIES }}
 
-      # If you rely on a fixed directory layout on the prod runner, keep it stable:
       MGC_PROD_ROOT: "/var/lib/mgc"
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
@@ -51,7 +44,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python (runner-local)
+      - name: Set up Python venv + install
         shell: bash
         run: |
           set -euxo pipefail
@@ -66,12 +59,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           CONTEXT="${{ inputs.context }}"
-          if [ -z "${CONTEXT}" ]; then CONTEXT="focus"; fi
+          [ -n "$CONTEXT" ] || CONTEXT="focus"
 
           KIND="${{ inputs.schedule_kind }}"
-          if [ -z "${KIND}" ]; then KIND="daily"; fi
+          [ -n "$KIND" ] || KIND="daily"
 
           PERIOD_KEY="${{ inputs.period_key }}"
 
@@ -79,7 +71,7 @@ jobs:
           echo "kind=$KIND" >> "$GITHUB_OUTPUT"
           echo "period_key=$PERIOD_KEY" >> "$GITHUB_OUTPUT"
 
-      - name: Run scheduled drop (provider-aware, no repo-audio assumptions)
+      - name: Run scheduled drop
         shell: bash
         run: |
           set -euxo pipefail
@@ -94,10 +86,8 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
-          # Pick command based on daily vs weekly.
           if [ "$KIND" = "weekly" ]; then
             if [ -z "$PERIOD_KEY" ]; then
-              # ISO week key like 2026-W04
               PERIOD_KEY="$(date -u +%G-W%V)"
             fi
             python -m mgc.main \
@@ -120,47 +110,7 @@ jobs:
 
           test -s "$OUT/drop_bundle/playlist.json"
 
-          # Assert: playlist references files that exist in THIS out-dir tree.
-          python - <<'PY'
-import json, os, sys
-
-playlist = os.environ.get("PLAYLIST", "")
-if not playlist:
-    playlist = "/var/lib/mgc/releases/"  # placeholder to force failure if not set
-PY
-          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
-          python - <<'PY'
-import json, os, sys
-
-p = os.environ["PLAYLIST_PATH"]
-with open(p, "r", encoding="utf-8") as f:
-    obj = json.load(f)
-
-base = os.path.dirname(p)
-
-missing = []
-tracks = obj.get("tracks") or []
-for t in tracks:
-    path = t.get("path") or t.get("file") or t.get("audio_path") or ""
-    if not path:
-        continue
-    cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
-    if not os.path.exists(cand):
-        missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
-
-if missing:
-    print("ERROR: playlist references missing track files.")
-    print("This usually means a web/playlist bundling path bug (or provider output not copied into drop_bundle).")
-    for m in missing[:50]:
-        print(m)
-    sys.exit(2)
-
-print("OK: all playlist track files exist for bundling")
-PY
-        env:
-          PLAYLIST_PATH: ${{ env.MGC_PROD_RELEASES }}/${{ github.run_id }}/_unused
-        # NOTE: above env is overridden below; GitHub requires env block exists for some runners
-      - name: Assert playlist track files exist (real)
+      - name: Assert playlist track files exist
         shell: bash
         run: |
           set -euxo pipefail
@@ -173,30 +123,45 @@ PY
 
           python - <<'PY'
 import json, os, sys
+
 p = os.environ["PLAYLIST_PATH"]
 with open(p, "r", encoding="utf-8") as f:
     obj = json.load(f)
+
 base = os.path.dirname(p)
-missing = []
 tracks = obj.get("tracks") or []
+missing = []
+
+def get_path(t: dict) -> str:
+    for k in ("path", "file", "audio_path", "audio", "src"):
+        v = t.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
 for t in tracks:
-    path = t.get("path") or t.get("file") or t.get("audio_path") or ""
+    if not isinstance(t, dict):
+        continue
+    path = get_path(t)
     if not path:
         continue
     cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
     if not os.path.exists(cand):
         missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
+
 if missing:
     print("ERROR: playlist references missing track files:")
-    for m in missing[:50]:
+    for m in missing[:200]:
         print(m)
     sys.exit(2)
+
 print("OK: all playlist track files exist")
 PY
         env:
-          PLAYLIST_PATH: ${{ steps.vars.outputs.context }}
+          PLAYLIST_PATH: ${{ github.workspace }}/_unused
+        # NOTE: overridden below by runner env injection; GitHub requires env map exists for some runners
 
-      - name: Build + validate web from generated output
+      - name: Build + validate web
         shell: bash
         run: |
           set -euxo pipefail
@@ -219,17 +184,6 @@ PY
 
           python -m mgc.main web validate --out-dir "$WEB_OUT"
 
-      - name: Provider-aware post steps (skip determinism gates for riffusion)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          PROVIDER="${MGC_PROVIDER:-}"
-          if [ "$PROVIDER" = "riffusion" ]; then
-            echo "Provider is riffusion: skipping deterministic/fixture-based checks that assume repo audio."
-            exit 0
-          fi
-          echo "Provider is $PROVIDER: (optional) place any deterministic/fixture checks here."
-
       - name: Summarize output paths
         shell: bash
         run: |
@@ -240,4 +194,4 @@ PY
           echo "OUT=$OUT"
           echo "Playlist=$OUT/drop_bundle/playlist.json"
           echo "Web=$OUT/web/index.html"
-          find "$OUT" -maxdepth 3 -type f | sort | sed -n '1,200p'
+          find "$OUT" -maxdepth 4 -type f | sort | sed -n '1,200p'
