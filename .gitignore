@@ -1,69 +1,94 @@
-# ----------------------------
-# Python / virtualenv / caches
-# ----------------------------
-.venv/
-venv/
+############################
+# OS / Editor noise
+############################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+############################
+# Python
+############################
 __pycache__/
 *.py[cod]
-*.pyo
 *.pyd
+*.so
 *.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
 .pytest_cache/
 .mypy_cache/
-.dist/
-build/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+.tox/
+.nox/
+.venv/
+venv/
+ENV/
+env/
+.python-version
 
-# ----------------------------
-# OS / IDE
-# ----------------------------
-.DS_Store
-.idea/
-.vscode/
-.env
+############################
+# Virtualenv variants (your repo)
+############################
+.venv-riffusion/
 
-# ----------------------------
-# Logs
-# ----------------------------
+############################
+# Logs / temp
+############################
 *.log
-logs/
-logs/*.log
-
-# ----------------------------
-# Runtime / local data (default: ignore)
-# ----------------------------
-data/
-*.db
-*.sqlite
-*.sqlite3
-
-# Keep playlists directory + manifest tracked (if you use it)
-!data/playlists/
-!data/playlists/_manifest.playlists.json
-
-# If you want to keep generated playlist jsons untracked:
-data/playlists/*.json
-
-# ----------------------------
-# Project artifacts
-# ----------------------------
-/artifacts/
-
-# Repo-root generated audio cache (this is what is breaking CI)
-# IMPORTANT: this is anchored to repo root, not docs/**/tracks
-/tracks/
-
-# ----------------------------
-# Local backups / scratch
-# ----------------------------
+*.tmp
+tmp/
+temp/
 *.bak
-*.bak_*
-src/mgc/run_cli00.py
 
-# Local / generated sqlite
-fixtures/ci_db.sqlite
+############################
+# MGC generated data (local)
+############################
+/data/tracks/
+/data/submissions/
+/data/receipts/
+/data/*.sqlite
+/data/*.sqlite-journal
+/data/*.sqlite-wal
+/data/*.sqlite-shm
 
-# -----------------------   -----
-# GitHub Pages output
-# ----------------------------
-# We *do* want to commit mp3s under docs/**/tracks for Pages
-!docs/**/tracks/*.mp3
+# keep placeholder dirs if you use them
+!/data/tracks/.keep
+!/data/submissions/.keep
+!/data/receipts/.keep
+
+############################
+# MGC artifacts / outputs
+############################
+/artifacts/
+/releases/
+/out/
+/output/
+
+############################
+# Web output / release bundles
+############################
+docs/latest/
+docs/releases/
+
+# keep placeholder if you use it
+!/docs/latest/.keep
+
+############################
+# Allow committed sample audio (if any)
+############################
+!**/*.mp3

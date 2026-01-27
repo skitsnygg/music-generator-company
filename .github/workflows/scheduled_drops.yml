@@ -1,21 +1,50 @@
-name: Scheduled Drops
+name: Scheduled Drops (Prod)
 
 on:
   schedule:
-    # Daily at 09:00 UTC (adjust as you like)
-    - cron: "0 9 * * *"
+    # 09:00 America/Sao_Paulo == 12:00 UTC (GitHub cron is UTC)
+    - cron: "0 12 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: scheduled-drops-prod
+  cancel-in-progress: false
 
 jobs:
   drop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, mgc-prod]
+
     env:
-      MGC_DB: data/db.sqlite
-      MGC_PROVIDER: stub
+      # Persistent prod DB
+      MGC_DB: /var/lib/mgc/db.sqlite
+
+      # Keep these for later if/when you switch to filesystem provider
+      MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
+
+      # Ensure scheduled runs use real time (not deterministic CI time)
+      MGC_DETERMINISTIC: ""
+      MGC_FIXED_TIME: ""
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euxo pipefail
+          whoami
+          id
+          uname -a || true
+          df -h || true
+          timedatectl || true
+
+          echo "MGC_DB=$MGC_DB"
+          ls -la "$(dirname "$MGC_DB")" || true
+          test -f "$MGC_DB"
+
+          echo "MGC_FS_PROVIDER_DIR=$MGC_FS_PROVIDER_DIR"
+          ls -la "$MGC_FS_PROVIDER_DIR" || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,113 +58,139 @@ jobs:
           set -euxo pipefail
           python -m pip install -U pip
           python -m pip install -e .
+          python -c "import mgc; print('mgc:', mgc.__file__)"
 
-      - name: Force non-deterministic mode for scheduled drops
-        shell: bash
-        run: |
-          echo "MGC_DETERMINISTIC=" >> $GITHUB_ENV
-          echo "MGC_FIXED_TIME=" >> $GITHUB_ENV
-
-      - name: Prepare DB for scheduled run
+      - name: DB migrate
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p data
-          cp -f fixtures/ci_db.sqlite data/db.sqlite
-          ls -la data
-          ls -la fixtures | head -n 50
+          python -m mgc.main --db "$MGC_DB" db migrate
+          python -m mgc.main --db "$MGC_DB" db status --json
 
-      - name: Ensure stub source track files exist (from DB)
+      - name: Provider check (non-blocking)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          python -m mgc.main --db "$MGC_DB" providers check --json || true
+
+      - name: Materialize missing stub source WAVs referenced by prod DB (safe)
         shell: bash
         run: |
           set -euxo pipefail
-
           python - <<'PY'
-          import os, sqlite3, wave, struct
-          db_path = "data/db.sqlite"
+          import os, sqlite3, wave, struct, math
+
+          db_path = os.environ.get("MGC_DB", "/var/lib/mgc/db.sqlite")
           con = sqlite3.connect(db_path)
-          cur = con.cursor()
+          con.row_factory = sqlite3.Row
 
-          # Collect any file paths that MGC might expect to exist.
-          paths = set()
-          for col in ("full_path", "preview_path"):
-            try:
-              rows = cur.execute(f"SELECT {col} FROM tracks").fetchall()
-            except Exception:
-              rows = []
-            for (p,) in rows:
-              if not p:
-                continue
-              paths.add(str(p))
+          rows = con.execute("SELECT DISTINCT full_path FROM tracks").fetchall()
+          paths = []
+          for r in rows:
+            p = (r["full_path"] or "").strip()
+            if p:
+              paths.append(p)
 
-          con.close()
-
-          def write_silent_wav(path: str, seconds: float = 1.0, sr: int = 44100) -> None:
+          def write_wav(path: str, seconds: float = 1.0, sr: int = 44100, hz: float = 440.0):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            nframes = int(sr * seconds)
+            n = max(1, int(sr * seconds))
+            amp = 0.15
             with wave.open(path, "wb") as wf:
               wf.setnchannels(1)
-              wf.setsampwidth(2)  # 16-bit
+              wf.setsampwidth(2)
               wf.setframerate(sr)
-              # Write silence
-              chunk = struct.pack("<h", 0) * 1024
-              remaining = nframes
-              while remaining > 0:
-                take = min(remaining, 1024)
-                wf.writeframes(chunk[: take * 2])
-                remaining -= take
+              frames = bytearray()
+              for i in range(n):
+                s = amp * math.sin(2.0 * math.pi * hz * (i / sr))
+                frames += struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767))
+              wf.writeframes(frames)
 
-          created = []
-          for p in sorted(paths):
-            # Only handle relative paths inside the repo workspace.
-            # If a path is absolute, we skip it for safety in GH-hosted runners.
-            if os.path.isabs(p):
-              continue
-            if os.path.exists(p):
-              continue
-            ext = os.path.splitext(p)[1].lower()
-            if ext == ".wav":
-              write_silent_wav(p)
-            else:
-              os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-              with open(p, "wb") as f:
-                f.write(b"")
-            created.append(p)
+          created = 0
+          skipped = 0
 
-          print(f"seeded_missing_track_files={len(created)}")
-          for p in created[:50]:
-            print("  created:", p)
+          # Only create files that are local paths (avoid weird values)
+          for p in paths:
+            if p.startswith(("data/", "artifacts/", "fixtures/", "./", "/var/lib/mgc/")) or (p.startswith("/") and not p.startswith("http")):
+              if not os.path.exists(p):
+                write_wav(p)
+                created += 1
+              else:
+                skipped += 1
+
+          print(f"[stub_wav] db={db_path} referenced={len(paths)} created={created} skipped_existing={skipped}")
           PY
 
-      - name: Prepare evidence/artifacts dirs
+      - name: Run autonomous drop (end-to-end)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p data/evidence artifacts/runs
-          echo "placeholder" > artifacts/runs/.keep
-          ls -la data/evidence || true
-          ls -la artifacts/runs
 
-      - name: Run drop (daily + publish)
-        shell: bash
-        env:
-          MGC_DB: data/db.sqlite
-        run: |
-          set -euxo pipefail
-          python -m mgc.main run drop --context focus --seed 1 --limit 50 > artifacts/runs/drop.json
+          OUT_DIR="/tmp/mgc_prod_autonomous"
+          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
 
-      - name: Manifest
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m mgc.main run manifest --repo-root . --out artifacts/runs/manifest.json --print-hash
+          rm -rf "$OUT_DIR" "$WEB_OUT_DIR"
+          mkdir -p "$OUT_DIR" "$WEB_OUT_DIR"
 
-      - name: Upload evidence bundle
+          # Force stub provider for now (until filesystem audio_pool is populated)
+          MGC_PROVIDER=stub python -m mgc.main --db "$MGC_DB" run autonomous \
+            --context focus \
+            --seed 1 \
+            --out-dir "$OUT_DIR" \
+            --with-web \
+            --web-out-dir "$WEB_OUT_DIR" \
+            --contract local \
+            --json | tee "$OUT_DIR/autonomous.json"
+
+          echo "Autonomous outputs:"
+          find "$OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
+          find "$WEB_OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
+
+      - name: Upload prod artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scheduled-drop-artifacts
+          name: scheduled-drop-artifacts-prod
           path: |
-            artifacts/runs/**
-            data/evidence/**
-            data/db.sqlite
+            /tmp/mgc_prod_autonomous/**
+            /tmp/mgc_prod_autonomous_web/**
+            data/submissions/**
           if-no-files-found: warn
+
+      - name: Promote release to /var/lib/mgc/releases
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUT_DIR="/tmp/mgc_prod_autonomous"
+          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
+          AUTON_JSON="$OUT_DIR/autonomous.json"
+
+          test -f "$AUTON_JSON"
+
+          # Parse drop_id from autonomous.json (no heredoc; avoids YAML indentation pitfalls)
+          DROP_ID="$(python -c 'import json; p="'"$AUTON_JSON"'"; obj=json.load(open(p,"r",encoding="utf-8")); print(obj["drop"]["ids"]["drop_id"])')"
+          echo "DROP_ID=$DROP_ID"
+
+          RELEASE_ROOT="/var/lib/mgc/releases"
+          RELEASE_DIR="$RELEASE_ROOT/$DROP_ID"
+
+          sudo mkdir -p "$RELEASE_DIR/web" "$RELEASE_DIR/submission" "$RELEASE_DIR/run"
+
+          # Copy web bundle
+          sudo rsync -a --delete "$WEB_OUT_DIR/" "$RELEASE_DIR/web/"
+
+          # Copy submission artifacts (zip + receipts)
+          sudo rsync -a "data/submissions/$DROP_ID/" "$RELEASE_DIR/submission/"
+
+          # Copy run evidence for convenience
+          sudo rsync -a "$OUT_DIR/" "$RELEASE_DIR/run/"
+
+          # Update latest symlink atomically
+          sudo ln -sfn "$RELEASE_DIR" "$RELEASE_ROOT/latest"
+
+          # Fix perms so nginx can read
+          sudo chmod -R a+rX "$RELEASE_DIR"
+
+          echo "Promoted release: $RELEASE_DIR"
+          echo "Latest -> $(readlink -f "$RELEASE_ROOT/latest")"
