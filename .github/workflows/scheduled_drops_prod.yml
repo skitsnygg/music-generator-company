@@ -18,6 +18,10 @@ jobs:
       # Persistent prod DB
       MGC_DB: /var/lib/mgc/db.sqlite
 
+      # Pin provider for scheduled runs so we never depend on repo-local data/tracks/*
+      # (Flip this later when you intentionally move prod to riffusion/filesystem provider.)
+      MGC_PROVIDER: stub
+
       # Keep these for later if/when you switch to filesystem provider
       MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
 
@@ -43,6 +47,7 @@ jobs:
           ls -la "$(dirname "$MGC_DB")" || true
           test -f "$MGC_DB"
 
+          echo "MGC_PROVIDER=$MGC_PROVIDER"
           echo "MGC_FS_PROVIDER_DIR=$MGC_FS_PROVIDER_DIR"
           ls -la "$MGC_FS_PROVIDER_DIR" || true
 
@@ -85,8 +90,8 @@ jobs:
           rm -rf "$OUT_DIR" "$WEB_OUT_DIR"
           mkdir -p "$OUT_DIR" "$WEB_OUT_DIR"
 
-          # Force stub provider for now (until filesystem audio_pool is populated)
-          MGC_PROVIDER=stub python -m mgc.main --db "$MGC_DB" run autonomous \
+          # Provider is pinned via env (MGC_PROVIDER=stub)
+          python -m mgc.main --db "$MGC_DB" run autonomous \
             --context focus \
             --seed 1 \
             --out-dir "$OUT_DIR" \
