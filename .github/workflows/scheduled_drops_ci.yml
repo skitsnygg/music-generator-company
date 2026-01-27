@@ -1,111 +1,102 @@
-name: scheduled_drops_ci
+name: scheduled_drops_prod
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
 
 jobs:
-  scheduled_drops_ci:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  scheduled_drops_prod:
+    runs-on: self-hosted
+    timeout-minutes: 120
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
+      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-      # CI must be self-contained and deterministic
-      MGC_PROVIDER: "stub"
-      MGC_DETERMINISTIC: "1"
-      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+      # Provider is set via repo vars (or runner env); can be "riffusion" or "stub" etc.
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
-      # Force outputs away from the repo checkout
-      MGC_ARTIFACTS_DIR: "/tmp/mgc_artifacts"
-      MGC_EVIDENCE_DIR: "/tmp/mgc_evidence"
-      MGC_TRACKS_DIR: "/tmp/mgc_tracks"
+      # Keep any accidental outputs away from the repo checkout
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clean repo working tree
+      - name: Prepare venv
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf data/evidence tracks || true
-          git clean -fdx
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install editable
-        shell: bash
-        run: |
-          set -euxo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Compile key modules
+      - name: Vars
+        id: vars
         shell: bash
         run: |
           set -euxo pipefail
-          python -m py_compile src/mgc/main.py
-          python -m py_compile src/mgc/run_cli.py
-          python -m py_compile src/mgc/web_cli.py
+          echo "context=focus" >> "$GITHUB_OUTPUT"
 
-      - name: Run autonomous (stub) + build web + validate
+      - name: Run weekly drop
         shell: bash
         run: |
           set -euxo pipefail
+          . .venv/bin/activate
 
-          OUT="/tmp/mgc_ci_autonomous"
-          WEB_OUT="/tmp/mgc_ci_web"
-          DB_SRC="fixtures/ci_db.sqlite"
-          DB_TMP="/tmp/mgc_ci_db.sqlite"
+          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
-          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
-          rm -rf data/evidence tracks || true
-          mkdir -p "$OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
 
-          # Critical: never let CI mutate the repo fixture DB
-          cp -f "$DB_SRC" "$DB_TMP"
-          ls -la "$DB_TMP"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
 
           python -m mgc.main \
-            --db "$DB_TMP" \
+            --db data/db.sqlite \
             --seed 1 \
-            --no-resume \
-            run autonomous \
-              --context focus \
+            run weekly \
+              --context "$CONTEXT" \
+              --period-key "${DATE_UTC}" \
               --out-dir "$OUT" \
-              --deterministic \
-              --with-web
+              --web \
+              --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
 
-          python -m mgc.main web build \
-            --playlist "$OUT/drop_bundle/playlist.json" \
-            --out-dir "$WEB_OUT" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json
+      - name: Assert playlist track files exist (inside OUT)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
 
-          python -m mgc.main web validate --out-dir "$WEB_OUT"
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
 
-          rm -rf data/evidence tracks || true
+          test -s "$PLAYLIST_PATH"
 
-          # Repo must remain clean
-          test -z "$(git status --porcelain)"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mgc_ci_autonomous
-          path: |
-            /tmp/mgc_ci_autonomous
-            /tmp/mgc_ci_web
-          if-no-files-found: error
+          OUT="$OUT" PLAYLIST_PATH="$PLAYLIST_PATH" python -c 'import json,os,sys; p=os.environ["PLAYLIST_PATH"]; out=os.path.abspath(os.environ["OUT"]); obj=json.load(open(p,"r",encoding="utf-8")); miss=[];
+t=obj.get("tracks") or [];
+def gp(x):
+  if not isinstance(x,dict): return "";
+  for k in ("path","file","audio_path","audio","src"):
+    v=x.get(k);
+    if isinstance(v,str) and v.strip(): return v.strip();
+  return "";
+for tr in t:
+  rel=gp(tr);
+  if not rel: continue;
+  r=rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(p),rel)); 
+  rabs=os.path.abspath(r);
+  if not (rabs==out or rabs.startswith(out+os.sep)): miss.append({"track_id": (tr.get("id") if isinstance(tr,dict) else None), "path": rel, "resolved": rabs, "reason": "path_outside_out_dir"});
+  elif not os.path.exists(rabs): miss.append({"track_id": (tr.get("id") if isinstance(tr,dict) else None), "path": rel, "resolved": rabs, "reason": "missing_file"});
+print("OK: playlist track files exist (and are inside OUT)") if not miss else (print("ERROR: invalid/missing track files:", *miss[:50], sep="\n") or sys.exit(2))'
