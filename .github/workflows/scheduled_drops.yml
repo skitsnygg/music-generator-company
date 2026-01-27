@@ -1,196 +1,145 @@
-name: Scheduled Drops (Prod)
+name: scheduled_drops_prod
 
 on:
-  schedule:
-    # 09:00 America/Sao_Paulo == 12:00 UTC (GitHub cron is UTC)
-    - cron: "0 12 * * *"
   workflow_dispatch:
-
-concurrency:
-  group: scheduled-drops-prod
-  cancel-in-progress: false
+  schedule:
+    - cron: "0 9 * * *"
 
 jobs:
-  drop:
-    runs-on: [self-hosted, mgc-prod]
+  scheduled_drops_prod:
+    runs-on: self-hosted
+    timeout-minutes: 120
 
     env:
-      # Persistent prod DB
-      MGC_DB: /var/lib/mgc/db.sqlite
+      PYTHONUNBUFFERED: "1"
+      MGC_NO_COLOR: "1"
 
-      # Keep these for later if/when you switch to filesystem provider
-      MGC_FS_PROVIDER_DIR: /var/lib/mgc/audio_pool
+      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
-      # Ensure scheduled runs use real time (not deterministic CI time)
-      MGC_DETERMINISTIC: ""
-      MGC_FIXED_TIME: ""
+      # Keep any accidental outputs away from the repo checkout
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Preflight
+      - name: Prepare venv
         shell: bash
         run: |
           set -euxo pipefail
-          whoami
-          id
-          uname -a || true
-          df -h || true
-          timedatectl || true
-
-          echo "MGC_DB=$MGC_DB"
-          ls -la "$(dirname "$MGC_DB")" || true
-          test -f "$MGC_DB"
-
-          echo "MGC_FS_PROVIDER_DIR=$MGC_FS_PROVIDER_DIR"
-          ls -la "$MGC_FS_PROVIDER_DIR" || true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install -U pip
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
           python -m pip install -e .
-          python -c "import mgc; print('mgc:', mgc.__file__)"
 
-      - name: DB migrate
+      - name: Compute vars
+        id: vars
         shell: bash
         run: |
           set -euxo pipefail
-          python -m mgc.main --db "$MGC_DB" db migrate
-          python -m mgc.main --db "$MGC_DB" db status --json
+          echo "context=focus" >> "$GITHUB_OUTPUT"
 
-      - name: Provider check (non-blocking)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
-          python -m mgc.main --db "$MGC_DB" providers check --json || true
-
-      - name: Materialize missing stub source WAVs referenced by prod DB (safe)
+      - name: Run weekly drop (bundle only)
+        id: run_drop
         shell: bash
         run: |
           set -euxo pipefail
-          python - <<'PY'
-          import os, sqlite3, wave, struct, math
+          . .venv/bin/activate
 
-          db_path = os.environ.get("MGC_DB", "/var/lib/mgc/db.sqlite")
-          con = sqlite3.connect(db_path)
-          con.row_factory = sqlite3.Row
+          rm -rf data/evidence tracks || true
 
-          rows = con.execute("SELECT DISTINCT full_path FROM tracks").fetchall()
-          paths = []
-          for r in rows:
-            p = (r["full_path"] or "").strip()
-            if p:
-              paths.append(p)
+          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
-          def write_wav(path: str, seconds: float = 1.0, sr: int = 44100, hz: float = 440.0):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            n = max(1, int(sr * seconds))
-            amp = 0.15
-            with wave.open(path, "wb") as wf:
-              wf.setnchannels(1)
-              wf.setsampwidth(2)
-              wf.setframerate(sr)
-              frames = bytearray()
-              for i in range(n):
-                s = amp * math.sin(2.0 * math.pi * hz * (i / sr))
-                frames += struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767))
-              wf.writeframes(frames)
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
 
-          created = 0
-          skipped = 0
+          # IMPORTANT: ensure the date directory exists
+          mkdir -p "${MGC_PROD_RELEASES}/${DATE_UTC}"
 
-          # Only create files that are local paths (avoid weird values)
-          for p in paths:
-            if p.startswith(("data/", "artifacts/", "fixtures/", "./", "/var/lib/mgc/")) or (p.startswith("/") and not p.startswith("http")):
-              if not os.path.exists(p):
-                write_wav(p)
-                created += 1
-              else:
-                skipped += 1
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
 
-          print(f"[stub_wav] db={db_path} referenced={len(paths)} created={created} skipped_existing={skipped}")
-          PY
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
 
-      - name: Run autonomous drop (end-to-end)
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          OUT_DIR="/tmp/mgc_prod_autonomous"
-          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
-
-          rm -rf "$OUT_DIR" "$WEB_OUT_DIR"
-          mkdir -p "$OUT_DIR" "$WEB_OUT_DIR"
-
-          # Force stub provider for now (until filesystem audio_pool is populated)
-          MGC_PROVIDER=stub python -m mgc.main --db "$MGC_DB" run autonomous \
-            --context focus \
+          python -m mgc.main \
+            --db /var/lib/mgc/db.sqlite \
             --seed 1 \
-            --out-dir "$OUT_DIR" \
-            --with-web \
-            --web-out-dir "$WEB_OUT_DIR" \
-            --contract local \
-            --json | tee "$OUT_DIR/autonomous.json"
+            run weekly \
+              --context "$CONTEXT" \
+              --period-key "${DATE_UTC}" \
+              --out-dir "$OUT" \
+              --deterministic \
+              --submission
 
-          echo "Autonomous outputs:"
-          find "$OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
-          find "$WEB_OUT_DIR" -maxdepth 3 -type f | sed -n '1,200p' || true
+          test -s "$OUT/drop_bundle/playlist.json"
 
-      - name: Upload prod artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scheduled-drop-artifacts-prod
-          path: |
-            /tmp/mgc_prod_autonomous/**
-            /tmp/mgc_prod_autonomous_web/**
-            data/submissions/**
-          if-no-files-found: warn
+          echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
+          echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
+          echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
 
-      - name: Promote release to /var/lib/mgc/releases
+      - name: Assert playlist track files exist (inside OUT)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          OUT="${{ steps.run_drop.outputs.out_dir }}"
+          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
+
+          test -s "$PLAYLIST_PATH"
+          python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
+
+      - name: Build web bundle into OUT/web
+        id: web_build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          OUT="${{ steps.run_drop.outputs.out_dir }}"
+          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
+
+          rm -rf "$OUT/web"
+          mkdir -p "$OUT/web"
+
+          python -m mgc.main web build \
+            --playlist "$PLAYLIST_PATH" \
+            --out-dir "$OUT/web" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json
+
+          python -m mgc.main web validate --out-dir "$OUT/web"
+
+          test "$(find "$OUT/web" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
+
+          echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
+
+      - name: Update releases/latest symlink to newest web bundle
         shell: bash
         run: |
           set -euxo pipefail
 
-          OUT_DIR="/tmp/mgc_prod_autonomous"
-          WEB_OUT_DIR="/tmp/mgc_prod_autonomous_web"
-          AUTON_JSON="$OUT_DIR/autonomous.json"
+          WEB_DIR="${{ steps.web_build.outputs.web_dir }}"
 
-          test -f "$AUTON_JSON"
+          # Point latest at the web bundle directory that contains index.html, tracks/, web_manifest.json
+          ln -sfn "$WEB_DIR" "${MGC_PROD_RELEASES}/latest"
 
-          # Parse drop_id from autonomous.json (no heredoc; avoids YAML indentation pitfalls)
-          DROP_ID="$(python -c 'import json; p="'"$AUTON_JSON"'"; obj=json.load(open(p,"r",encoding="utf-8")); print(obj["drop"]["ids"]["drop_id"])')"
-          echo "DROP_ID=$DROP_ID"
+          echo "latest now -> $(readlink -f "${MGC_PROD_RELEASES}/latest")"
+          ls -la "${MGC_PROD_RELEASES}/latest" | sed -n '1,120p'
+          ls -la "${MGC_PROD_RELEASES}/latest/tracks" | head
 
-          RELEASE_ROOT="/var/lib/mgc/releases"
-          RELEASE_DIR="$RELEASE_ROOT/$DROP_ID"
+          test -s "${MGC_PROD_RELEASES}/latest/web_manifest.json"
 
-          sudo mkdir -p "$RELEASE_DIR/web" "$RELEASE_DIR/submission" "$RELEASE_DIR/run"
-
-          # Copy web bundle
-          sudo rsync -a --delete "$WEB_OUT_DIR/" "$RELEASE_DIR/web/"
-
-          # Copy submission artifacts (zip + receipts)
-          sudo rsync -a "data/submissions/$DROP_ID/" "$RELEASE_DIR/submission/"
-
-          # Copy run evidence for convenience
-          sudo rsync -a "$OUT_DIR/" "$RELEASE_DIR/run/"
-
-          # Update latest symlink atomically
-          sudo ln -sfn "$RELEASE_DIR" "$RELEASE_ROOT/latest"
-
-          # Fix perms so nginx can read
-          sudo chmod -R a+rX "$RELEASE_DIR"
-
-          echo "Promoted release: $RELEASE_DIR"
-          echo "Latest -> $(readlink -f "$RELEASE_ROOT/latest")"
+      - name: Repo must remain clean
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf data/evidence tracks || true
+          test -z "$(git status --porcelain)"
