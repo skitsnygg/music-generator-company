@@ -1,142 +1,106 @@
-name: scheduled_drops_prod
+name: scheduled_drops_ci
 
 on:
+  push:
+    branches: ["main"]
+  pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "0 9 * * *" # 06:00 America/Sao_Paulo approx; runner uses UTC
 
 jobs:
-  scheduled_drops_prod:
-    runs-on: self-hosted
-    timeout-minutes: 120
+  scheduled_drops_ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # Prod can be riffusion, but the workflow must not assume repo-stored tracks.
-      # Set this on the runner environment if you want riffusion:
-      #   export MGC_PROVIDER=riffusion
-      #   export MGC_RIFFUSION_URL=...
-      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
-      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
+      # CI should be self-contained and deterministic.
+      MGC_PROVIDER: "stub"
+      MGC_DETERMINISTIC: "1"
+      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+
+      # Force outputs away from the repo checkout (prevents "?? tracks/" type failures).
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_tracks"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare venv
+      - name: Clean repo working tree
         shell: bash
         run: |
           set -euxo pipefail
-          python3 -m venv .venv
-          . .venv/bin/activate
+          rm -rf data/evidence tracks || true
+          git clean -fdx
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install editable
+        shell: bash
+        run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Compute vars
-        id: vars
+      - name: Compile key modules
         shell: bash
         run: |
           set -euxo pipefail
-          echo "context=focus" >> "$GITHUB_OUTPUT"
+          python -m py_compile src/mgc/main.py
+          python -m py_compile src/mgc/run_cli.py
+          python -m py_compile src/mgc/web_cli.py
 
-      - name: Run weekly drop
+      - name: Run weekly (stub) + build web + validate
         shell: bash
         run: |
           set -euxo pipefail
-          . .venv/bin/activate
 
-          DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          OUT="/tmp/mgc_ci_weekly"
+          WEB_OUT="/tmp/mgc_ci_web"
 
-          rm -rf "$OUT"
-          mkdir -p "$OUT"
+          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
+          rm -rf data/evidence tracks || true
+          mkdir -p "$OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
 
           python -m mgc.main \
-            --db data/db.sqlite \
+            --db fixtures/ci_db.sqlite \
             --seed 1 \
+            --no-resume \
             run weekly \
-              --context "$CONTEXT" \
-              --period-key "${DATE_UTC}" \
+              --context focus \
+              --period-key 2020-W01 \
               --out-dir "$OUT" \
+              --deterministic \
               --web \
               --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
 
-      - name: Assert playlist track files exist (inside OUT)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          . .venv/bin/activate
+          python -m mgc.main web build \
+            --playlist "$OUT/drop_bundle/playlist.json" \
+            --out-dir "$WEB_OUT" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json
 
-          DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
-          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
+          python -m mgc.main web validate --out-dir "$WEB_OUT"
 
-          cat > /tmp/check_playlist_tracks_prod.py <<'PY'
-import json
-import os
-import sys
+          # Sanity: repo must remain clean
+          rm -rf data/evidence tracks || true
+          test -z "$(git status --porcelain)"
 
-playlist = os.environ["PLAYLIST_PATH"]
-out_dir = os.environ["OUT"]
-
-with open(playlist, "r", encoding="utf-8") as f:
-    obj = json.load(f)
-
-tracks = obj.get("tracks") or []
-missing = []
-
-def extract_path(t: dict) -> str:
-    for k in ("path", "file", "audio_path", "audio", "src"):
-        v = t.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-for t in tracks:
-    if not isinstance(t, dict):
-        continue
-    rel = extract_path(t)
-    if not rel:
-        continue
-
-    resolved = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(playlist), rel))
-    resolved_abs = os.path.abspath(resolved)
-    out_abs = os.path.abspath(out_dir)
-
-    if not resolved_abs.startswith(out_abs + os.sep) and resolved_abs != out_abs:
-        missing.append(
-            {
-                "track_id": t.get("id"),
-                "path": rel,
-                "resolved": resolved_abs,
-                "reason": "path_outside_out_dir",
-            }
-        )
-        continue
-
-    if not os.path.exists(resolved_abs):
-        missing.append(
-            {
-                "track_id": t.get("id"),
-                "path": rel,
-                "resolved": resolved_abs,
-                "reason": "missing_file",
-            }
-        )
-
-if missing:
-    print("ERROR: playlist track paths invalid/missing:")
-    for m in missing[:200]:
-        print(m)
-    sys.exit(2)
-
-print("OK: playlist track files exist (and are inside OUT)")
-PY
-
-          OUT="$OUT" PLAYLIST_PATH="$PLAYLIST_PATH" python /tmp/check_playlist_tracks_prod.py
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgc_ci_weekly
+          path: |
+            /tmp/mgc_ci_weekly
+            /tmp/mgc_ci_web
+          if-no-files-found: error
