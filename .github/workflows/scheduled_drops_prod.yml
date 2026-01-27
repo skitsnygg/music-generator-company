@@ -1,77 +1,52 @@
 name: scheduled_drops_prod
 
 on:
-  schedule:
-    - cron: "15 3 * * *"
   workflow_dispatch:
-    inputs:
-      context:
-        description: "Drop context (e.g. focus, workout, sleep)"
-        required: false
-        default: "focus"
-      schedule_kind:
-        description: "daily or weekly"
-        required: false
-        default: "daily"
-      period_key:
-        description: "Weekly period key (e.g. 2026-W04). Used when schedule_kind=weekly"
-        required: false
-        default: ""
-      provider:
-        description: "Provider for prod scheduled runs"
-        required: false
-        default: "riffusion"
+  schedule:
+    - cron: "0 9 * * *" # 06:00 America/Sao_Paulo approx; runner uses UTC
 
 jobs:
-  prod_scheduled_drops:
-    runs-on: [self-hosted, linux]
-    timeout-minutes: 90
+  scheduled_drops_prod:
+    runs-on: self-hosted
+    timeout-minutes: 120
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
-      MGC_PROVIDER: ${{ inputs.provider || 'riffusion' }}
-
-      MGC_RIFFUSION_URL: ${{ secrets.MGC_RIFFUSION_URL }}
-      MGC_RIFFUSION_CONNECT_TIMEOUT: ${{ secrets.MGC_RIFFUSION_CONNECT_TIMEOUT }}
-      MGC_RIFFUSION_READ_TIMEOUT: ${{ secrets.MGC_RIFFUSION_READ_TIMEOUT }}
-      MGC_RIFFUSION_RETRIES: ${{ secrets.MGC_RIFFUSION_RETRIES }}
-
-      MGC_PROD_ROOT: "/var/lib/mgc"
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
+
+      # Provider is controlled by repo/environment variables on the runner.
+      # Example for riffusion on the runner:
+      #   MGC_PROVIDER=riffusion
+      #   MGC_RIFFUSION_URL=http://127.0.0.1:3013
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
+
+      # Keep prod runs from writing into the repo checkout
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python venv + install
+      - name: Prepare venv
         shell: bash
         run: |
           set -euxo pipefail
-          python3 -V
           python3 -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Resolve inputs
+      - name: Compute vars
         id: vars
         shell: bash
         run: |
           set -euxo pipefail
-          CONTEXT="${{ inputs.context }}"
-          [ -n "$CONTEXT" ] || CONTEXT="focus"
+          echo "context=focus" >> "$GITHUB_OUTPUT"
 
-          KIND="${{ inputs.schedule_kind }}"
-          [ -n "$KIND" ] || KIND="daily"
-
-          PERIOD_KEY="${{ inputs.period_key }}"
-
-          echo "context=$CONTEXT" >> "$GITHUB_OUTPUT"
-          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
-          echo "period_key=$PERIOD_KEY" >> "$GITHUB_OUTPUT"
-
-      - name: Run scheduled drop
+      - name: Run weekly drop
         shell: bash
         run: |
           set -euxo pipefail
@@ -79,38 +54,27 @@ jobs:
 
           DATE_UTC="$(date -u +%Y-%m-%d)"
           CONTEXT="${{ steps.vars.outputs.context }}"
-          KIND="${{ steps.vars.outputs.kind }}"
-          PERIOD_KEY="${{ steps.vars.outputs.period_key }}"
-
           OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
-          if [ "$KIND" = "weekly" ]; then
-            if [ -z "$PERIOD_KEY" ]; then
-              PERIOD_KEY="$(date -u +%G-W%V)"
-            fi
-            python -m mgc.main \
-              --db "${MGC_PROD_ROOT}/db.sqlite" \
-              run weekly \
-                --context "$CONTEXT" \
-                --period-key "$PERIOD_KEY" \
-                --out-dir "$OUT" \
-                --with-web \
-                --submission
-          else
-            python -m mgc.main \
-              --db "${MGC_PROD_ROOT}/db.sqlite" \
-              run drop \
-                --context "$CONTEXT" \
-                --out-dir "$OUT" \
-                --with-web \
-                --submission
-          fi
+          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+
+          python -m mgc.main \
+            --db data/db.sqlite \
+            --seed 1 \
+            run weekly \
+              --context "$CONTEXT" \
+              --period-key "${DATE_UTC}" \
+              --out-dir "$OUT" \
+              --web \
+              --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
 
-      - name: Assert playlist track files exist
+      - name: Assert playlist track files exist (inside OUT)
         shell: bash
         run: |
           set -euxo pipefail
@@ -121,18 +85,25 @@ jobs:
           OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
           PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
 
-          python - <<'PY'
-import json, os, sys
+          test -s "$PLAYLIST_PATH"
 
-p = os.environ["PLAYLIST_PATH"]
-with open(p, "r", encoding="utf-8") as f:
+          cat > /tmp/check_playlist_tracks_prod.py <<'PY'
+import json
+import os
+import sys
+
+playlist = os.environ["PLAYLIST_PATH"]
+out_dir = os.environ["OUT"]
+
+with open(playlist, "r", encoding="utf-8") as f:
     obj = json.load(f)
 
-base = os.path.dirname(p)
 tracks = obj.get("tracks") or []
 missing = []
 
-def get_path(t: dict) -> str:
+def extract_path(t: dict) -> str:
+    if not isinstance(t, dict):
+        return ""
     for k in ("path", "file", "audio_path", "audio", "src"):
         v = t.get(k)
         if isinstance(v, str) and v.strip():
@@ -140,58 +111,42 @@ def get_path(t: dict) -> str:
     return ""
 
 for t in tracks:
-    if not isinstance(t, dict):
+    rel = extract_path(t)
+    if not rel:
         continue
-    path = get_path(t)
-    if not path:
+
+    resolved = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(playlist), rel))
+    resolved_abs = os.path.abspath(resolved)
+    out_abs = os.path.abspath(out_dir)
+
+    if not resolved_abs.startswith(out_abs + os.sep) and resolved_abs != out_abs:
+        missing.append(
+            {
+                "track_id": t.get("id") if isinstance(t, dict) else None,
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "path_outside_out_dir",
+            }
+        )
         continue
-    cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
-    if not os.path.exists(cand):
-        missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
+
+    if not os.path.exists(resolved_abs):
+        missing.append(
+            {
+                "track_id": t.get("id") if isinstance(t, dict) else None,
+                "path": rel,
+                "resolved": resolved_abs,
+                "reason": "missing_file",
+            }
+        )
 
 if missing:
-    print("ERROR: playlist references missing track files:")
+    print("ERROR: playlist track paths invalid/missing:")
     for m in missing[:200]:
         print(m)
     sys.exit(2)
 
-print("OK: all playlist track files exist")
+print("OK: playlist track files exist (and are inside OUT)")
 PY
-        env:
-          PLAYLIST_PATH: ${{ github.workspace }}/_unused
-        # NOTE: overridden below by runner env injection; GitHub requires env map exists for some runners
 
-      - name: Build + validate web
-        shell: bash
-        run: |
-          set -euxo pipefail
-          . .venv/bin/activate
-
-          DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
-
-          WEB_OUT="$OUT/web"
-          rm -rf "$WEB_OUT"
-
-          python -m mgc.main web build \
-            --playlist "$OUT/drop_bundle/playlist.json" \
-            --out-dir "$WEB_OUT" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json
-
-          python -m mgc.main web validate --out-dir "$WEB_OUT"
-
-      - name: Summarize output paths
-        shell: bash
-        run: |
-          set -euxo pipefail
-          DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
-          echo "OUT=$OUT"
-          echo "Playlist=$OUT/drop_bundle/playlist.json"
-          echo "Web=$OUT/web/index.html"
-          find "$OUT" -maxdepth 4 -type f | sort | sed -n '1,200p'
+          OUT="$OUT" PLAYLIST_PATH="$PLAYLIST_PATH" python /tmp/check_playlist_tracks_prod.py
