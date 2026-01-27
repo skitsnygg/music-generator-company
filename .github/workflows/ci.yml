@@ -26,6 +26,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Purge generated dirs in checkout (pre)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf data/evidence tracks || true
+
       - name: Set temp dirs
         shell: bash
         run: |
@@ -33,19 +39,22 @@ jobs:
           echo "MGC_EVIDENCE_DIR=${RUNNER_TEMP}/mgc_evidence" >> "$GITHUB_ENV"
           echo "MGC_ARTIFACTS_DIR=${RUNNER_TEMP}/artifacts/ci" >> "$GITHUB_ENV"
           echo "MGC_WEB_DIR=${RUNNER_TEMP}/mgc_web" >> "$GITHUB_ENV"
+          echo "MGC_TRACKS_DIR=${RUNNER_TEMP}/mgc_tracks" >> "$GITHUB_ENV"
           mkdir -p \
             "${RUNNER_TEMP}/mgc_evidence" \
             "${RUNNER_TEMP}/artifacts/ci" \
-            "${RUNNER_TEMP}/mgc_web"
+            "${RUNNER_TEMP}/mgc_web" \
+            "${RUNNER_TEMP}/mgc_tracks"
 
       - name: Prepare temp dirs
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_WEB_DIR}"
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_WEB_DIR}" "${MGC_TRACKS_DIR}"
           echo "placeholder" > "${MGC_ARTIFACTS_DIR}/.keep"
           ls -la "${MGC_ARTIFACTS_DIR}"
           ls -la "${MGC_EVIDENCE_DIR}"
+          ls -la "${MGC_TRACKS_DIR}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -190,6 +199,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
           MGC_CI_MODE: "fast"
         run: |
           set -euxo pipefail
@@ -216,8 +226,8 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_PROVIDER: "stub"
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
           # Allow autonomous to stage receipts into out_dir.
-          # ci_gate.sh typically writes receipts under ${MGC_ARTIFACTS_DIR}/run/marketing/receipts.jsonl
           MGC_MARKETING_RECEIPTS_PATH: ${{ env.MGC_ARTIFACTS_DIR }}/run/marketing/receipts.jsonl
         run: |
           set -euxo pipefail
@@ -236,7 +246,6 @@ jobs:
           test -s "${OUT1}/contract_report.json"
           test -s "${OUT2}/contract_report.json"
 
-          # Determinism: whole publish bundle tree must match
           (cd "${OUT1}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256"
           (cd "${OUT2}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
           diff -u "${MGC_ARTIFACTS_DIR}/auto_publish_1.sha256" "${MGC_ARTIFACTS_DIR}/auto_publish_2.sha256"
@@ -251,6 +260,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
           MGC_CI_MODE: "full"
         run: |
           set -euxo pipefail
@@ -266,6 +276,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
         run: |
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
@@ -277,6 +288,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_FIXED_TIME: ${{ env.MGC_FIXED_TIME }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
         run: |
           set -euxo pipefail
 
@@ -332,6 +344,7 @@ jobs:
           MGC_DB: ${{ env.MGC_DB }}
           MGC_FIXED_TIME: ${{ env.MGC_FIXED_TIME }}
           MGC_DETERMINISTIC: ${{ env.MGC_DETERMINISTIC }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
         run: |
           set -euxo pipefail
 
@@ -340,14 +353,12 @@ jobs:
           rm -rf "${OUT1}" "${OUT2}"
           mkdir -p "${OUT1}" "${OUT2}"
 
-          # Build the same weekly bundle twice
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
             --context focus --out-dir "${OUT1}" --deterministic --period-key 2020-W01
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
             --context focus --out-dir "${OUT2}" --deterministic --period-key 2020-W01
 
-          # Write receipts into each out_dir (dry-run but writes deterministic receipts)
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${OUT1}/drop_bundle" --deterministic --dry-run --out-dir "${OUT1}" \
             --json
@@ -356,14 +367,12 @@ jobs:
             --bundle-dir "${OUT2}/drop_bundle" --deterministic --dry-run --out-dir "${OUT2}" \
             --json
 
-          # Build submission zips
           python -m mgc.main submission build --bundle-dir "${OUT1}/drop_bundle" --out "${OUT1}/submission.zip"
           python -m mgc.main submission build --bundle-dir "${OUT2}/drop_bundle" --out "${OUT2}/submission.zip"
 
           test -s "${OUT1}/submission.zip"
           test -s "${OUT2}/submission.zip"
 
-          # Determinism: receipts trees and zips must match
           diff -ru "${OUT1}/marketing/receipts" "${OUT2}/marketing/receipts"
           sha256sum "${OUT1}/submission.zip" "${OUT2}/submission.zip"
           test "$(sha256sum "${OUT1}/submission.zip" | awk '{print $1}')" = "$(sha256sum "${OUT2}/submission.zip" | awk '{print $1}')"
@@ -376,7 +385,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Verify any drop outputs that CI produced
           if test -d "${MGC_ARTIFACTS_DIR}/auto"; then
             python scripts/verify_drop_contract.py \
               --out-dir "${MGC_ARTIFACTS_DIR}/auto"
@@ -399,6 +407,7 @@ jobs:
           WEB_DIR: ${{ env.MGC_WEB_DIR }}
           MGC_ARTIFACTS_DIR: ${{ env.MGC_ARTIFACTS_DIR }}
           MGC_EVIDENCE_DIR: ${{ env.MGC_EVIDENCE_DIR }}
+          MGC_TRACKS_DIR: ${{ env.MGC_TRACKS_DIR }}
         run: |
           set -euxo pipefail
 
@@ -414,15 +423,9 @@ jobs:
           test -n "${PLAYLIST_PATH}"
           test -s "${PLAYLIST_PATH}"
 
-          # -------------------------------------------------------------------
-          # Fix for CI red: playlist may reference tracks/ at the out-dir root,
-          # but the actual audio may live under drop_bundle/tracks/.
-          # If we detect missing audio next to the playlist, fall back to
-          # sibling drop_bundle/playlist.json when it exists.
-          # -------------------------------------------------------------------
           PLAYLIST_DIR="$(dirname "${PLAYLIST_PATH}")"
           FALLBACK_PLAYLIST="${PLAYLIST_DIR}/drop_bundle/playlist.json"
-          
+
           if test -s "${FALLBACK_PLAYLIST}"; then
             echo "Using drop_bundle playlist: ${FALLBACK_PLAYLIST}"
             PLAYLIST_PATH="${FALLBACK_PLAYLIST}"
@@ -430,9 +433,6 @@ jobs:
             echo "Using evidence playlist: ${PLAYLIST_PATH}"
           fi
 
-
-          # If the current playlist yields no local audio files but drop_bundle has some,
-          # switch to the drop_bundle playlist.
           AUDIO_NEAR_PLAYLIST="$(find "${PLAYLIST_DIR}" -maxdepth 2 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
           AUDIO_IN_DROP_BUNDLE="0"
           if test -d "${PLAYLIST_DIR}/drop_bundle"; then
@@ -449,7 +449,6 @@ jobs:
             test -s "${PLAYLIST_PATH}"
           fi
 
-          # Helpful diagnostics when this fails again
           echo "Playlist head (first 200 lines):"
           sed -n '1,200p' "${PLAYLIST_PATH}" || true
 
@@ -463,6 +462,13 @@ jobs:
 
           test "$(find "${WEB_DIR}" -maxdepth 6 -type f -name 'index.html' | wc -l)" -ge 1
           test "$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l)" -ge 1
+
+      - name: Purge generated dirs in checkout (post)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf data/evidence tracks || true
+          git checkout -- fixtures/ci_db.sqlite || true
 
       - name: Ensure working tree is clean (no generated artifacts)
         shell: bash
@@ -481,3 +487,4 @@ jobs:
             ${{ env.MGC_ARTIFACTS_DIR }}
             ${{ env.MGC_EVIDENCE_DIR }}
             ${{ env.MGC_WEB_DIR }}
+            ${{ env.MGC_TRACKS_DIR }}
