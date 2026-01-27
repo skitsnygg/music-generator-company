@@ -17,13 +17,14 @@ jobs:
       # Where prod drops are written on the self-hosted runner
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-      # Provider is controlled via repo vars (or runner env). Example: riffusion
+      # Provider controlled via repo vars (or runner env)
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
-      # Keep any accidental outputs away from the repo checkout
+      # Keep outputs away from repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
       MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
+      MGC_WEB_DIR: "/tmp/mgc_prod_web"
 
     steps:
       - name: Checkout
@@ -46,6 +47,7 @@ jobs:
           echo "context=focus" >> "$GITHUB_OUTPUT"
 
       - name: Run weekly drop
+        id: run_drop
         shell: bash
         run: |
           set -euxo pipefail
@@ -54,9 +56,9 @@ jobs:
           # Keep repo checkout clean
           rm -rf data/evidence tracks || true
 
-          # Clear temp output dirs
-          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
-          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          # Reset temp dirs
+          rm -rf "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_TRACKS_DIR}" "${MGC_WEB_DIR}"
+          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_TRACKS_DIR}" "${MGC_WEB_DIR}"
 
           DATE_UTC="$(date -u +%Y-%m-%d)"
           CONTEXT="${{ steps.vars.outputs.context }}"
@@ -77,86 +79,19 @@ jobs:
 
           test -s "$OUT/drop_bundle/playlist.json"
 
+          echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
+          echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
+          echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
+
       - name: Assert playlist track files exist (inside OUT)
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
 
-          DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
-          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
+          OUT="${{ steps.run_drop.outputs.out_dir }}"
+          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
 
           test -s "$PLAYLIST_PATH"
-
-          python - "$PLAYLIST_PATH" "$OUT" <<'PY'
-import json
-import os
-import sys
-
-playlist = sys.argv[1]
-out_dir = os.path.abspath(sys.argv[2])
-
-with open(playlist, "r", encoding="utf-8") as f:
-    obj = json.load(f)
-
-tracks = obj.get("tracks") or []
-missing = []
-
-def extract_path(t: dict) -> str:
-    if not isinstance(t, dict):
-        return ""
-    for k in ("path", "file", "audio_path", "audio", "src"):
-        v = t.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-playlist_dir = os.path.dirname(playlist)
-
-for t in tracks:
-    rel = extract_path(t)
-    if not rel:
-        continue
-
-    resolved = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(playlist_dir, rel))
-    resolved_abs = os.path.abspath(resolved)
-
-    # Must be inside OUT; we do not allow repo-root audio paths here
-    if not (resolved_abs == out_dir or resolved_abs.startswith(out_dir + os.sep)):
-        missing.append(
-            {
-                "track_id": t.get("id") if isinstance(t, dict) else None,
-                "path": rel,
-                "resolved": resolved_abs,
-                "reason": "path_outside_out_dir",
-            }
-        )
-        continue
-
-    if not os.path.exists(resolved_abs):
-        missing.append(
-            {
-                "track_id": t.get("id") if isinstance(t, dict) else None,
-                "path": rel,
-                "resolved": resolved_abs,
-                "reason": "missing_file",
-            }
-        )
-
-if missing:
-    print("ERROR: invalid/missing track files:")
-    for m in missing[:200]:
-        print(m)
-    sys.exit(2)
-
-print("OK: playlist track files exist (and are inside OUT)")
-PY
-
-      - name: Repo must remain clean
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rm -rf data/evidence tracks || true
-          test -z "$(git status --porcelain)"
+          python scripts/check_playlist_tr
