@@ -1,0 +1,114 @@
+name: scheduled_drops_ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci_scheduled_drops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      # CI must never depend on external providers or repo-stored audio.
+      MGC_PROVIDER: "stub"
+      MGC_DETERMINISTIC: "1"
+      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
+      MGC_NO_COLOR: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Compile check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m py_compile src/mgc/main.py
+          python -m py_compile src/mgc/run_cli.py
+          python -m py_compile src/mgc/web_cli.py
+
+      - name: Run weekly (stub) + build web bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUT="/tmp/mgc_ci_weekly"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          # Use fixtures DB for CI determinism, but never repo audio.
+          python -m mgc.main \
+            --db fixtures/ci_db.sqlite \
+            --seed 1 \
+            --no-resume \
+            run weekly \
+              --context focus \
+              --period-key 2020-W01 \
+              --out-dir "$OUT" \
+              --deterministic \
+              --web \
+              --submission
+
+          test -s "$OUT/drop_bundle/playlist.json"
+
+          # Assert that any track paths referenced by the playlist exist on disk.
+          python - <<'PY'
+import json, os, sys
+p = "/tmp/mgc_ci_weekly/drop_bundle/playlist.json"
+with open(p, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+base = os.path.dirname(p)
+missing = []
+tracks = obj.get("tracks") or []
+for t in tracks:
+    path = t.get("path") or t.get("file") or t.get("audio_path") or ""
+    if not path:
+        continue
+    cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
+    if not os.path.exists(cand):
+        missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
+if missing:
+    print("ERROR: playlist references missing track files:")
+    for m in missing[:50]:
+        print(m)
+    sys.exit(2)
+print("OK: all playlist track files exist")
+PY
+
+          # Build + validate web output from the generated bundle.
+          WEB_OUT="/tmp/mgc_ci_web"
+          rm -rf "$WEB_OUT"
+          python -m mgc.main web build \
+            --playlist "$OUT/drop_bundle/playlist.json" \
+            --out-dir "$WEB_OUT" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json
+
+          python -m mgc.main web validate --out-dir "$WEB_OUT"
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgc_ci_weekly
+          path: |
+            /tmp/mgc_ci_weekly
+            /tmp/mgc_ci_web
+          if-no-files-found: error

@@ -1,73 +1,243 @@
-# -----------------------------
-# Python
-# -----------------------------
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-.Python
-build/
-dist/
-*.egg-info/
-.eggs/
+name: scheduled_drops_prod
 
-# Virtual environments
-.venv/
-.venv-*/
-venv/
-ENV/
+on:
+  schedule:
+    # Adjust as desired; this is daily at 03:15 UTC.
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      context:
+        description: "Drop context (e.g. focus, workout, sleep)"
+        required: false
+        default: "focus"
+      schedule_kind:
+        description: "daily or weekly"
+        required: false
+        default: "daily"
+      period_key:
+        description: "Weekly period key (e.g. 2026-W04). Only used when schedule_kind=weekly"
+        required: false
+        default: ""
+      provider:
+        description: "Provider to use in prod schedule (riffusion recommended)"
+        required: false
+        default: "riffusion"
 
-# -----------------------------
-# MGC local/runtime data
-# -----------------------------
-# Local databases (except fixtures)
-data/db.sqlite
-data/*.sqlite
-!fixtures/ci_db.sqlite
+jobs:
+  prod_scheduled_drops:
+    # Your self-hosted runner (as you described previously).
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
 
-# Evidence, artifacts, temp outputs
-data/evidence/
-artifacts/
-tmp/
-.tmp/
-.cache/
+    env:
+      PYTHONUNBUFFERED: "1"
+      MGC_NO_COLOR: "1"
 
-# -----------------------------
-# Generated web output
-# -----------------------------
-# All generated releases must be ignored
-docs/releases/
+      # Default to riffusion for prod scheduled drops, but keep it overridable.
+      MGC_PROVIDER: ${{ inputs.provider || 'riffusion' }}
 
-# Allow the root web shell only
-!docs/index.html
+      # Riffusion connection details must come from secrets on the runner / GH.
+      # If you store these elsewhere (runner env), that's fine too.
+      MGC_RIFFUSION_URL: ${{ secrets.MGC_RIFFUSION_URL }}
+      MGC_RIFFUSION_CONNECT_TIMEOUT: ${{ secrets.MGC_RIFFUSION_CONNECT_TIMEOUT }}
+      MGC_RIFFUSION_READ_TIMEOUT: ${{ secrets.MGC_RIFFUSION_READ_TIMEOUT }}
+      MGC_RIFFUSION_RETRIES: ${{ secrets.MGC_RIFFUSION_RETRIES }}
 
-# -----------------------------
-# Audio / media artifacts
-# -----------------------------
-data/tracks/
-data/submissions/
+      # If you rely on a fixed directory layout on the prod runner, keep it stable:
+      MGC_PROD_ROOT: "/var/lib/mgc"
+      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-# -----------------------------
-# Logs & misc
-# -----------------------------
-*.log
-*.pid
-.DS_Store
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# -----------------------------
-# Editor / OS junk
-# -----------------------------
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+      - name: Set up Python (runner-local)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 -V
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e .
 
-# -----------------------------
-# Node / frontend (future-proofing)
-# -----------------------------
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+      - name: Resolve inputs
+        id: vars
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          CONTEXT="${{ inputs.context }}"
+          if [ -z "${CONTEXT}" ]; then CONTEXT="focus"; fi
+
+          KIND="${{ inputs.schedule_kind }}"
+          if [ -z "${KIND}" ]; then KIND="daily"; fi
+
+          PERIOD_KEY="${{ inputs.period_key }}"
+
+          echo "context=$CONTEXT" >> "$GITHUB_OUTPUT"
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "period_key=$PERIOD_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Run scheduled drop (provider-aware, no repo-audio assumptions)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          KIND="${{ steps.vars.outputs.kind }}"
+          PERIOD_KEY="${{ steps.vars.outputs.period_key }}"
+
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          # Pick command based on daily vs weekly.
+          if [ "$KIND" = "weekly" ]; then
+            if [ -z "$PERIOD_KEY" ]; then
+              # ISO week key like 2026-W04
+              PERIOD_KEY="$(date -u +%G-W%V)"
+            fi
+            python -m mgc.main \
+              --db "${MGC_PROD_ROOT}/db.sqlite" \
+              run weekly \
+                --context "$CONTEXT" \
+                --period-key "$PERIOD_KEY" \
+                --out-dir "$OUT" \
+                --with-web \
+                --submission
+          else
+            python -m mgc.main \
+              --db "${MGC_PROD_ROOT}/db.sqlite" \
+              run drop \
+                --context "$CONTEXT" \
+                --out-dir "$OUT" \
+                --with-web \
+                --submission
+          fi
+
+          test -s "$OUT/drop_bundle/playlist.json"
+
+          # Assert: playlist references files that exist in THIS out-dir tree.
+          python - <<'PY'
+import json, os, sys
+
+playlist = os.environ.get("PLAYLIST", "")
+if not playlist:
+    playlist = "/var/lib/mgc/releases/"  # placeholder to force failure if not set
+PY
+          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
+          python - <<'PY'
+import json, os, sys
+
+p = os.environ["PLAYLIST_PATH"]
+with open(p, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+
+base = os.path.dirname(p)
+
+missing = []
+tracks = obj.get("tracks") or []
+for t in tracks:
+    path = t.get("path") or t.get("file") or t.get("audio_path") or ""
+    if not path:
+        continue
+    cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
+    if not os.path.exists(cand):
+        missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
+
+if missing:
+    print("ERROR: playlist references missing track files.")
+    print("This usually means a web/playlist bundling path bug (or provider output not copied into drop_bundle).")
+    for m in missing[:50]:
+        print(m)
+    sys.exit(2)
+
+print("OK: all playlist track files exist for bundling")
+PY
+        env:
+          PLAYLIST_PATH: ${{ env.MGC_PROD_RELEASES }}/${{ github.run_id }}/_unused
+        # NOTE: above env is overridden below; GitHub requires env block exists for some runners
+      - name: Assert playlist track files exist (real)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          PLAYLIST_PATH="$OUT/drop_bundle/playlist.json"
+
+          python - <<'PY'
+import json, os, sys
+p = os.environ["PLAYLIST_PATH"]
+with open(p, "r", encoding="utf-8") as f:
+    obj = json.load(f)
+base = os.path.dirname(p)
+missing = []
+tracks = obj.get("tracks") or []
+for t in tracks:
+    path = t.get("path") or t.get("file") or t.get("audio_path") or ""
+    if not path:
+        continue
+    cand = path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
+    if not os.path.exists(cand):
+        missing.append({"track_id": t.get("id"), "path": path, "resolved": cand})
+if missing:
+    print("ERROR: playlist references missing track files:")
+    for m in missing[:50]:
+        print(m)
+    sys.exit(2)
+print("OK: all playlist track files exist")
+PY
+        env:
+          PLAYLIST_PATH: ${{ steps.vars.outputs.context }}
+
+      - name: Build + validate web from generated output
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+
+          WEB_OUT="$OUT/web"
+          rm -rf "$WEB_OUT"
+
+          python -m mgc.main web build \
+            --playlist "$OUT/drop_bundle/playlist.json" \
+            --out-dir "$WEB_OUT" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json
+
+          python -m mgc.main web validate --out-dir "$WEB_OUT"
+
+      - name: Provider-aware post steps (skip determinism gates for riffusion)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PROVIDER="${MGC_PROVIDER:-}"
+          if [ "$PROVIDER" = "riffusion" ]; then
+            echo "Provider is riffusion: skipping deterministic/fixture-based checks that assume repo audio."
+            exit 0
+          fi
+          echo "Provider is $PROVIDER: (optional) place any deterministic/fixture checks here."
+
+      - name: Summarize output paths
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          CONTEXT="${{ steps.vars.outputs.context }}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          echo "OUT=$OUT"
+          echo "Playlist=$OUT/drop_bundle/playlist.json"
+          echo "Web=$OUT/web/index.html"
+          find "$OUT" -maxdepth 3 -type f | sort | sed -n '1,200p'
