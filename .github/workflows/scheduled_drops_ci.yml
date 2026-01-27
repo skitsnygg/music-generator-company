@@ -15,12 +15,12 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # CI should be self-contained and deterministic.
+      # CI must be self-contained and deterministic
       MGC_PROVIDER: "stub"
       MGC_DETERMINISTIC: "1"
       MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
 
-      # Force outputs away from the repo checkout (prevents "?? tracks/" type failures).
+      # Force outputs away from the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_evidence"
       MGC_TRACKS_DIR: "/tmp/mgc_tracks"
@@ -56,12 +56,12 @@ jobs:
           python -m py_compile src/mgc/run_cli.py
           python -m py_compile src/mgc/web_cli.py
 
-      - name: Run weekly (stub) + build web + validate
+      - name: Run autonomous (stub) + build web + validate
         shell: bash
         run: |
           set -euxo pipefail
 
-          OUT="/tmp/mgc_ci_weekly"
+          OUT="/tmp/mgc_ci_autonomous"
           WEB_OUT="/tmp/mgc_ci_web"
 
           rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
@@ -72,12 +72,11 @@ jobs:
             --db fixtures/ci_db.sqlite \
             --seed 1 \
             --no-resume \
-            run weekly \
+            run autonomous \
               --context focus \
-              --period-key 2020-W01 \
               --out-dir "$OUT" \
               --deterministic \
-              --web \
+              --with-web \
               --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
@@ -92,15 +91,14 @@ jobs:
 
           python -m mgc.main web validate --out-dir "$WEB_OUT"
 
-          # Sanity: repo must remain clean
           rm -rf data/evidence tracks || true
           test -z "$(git status --porcelain)"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mgc_ci_weekly
+          name: mgc_ci_autonomous
           path: |
-            /tmp/mgc_ci_weekly
+            /tmp/mgc_ci_autonomous
             /tmp/mgc_ci_web
           if-no-files-found: error
