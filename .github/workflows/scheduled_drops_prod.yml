@@ -17,6 +17,10 @@ jobs:
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
+      # Optional for riffusion; set this in runner env or Actions vars/secrets.
+      # If provider=riffusion and URL is empty, we fail fast below.
+      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL }}"
+
       # Keep any accidental outputs away from the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
@@ -35,12 +39,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Compute vars
-        id: vars
+      - name: Validate environment (fail fast)
         shell: bash
         run: |
           set -euxo pipefail
-          echo "context=focus" >> "$GITHUB_OUTPUT"
+          echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
+          echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
+
+          test -s /var/lib/mgc/db.sqlite
+
+          if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
+            if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
+              echo "ERROR: MGC_PROVIDER=riffusion but MGC_RIFFUSION_URL is empty"
+              exit 2
+            fi
+          fi
 
       - name: Run weekly drop (bundle only)
         id: run_drop
@@ -55,15 +68,16 @@ jobs:
           mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
           DATE_UTC="$(date -u +%Y-%m-%d)"
-          CONTEXT="${{ steps.vars.outputs.context }}"
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+          CONTEXT="focus"
 
+          mkdir -p "${MGC_PROD_RELEASES}/${DATE_UTC}"
+
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
-          # NOTE: do NOT rely on --web here; we build web explicitly below.
           python -m mgc.main \
-            --db data/db.sqlite \
+            --db /var/lib/mgc/db.sqlite \
             --seed 1 \
             run weekly \
               --context "$CONTEXT" \
@@ -92,6 +106,7 @@ jobs:
           python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
 
       - name: Build web bundle into OUT/web
+        id: web_build
         shell: bash
         run: |
           set -euxo pipefail
@@ -113,8 +128,28 @@ jobs:
 
           python -m mgc.main web validate --out-dir "$OUT/web"
 
-          # Sanity: web bundle must contain audio
+          test -s "$OUT/web/web_manifest.json"
           test "$(find "$OUT/web" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
+
+          echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
+
+      - name: Update latest symlinks
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUT="${{ steps.run_drop.outputs.out_dir }}"
+          WEB_DIR="${{ steps.web_build.outputs.web_dir }}"
+
+          ln -sfn "$OUT" "${MGC_PROD_RELEASES}/latest_release"
+          ln -sfn "$WEB_DIR" "${MGC_PROD_RELEASES}/latest_web"
+
+          echo "latest_release -> $(readlink -f "${MGC_PROD_RELEASES}/latest_release")"
+          echo "latest_web     -> $(readlink -f "${MGC_PROD_RELEASES}/latest_web")"
+
+          test -s "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
+          ls -la "${MGC_PROD_RELEASES}/latest_web/tracks" | head
+          sed -n '1,40p' "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
 
       - name: Repo must remain clean
         shell: bash

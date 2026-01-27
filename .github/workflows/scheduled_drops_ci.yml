@@ -1,68 +1,59 @@
 name: scheduled_drops_ci
 
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
   pull_request:
-  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
 
 jobs:
   scheduled_drops_ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
+      # CI must never assume repo-stored audio exists.
+      # Use stub so it’s deterministic and self-contained.
       MGC_PROVIDER: "stub"
-      MGC_DETERMINISTIC: "1"
-      MGC_FIXED_TIME: "2020-01-01T00:00:00Z"
 
-      MGC_ARTIFACTS_DIR: "/tmp/mgc_artifacts"
-      MGC_EVIDENCE_DIR: "/tmp/mgc_evidence"
-      MGC_TRACKS_DIR: "/tmp/mgc_tracks"
+      # Keep any accidental outputs away from the repo checkout
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_ci_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_ci_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_ci_tracks"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clean repo working tree
+      - name: Prepare venv
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf data/evidence tracks || true
-          git clean -fdx
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install editable
-        shell: bash
-        run: |
-          set -euxo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Run autonomous (stub) + build web + validate
+      - name: Run autonomous (self-contained) and build web
         shell: bash
         run: |
           set -euxo pipefail
+          . .venv/bin/activate
 
           OUT="/tmp/mgc_ci_autonomous"
           WEB_OUT="/tmp/mgc_ci_web"
-          DB_TMP="/tmp/mgc_ci_db.sqlite"
 
-          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
+          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_ci_artifacts /tmp/mgc_ci_evidence /tmp/mgc_ci_tracks
           rm -rf data/evidence tracks || true
-          mkdir -p "$OUT" /tmp/mgc_artifacts /tmp/mgc_evidence /tmp/mgc_tracks
-
-          cp -f fixtures/ci_db.sqlite "$DB_TMP"
+          mkdir -p /tmp/mgc_ci_artifacts /tmp/mgc_ci_evidence /tmp/mgc_ci_tracks
 
           python -m mgc.main \
-            --db "$DB_TMP" \
+            --db fixtures/ci_db.sqlite \
             --seed 1 \
             --no-resume \
             run autonomous \
@@ -73,6 +64,10 @@ jobs:
 
           test -s "$OUT/drop_bundle/playlist.json"
 
+          # Assert playlist track files exist inside OUT
+          python scripts/check_playlist_tracks.py "$OUT/drop_bundle/playlist.json" "$OUT"
+
+          # Build a separate web bundle (CI sanity)
           python -m mgc.main web build \
             --playlist "$OUT/drop_bundle/playlist.json" \
             --out-dir "$WEB_OUT" \
@@ -83,14 +78,12 @@ jobs:
 
           python -m mgc.main web validate --out-dir "$WEB_OUT"
 
+          # Sanity: web bundle must contain audio
+          test "$(find "$WEB_OUT" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
+
+      - name: Repo must remain clean
+        shell: bash
+        run: |
+          set -euxo pipefail
           rm -rf data/evidence tracks || true
           test -z "$(git status --porcelain)"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mgc_ci_autonomous
-          path: |
-            /tmp/mgc_ci_autonomous
-            /tmp/mgc_ci_web
-          if-no-files-found: error
