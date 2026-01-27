@@ -14,17 +14,13 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # Where prod drops are written on the self-hosted runner
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
-
-      # Provider controlled via repo vars (or runner env)
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
-      # Keep outputs away from repo checkout
+      # Keep any accidental outputs away from the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
       MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
-      MGC_WEB_DIR: "/tmp/mgc_prod_web"
 
     steps:
       - name: Checkout
@@ -46,19 +42,17 @@ jobs:
           set -euxo pipefail
           echo "context=focus" >> "$GITHUB_OUTPUT"
 
-      - name: Run weekly drop
+      - name: Run weekly drop (bundle only)
         id: run_drop
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
 
-          # Keep repo checkout clean
           rm -rf data/evidence tracks || true
 
-          # Reset temp dirs
-          rm -rf "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_TRACKS_DIR}" "${MGC_WEB_DIR}"
-          mkdir -p "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_TRACKS_DIR}" "${MGC_WEB_DIR}"
+          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
           DATE_UTC="$(date -u +%Y-%m-%d)"
           CONTEXT="${{ steps.vars.outputs.context }}"
@@ -67,6 +61,7 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
+          # NOTE: do NOT rely on --web here; we build web explicitly below.
           python -m mgc.main \
             --db data/db.sqlite \
             --seed 1 \
@@ -74,7 +69,7 @@ jobs:
               --context "$CONTEXT" \
               --period-key "${DATE_UTC}" \
               --out-dir "$OUT" \
-              --web \
+              --deterministic \
               --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
@@ -94,4 +89,36 @@ jobs:
           PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
 
           test -s "$PLAYLIST_PATH"
-          python scripts/check_playlist_tr
+          python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
+
+      - name: Build web bundle into OUT/web
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+
+          OUT="${{ steps.run_drop.outputs.out_dir }}"
+          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
+
+          rm -rf "$OUT/web"
+          mkdir -p "$OUT/web"
+
+          python -m mgc.main web build \
+            --playlist "$PLAYLIST_PATH" \
+            --out-dir "$OUT/web" \
+            --prefer-mp3 \
+            --clean \
+            --fail-if-empty \
+            --json
+
+          python -m mgc.main web validate --out-dir "$OUT/web"
+
+          # Sanity: web bundle must contain audio
+          test "$(find "$OUT/web" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
+
+      - name: Repo must remain clean
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf data/evidence tracks || true
+          test -z "$(git status --porcelain)"
