@@ -14,11 +14,11 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
+      # Production directories on the runner
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
-      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
 
-      # Optional for riffusion; set this in runner env or Actions vars/secrets.
-      # If provider=riffusion and URL is empty, we fail fast below.
+      # Provider selection from Actions vars
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
       MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL }}"
 
       # Keep any accidental outputs away from the repo checkout
@@ -46,6 +46,7 @@ jobs:
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
           echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
 
+          # This is the only DB path prod should use
           test -s /var/lib/mgc/db.sqlite
 
           if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
@@ -55,8 +56,8 @@ jobs:
             fi
           fi
 
-      - name: Run weekly drop (bundle only)
-        id: run_drop
+      - name: Run autonomous (self-contained) into release OUT (includes web)
+        id: run_auto
         shell: bash
         run: |
           set -euxo pipefail
@@ -67,30 +68,34 @@ jobs:
           rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
           mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
-          DATE_UTC="$(date -u +%Y-%m-%d)"
+          # Use ISO week key so mgc weekly validation never trips.
+          WEEK_KEY="$(date -u +%G-W%V)"
           CONTEXT="focus"
 
-          mkdir -p "${MGC_PROD_RELEASES}/${DATE_UTC}"
+          mkdir -p "${MGC_PROD_RELEASES}/${WEEK_KEY}"
+          OUT="${MGC_PROD_RELEASES}/${WEEK_KEY}/${CONTEXT}"
 
-          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
           python -m mgc.main \
             --db /var/lib/mgc/db.sqlite \
             --seed 1 \
-            run weekly \
+            --no-resume \
+            run autonomous \
               --context "$CONTEXT" \
-              --period-key "${DATE_UTC}" \
               --out-dir "$OUT" \
               --deterministic \
+              --with-web \
               --submission
 
           test -s "$OUT/drop_bundle/playlist.json"
+          test -s "$OUT/web/web_manifest.json"
 
-          echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
+          echo "week_key=${WEEK_KEY}" >> "$GITHUB_OUTPUT"
           echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
           echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
           echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
 
       - name: Assert playlist track files exist (inside OUT)
@@ -99,47 +104,34 @@ jobs:
           set -euxo pipefail
           . .venv/bin/activate
 
-          OUT="${{ steps.run_drop.outputs.out_dir }}"
-          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
+          OUT="${{ steps.run_auto.outputs.out_dir }}"
+          PLAYLIST_PATH="${{ steps.run_auto.outputs.playlist_path }}"
 
           test -s "$PLAYLIST_PATH"
           python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
 
-      - name: Build web bundle into OUT/web
-        id: web_build
+      - name: Validate web bundle contains audio
         shell: bash
         run: |
           set -euxo pipefail
-          . .venv/bin/activate
 
-          OUT="${{ steps.run_drop.outputs.out_dir }}"
-          PLAYLIST_PATH="${{ steps.run_drop.outputs.playlist_path }}"
+          WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
 
-          rm -rf "$OUT/web"
-          mkdir -p "$OUT/web"
+          python -m mgc.main web validate --out-dir "$WEB_DIR"
 
-          python -m mgc.main web build \
-            --playlist "$PLAYLIST_PATH" \
-            --out-dir "$OUT/web" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json
+          test "$(find "$WEB_DIR" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
 
-          python -m mgc.main web validate --out-dir "$OUT/web"
-
-          test -s "$OUT/web/web_manifest.json"
-          test "$(find "$OUT/web" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
-
-          echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
+          test -s "$WEB_DIR/web_manifest.json"
+          ls -la "$WEB_DIR/tracks" | head
+          sed -n '1,40p' "$WEB_DIR/web_manifest.json"
 
       - name: Update latest symlinks
         shell: bash
         run: |
           set -euxo pipefail
 
-          OUT="${{ steps.run_drop.outputs.out_dir }}"
-          WEB_DIR="${{ steps.web_build.outputs.web_dir }}"
+          OUT="${{ steps.run_auto.outputs.out_dir }}"
+          WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
 
           ln -sfn "$OUT" "${MGC_PROD_RELEASES}/latest_release"
           ln -sfn "$WEB_DIR" "${MGC_PROD_RELEASES}/latest_web"
@@ -148,8 +140,6 @@ jobs:
           echo "latest_web     -> $(readlink -f "${MGC_PROD_RELEASES}/latest_web")"
 
           test -s "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
-          ls -la "${MGC_PROD_RELEASES}/latest_web/tracks" | head
-          sed -n '1,40p' "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
 
       - name: Repo must remain clean
         shell: bash
