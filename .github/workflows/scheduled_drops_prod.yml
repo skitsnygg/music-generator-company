@@ -3,6 +3,7 @@ name: scheduled_drops_prod
 on:
   workflow_dispatch:
   schedule:
+    # 09:00 UTC daily
     - cron: "0 9 * * *"
 
 jobs:
@@ -14,14 +15,14 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # Production directories on the runner
+      # Absolute prod paths on the runner
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-      # Provider selection from Actions vars
+      # Provider selection via Actions variables
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
       MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL }}"
 
-      # Keep any accidental outputs away from the repo checkout
+      # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
       MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
       MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
@@ -43,37 +44,36 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
           echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
 
-          # This is the only DB path prod should use
+          # Prod must always use the system DB
           test -s /var/lib/mgc/db.sqlite
 
           if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
             if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
-              echo "ERROR: MGC_PROVIDER=riffusion but MGC_RIFFUSION_URL is empty"
+              echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
               exit 2
             fi
           fi
 
-      - name: Run autonomous (self-contained) into release OUT (includes web)
+      - name: Run autonomous drop (self-contained, builds web)
         id: run_auto
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
 
+          # Ensure repo stays clean
           rm -rf data/evidence tracks || true
 
           rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
           mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
-          # Use ISO week key so mgc weekly validation never trips.
-          WEEK_KEY="$(date -u +%G-W%V)"
           CONTEXT="focus"
-
-          mkdir -p "${MGC_PROD_RELEASES}/${WEEK_KEY}"
-          OUT="${MGC_PROD_RELEASES}/${WEEK_KEY}/${CONTEXT}"
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
 
           rm -rf "$OUT"
           mkdir -p "$OUT"
@@ -92,7 +92,7 @@ jobs:
           test -s "$OUT/drop_bundle/playlist.json"
           test -s "$OUT/web/web_manifest.json"
 
-          echo "week_key=${WEEK_KEY}" >> "$GITHUB_OUTPUT"
+          echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
           echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
           echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
           echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
@@ -107,7 +107,6 @@ jobs:
           OUT="${{ steps.run_auto.outputs.out_dir }}"
           PLAYLIST_PATH="${{ steps.run_auto.outputs.playlist_path }}"
 
-          test -s "$PLAYLIST_PATH"
           python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
 
       - name: Validate web bundle contains audio
@@ -120,10 +119,7 @@ jobs:
           python -m mgc.main web validate --out-dir "$WEB_DIR"
 
           test "$(find "$WEB_DIR" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
-
           test -s "$WEB_DIR/web_manifest.json"
-          ls -la "$WEB_DIR/tracks" | head
-          sed -n '1,40p' "$WEB_DIR/web_manifest.json"
 
       - name: Update latest symlinks
         shell: bash
