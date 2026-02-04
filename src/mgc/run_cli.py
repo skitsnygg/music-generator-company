@@ -748,6 +748,73 @@ def _marketing_teaser_wav(
         return (False, f"teaser failed: {e}")
 
 
+def _marketing_teaser_mp4(
+    *,
+    cover_path: Optional[Path],
+    teaser_wav: Path,
+    out_path: Path,
+    seconds: int,
+) -> Tuple[bool, str]:
+    """Create a simple MP4 teaser from cover + audio using ffmpeg."""
+    if not teaser_wav.exists():
+        return (False, "teaser wav missing")
+    if not _ffmpeg_available():
+        return (False, "ffmpeg not available")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    use_cover = bool(
+        cover_path
+        and cover_path.exists()
+        and cover_path.suffix.lower() in (".png", ".jpg", ".jpeg")
+    )
+    if use_cover:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(cover_path),
+            "-i",
+            str(teaser_wav),
+            "-t",
+            str(int(seconds)),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(out_path),
+        ]
+    else:
+        # Fallback: use a solid color video if no PNG/JPG cover is available.
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s=1024x1024:d={int(seconds)}",
+            "-i",
+            str(teaser_wav),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(out_path),
+        ]
+    try:
+        _run_ffmpeg(cmd)
+        return (out_path.exists(), "" if out_path.exists() else "ffmpeg did not produce output")
+    except Exception as e:
+        return (False, f"ffmpeg failed: {e}")
+
+
 def _relpath_from_out_dir(out_dir: Path, p: str) -> str:
     """
     Convert an absolute path under out_dir into a portable, POSIX-style relative path.
@@ -761,6 +828,53 @@ def _relpath_from_out_dir(out_dir: Path, p: str) -> str:
         import os
         return Path(os.path.relpath(str(pp), str(out))).as_posix()
 
+
+def _format_marketing_media_url(
+    base: str,
+    *,
+    media_rel: str,
+    context: str,
+    schedule: str,
+    period_key: str,
+    drop_id: str,
+    track_id: str,
+) -> Optional[str]:
+    base = (base or "").strip()
+    if not base or not media_rel:
+        return None
+
+    base = base.rstrip("/")
+    media_rel_posix = Path(media_rel).as_posix()
+    media_file = Path(media_rel_posix).name
+    marketing_media_path = f"marketing/{media_rel_posix.lstrip('/')}"
+
+    mapping = {
+        "context": context or "",
+        "schedule": schedule or "",
+        "period_key": period_key or "",
+        "period": period_key or "",
+        "drop_id": drop_id or "",
+        "track_id": track_id or "",
+        "media_path": media_rel_posix,
+        "media_rel": media_rel_posix,
+        "media_file": media_file,
+        "media_name": media_file,
+        "marketing_media_path": marketing_media_path,
+    }
+
+    media_tokens = {"media_path", "media_rel", "media_file", "media_name", "marketing_media_path"}
+    has_media_token = any(f"{{{k}}}" in base for k in media_tokens)
+
+    out = base
+    for key, val in mapping.items():
+        token = f"{{{key}}}"
+        if token in out:
+            out = out.replace(token, val)
+
+    if has_media_token:
+        return out
+    return f"{out}/{media_file}"
+
 def _agents_marketing_plan(
     *,
     drop_dir: Path,
@@ -769,6 +883,7 @@ def _agents_marketing_plan(
     seed: int,
     teaser_seconds: int,
     ts: str,
+    drop_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate a deterministic marketing plan for a drop bundle.
 
@@ -802,6 +917,10 @@ def _agents_marketing_plan(
     receipts = out_dir / "receipts.jsonl"
     plan_path = out_dir / "marketing_plan.json"
 
+    context = str(pl.get("context") or "focus")
+    schedule = str(pl.get("schedule") or "daily")
+    period_key = str((pl.get("period") or {}).get("label") or "")
+
     # teaser
     teaser_path = out_dir / "teaser.wav"
     wrote, reason = _marketing_teaser_wav(lead_audio=lead_audio, out_path=teaser_path, teaser_seconds=int(teaser_seconds))
@@ -825,11 +944,37 @@ def _agents_marketing_plan(
             "note": png_err or "svg_fallback",
         }
 
+    # mp4 teaser (optional)
+    media_rel: Optional[str] = None
+    media_url: Optional[str] = None
+    media_note: Optional[str] = None
+    if wrote:
+        media_dir = out_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        media_path = media_dir / f"{lead_track_id}.mp4"
+        wrote_mp4, mp4_reason = _marketing_teaser_mp4(
+            cover_path=cover_path,
+            teaser_wav=teaser_path,
+            out_path=media_path,
+            seconds=int(teaser_seconds),
+        )
+        if wrote_mp4:
+            media_rel = _relpath_from_out_dir(out_dir, str(media_path))
+            base = os.environ.get("MGC_MARKETING_MEDIA_BASE") or ""
+            media_url = _format_marketing_media_url(
+                base,
+                media_rel=media_rel,
+                context=context,
+                schedule=schedule,
+                period_key=period_key,
+                drop_id=str(drop_id or ""),
+                track_id=lead_track_id,
+            )
+        else:
+            media_note = mp4_reason
+
     # posts (simple deterministic copy)
-    context = str(pl.get("context") or "focus")
-    schedule = str(pl.get("schedule") or "daily")
-    period = (pl.get("period") or {}).get("label") or ""
-    base = f"{context} | {schedule} | {period}".strip(" |")
+    base = f"{context} | {schedule} | {period_key}".strip(" |")
     posts_text = [
         f"New {context} drop is live. {base}. Listen now.",
         f"{context.capitalize()} session soundtrack: fresh release for {base}.",
@@ -840,6 +985,11 @@ def _agents_marketing_plan(
         p = out_dir / f"post_{idx}.txt"
         p.write_text(txt + "\n", encoding="utf-8")
         post_paths.append(_relpath_from_out_dir(out_dir, str(p)))
+
+    # Also emit publish payloads with media pointers (for live publish)
+    publish_dir = out_dir / "publish"
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    # Note: canonical publish payloads are generated by _emit_marketing_publish_posts during run daily/weekly.
 
     out_obj: Dict[str, Any] = {
         "ok": True,
@@ -855,12 +1005,18 @@ def _agents_marketing_plan(
             "skipped": (not wrote),
             "reason": reason if not wrote else "",
         },
+        "media": {
+            "video_path": media_rel,
+            "video_url": media_url,
+            "note": media_note,
+        },
         "paths": {
             "out_dir": ".",
             "playlist": _relpath_from_out_dir(out_dir, str(playlist_path)),
             "lead_audio": _relpath_from_out_dir(out_dir, str(lead_audio)),
             "cover": _relpath_from_out_dir(out_dir, str(cover_path)),
             "teaser": _relpath_from_out_dir(out_dir, str(teaser_path)),
+            "media": media_rel,
             "posts": post_paths,
             "receipts": _relpath_from_out_dir(out_dir, str(receipts)),
             "plan": _relpath_from_out_dir(out_dir, str(plan_path)),
@@ -898,6 +1054,8 @@ def _emit_marketing_publish_posts(
     title: str,
     hook: str,
     cta: str,
+    media_path: Optional[str] = None,
+    media_url: Optional[str] = None,
 ) -> List[str]:
     marketing_dir = out_dir / "marketing"
     publish_dir = marketing_dir / "publish"
@@ -922,6 +1080,8 @@ def _emit_marketing_publish_posts(
             "hook": hook,
             "cta": cta,
             "context": context,
+            "video_path": media_path,
+            "video_url": media_url,
         }
         (publish_dir / f"{post_id}.json").write_text(stable_json_dumps(payload) + "\n", encoding="utf-8")
         post_ids.append(post_id)
@@ -2808,6 +2968,27 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     # Pipeline contract: always expose top-level playlist.json as well
     (out_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
 
+    marketing_obj: Optional[Dict[str, Any]] = None
+    if bool(getattr(args, "marketing", False)):
+        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
+        marketing_obj = _agents_marketing_plan(
+            drop_dir=bundle_dir,
+            repo_root=repo_root,
+            out_dir=marketing_out,
+            seed=int(seed),
+            teaser_seconds=int(getattr(args, "teaser_seconds", 15) or 15),
+            ts=now_iso,
+            drop_id=str(drop_id),
+        )
+
+    media_rel = None
+    media_url = None
+    if isinstance(marketing_obj, dict):
+        media_obj = marketing_obj.get("media") if isinstance(marketing_obj.get("media"), dict) else None
+        if isinstance(media_obj, dict):
+            media_rel = media_obj.get("video_path") or media_obj.get("media_path")
+            media_url = media_obj.get("video_url") or media_obj.get("media_url")
+
     post_ids = _emit_marketing_publish_posts(
         out_dir=out_dir,
         schedule="daily",
@@ -2820,6 +3001,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         title=f"Daily Drop {period_key} ({context})",
         hook=f"New {context} daily drop is ready.",
         cta="Listen now.",
+        media_path=media_rel,
+        media_url=media_url,
     )
 
     lead_rel_path = copied[0]["path"]
@@ -2872,17 +3055,6 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
 
-    marketing_obj: Optional[Dict[str, Any]] = None
-    if bool(getattr(args, "marketing", False)):
-        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
-        marketing_obj = _agents_marketing_plan(
-            drop_dir=bundle_dir,
-            repo_root=repo_root,
-            out_dir=marketing_out,
-            seed=int(seed),
-            teaser_seconds=int(getattr(args, "teaser_seconds", 15) or 15),
-            ts=now_iso,
-        )
     drop_evidence = {
         "ok": True,
         "schedule": "daily",
@@ -3066,8 +3238,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
         live_errors: List[Dict[str, Any]] = []
         mp = None
+        publish_base_dir: Optional[Path] = None
         if publish_live:
             from mgc import marketing_publishers as mp  # type: ignore
+            # In file mode, payload media paths are relative to the marketing dir.
+            publish_base_dir = publish_dir.parent
 
         for d in posts_sorted[:limit]:
             post_id = str(d["post_id"])
@@ -3089,7 +3264,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             remote_id: Optional[str] = None
             if publish_live and mp is not None:
                 try:
-                    res = mp.publish(platform, payload=obj)
+                    res = mp.publish(platform, payload=obj, base_dir=publish_base_dir)
                     if isinstance(res, dict):
                         remote_id = res.get("remote_id")
                     live_ok = True
@@ -3221,8 +3396,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
     live_errors: List[Dict[str, Any]] = []
     mp = None
+    publish_base_dir: Optional[Path] = None
     if publish_live:
         from mgc import marketing_publishers as mp  # type: ignore
+        if out_dir is not None:
+            publish_base_dir = out_dir / "marketing"
 
     def _meta_matches(meta: Dict[str, Any]) -> bool:
         if filter_run_id and str(meta.get("run_id") or "") != filter_run_id:
@@ -3273,7 +3451,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                         payload_obj = {"text": content}
                 except Exception:
                     payload_obj = {"text": content}
-                res = mp.publish(platform, payload=payload_obj)
+                res = mp.publish(platform, payload=payload_obj, base_dir=publish_base_dir)
                 if isinstance(res, dict):
                     remote_id = res.get("remote_id")
                 live_ok = True
@@ -4722,10 +4900,31 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
+    marketing_obj: Optional[Dict[str, Any]] = None
+    if bool(getattr(args, "marketing", False)):
+        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
+        marketing_obj = _agents_marketing_plan(
+            drop_dir=bundle_dir,
+            repo_root=repo_root,
+            out_dir=marketing_out,
+            seed=int(seed),
+            teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
+            ts=now_iso,
+            drop_id=str(drop_id),
+        )
+
     # ------------------------------------------------------------------
     # Emit planned marketing posts for file-mode publishing (weekly)
     # Writes: <out_dir>/marketing/publish/<post_id>.json
     # ------------------------------------------------------------------
+    media_rel = None
+    media_url = None
+    if isinstance(marketing_obj, dict):
+        media_obj = marketing_obj.get("media") if isinstance(marketing_obj.get("media"), dict) else None
+        if isinstance(media_obj, dict):
+            media_rel = media_obj.get("video_path") or media_obj.get("media_path")
+            media_url = media_obj.get("video_url") or media_obj.get("media_url")
+
     _emit_marketing_publish_posts(
         out_dir=out_dir,
         schedule="weekly",
@@ -4738,6 +4937,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         title=f"Weekly Drop {period_key} ({context})",
         hook=f"New weekly {context} drop is ready.",
         cta="Listen now.",
+        media_path=media_rel,
+        media_url=media_url,
     )
 
     # Compute deterministic repo manifest alongside playlist (helps CI provenance)
@@ -4764,18 +4965,6 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     manifest_path = out_dir / "weekly_manifest.json"
     manifest_path.write_text(stable_json_dumps(manifest_obj) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
-
-    marketing_obj: Optional[Dict[str, Any]] = None
-    if bool(getattr(args, "marketing", False)):
-        marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
-        marketing_obj = _agents_marketing_plan(
-            drop_dir=bundle_dir,
-            repo_root=repo_root,
-            out_dir=marketing_out,
-            seed=int(seed),
-            teaser_seconds=int(getattr(args, "teaser_seconds", 20) or 20),
-            ts=now_iso,
-        )
 
     # Prefer the bundle playlist for downstream steps (web/submission), since it is portable.
     bundle_playlist_path = (bundle_dir / "playlist.json").resolve()

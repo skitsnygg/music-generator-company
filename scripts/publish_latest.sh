@@ -27,6 +27,7 @@ DB_PATH="data/db.sqlite"
 
 WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
 WEB_BUILD_ARGS="${MGC_WEB_BUILD_ARGS:-}"
+MARKETING_MEDIA_SRC=""
 
 die() { echo "[publish_latest] ERROR: $*" >&2; exit 2; }
 log() { echo "[publish_latest] $*"; }
@@ -80,6 +81,13 @@ RC=$?
 set -e
 if [[ $RC -ne 0 ]]; then
   die "web build failed (rc=${RC}). Re-run without redirect to see error."
+fi
+
+# Optional: copy marketing media into the web bundle (for public video_url)
+MARKETING_MEDIA_SRC="${SRC_OUT_DIR}/marketing/media"
+if [[ -d "${MARKETING_MEDIA_SRC}" ]]; then
+  mkdir -p "${TMP_DIR}/marketing"
+  cp -a "${MARKETING_MEDIA_SRC}" "${TMP_DIR}/marketing/"
 fi
 
 # Atomic swap: DEST_DIR -> backup, TMP_DIR -> DEST_DIR

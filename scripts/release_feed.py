@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 ALWAYS_EXCLUDE_NAMES = {
     "run",
     "submission",
-    "web",
+    "web",          # container dir
     "bundle",
     "marketing",
     "tracks",
@@ -166,6 +166,12 @@ def releases_section(root_dir: Path, *, base_url: str, max_items: int, include_b
     return releases
 
 def canonical_content(obj: Dict[str, Any]) -> bytes:
+    """
+    Canonical bytes for content hashing:
+    - remove generated_at (timestamp)
+    - remove content_sha256 itself
+    - stable JSON with sort_keys and compact separators
+    """
     clone = dict(obj)
     clone.pop("generated_at", None)
     clone.pop("content_sha256", None)

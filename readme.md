@@ -179,6 +179,7 @@ No API keys are required for the default stub provider.
 
 Daily/weekly runs emit deterministic post payloads under `marketing/publish/`.  
 Publishing is file-based and writes receipts to `marketing/receipts/`.
+If `ffmpeg` is available, a short MP4 teaser is generated under `marketing/media/`.
 
 Environment toggles:
 - `MGC_PUBLISH_MARKETING=1` (default) — run `publish-marketing` in `scripts/run_daily.sh`
@@ -194,8 +195,21 @@ python -m mgc.main run publish-marketing --bundle-dir <out_dir>/drop_bundle --ou
 Live integration env:
 - `MGC_PUBLISH_LIVE=1` (or pass `--publish-live`)
 - X (Twitter): `MGC_X_API_KEY`, `MGC_X_API_SECRET`, `MGC_X_ACCESS_TOKEN`, `MGC_X_ACCESS_TOKEN_SECRET`
+  - If `video_path`/`media_path` is provided, X uploads local media (mp4/gif/jpg/png) before posting.
+- YouTube: `MGC_YT_ACCESS_TOKEN` (optional: `MGC_YT_PRIVACY`, `MGC_YT_CATEGORY_ID`)
+  - Optional retries: `MGC_YT_RETRY=1`, `MGC_YT_RETRY_MAX=3`, `MGC_YT_RETRY_SLEEP=2`
+  - Optional processing poll: `MGC_YT_POLL=0`, `MGC_YT_POLL_MAX=12`, `MGC_YT_POLL_SLEEP=5`
+- Instagram Reels: `MGC_IG_ACCESS_TOKEN`, `MGC_IG_USER_ID` + `video_url` in payload (public URL)
+  - Processing poll: `MGC_IG_POLL=1` (default), `MGC_IG_POLL_MAX=10`, `MGC_IG_POLL_SLEEP=3`
+- TikTok: `MGC_TIKTOK_ACCESS_TOKEN` + `video_url` in payload (public URL)
+  - Optional status polling: `MGC_TIKTOK_POLL=1`, `MGC_TIKTOK_POLL_MAX=10`, `MGC_TIKTOK_POLL_SLEEP=3`
 - Webhook fallback: `MGC_MARKETING_WEBHOOK_URL` or `MGC_MARKETING_WEBHOOK_<PLATFORM>`
 - Webhook media (optional): `MGC_MARKETING_WEBHOOK_INCLUDE_MEDIA=1` to include base64 media payloads
+- Media hosting: set `MGC_MARKETING_MEDIA_BASE` to a public URL that serves `marketing/media/` (publish_latest copies it into the web bundle).
+  Supports placeholders: `{context}`, `{schedule}`, `{period_key}`, `{drop_id}`, `{track_id}`, `{media_path}`, `{media_file}`, `{marketing_media_path}`.
+  If no media placeholders are used, the filename is appended to the base URL.
+- Scheduler adapter (credential-less): set `MGC_MARKETING_SCHEDULER_URL` to push all posts to a scheduler service.
+  Optional: `MGC_MARKETING_SCHEDULER_AUTH`, `MGC_MARKETING_SCHEDULER_HEADERS` (JSON), `MGC_MARKETING_SCHEDULER_INCLUDE_MEDIA=1`.
 
 ---
 

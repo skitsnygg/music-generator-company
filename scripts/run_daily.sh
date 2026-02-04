@@ -93,15 +93,9 @@ run_one() {
   printf "%s\n" "${daily_json}"
 
   if [[ "${PUBLISH_MARKETING}" == "1" ]]; then
-    drop_id="$("${PY}" - <<'PY'
-import json, sys
-try:
-    obj = json.loads(sys.stdin.read() or "{}")
-    print(obj.get("drop_id", ""))
-except Exception:
-    print("")
-PY
-<<<"${daily_json}")"
+    drop_id="$("${PY}" -c 'import json,sys; \
+data=sys.stdin.read() or "{}"; \
+print(json.loads(data).get("drop_id",""))' <<<"${daily_json}")"
 
     if [[ -z "${drop_id}" ]]; then
       log "WARN: drop_id missing from daily JSON; skipping publish-marketing to avoid replay"
