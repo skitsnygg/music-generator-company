@@ -1,0 +1,30 @@
+{
+  "content_sha256": "368a22fa66444ed6e0de48cd595ccdad0660dcdb7772091ff75a262ed6e2ac54",
+  "latest": {
+    "contexts": [
+      {
+        "context": "focus",
+        "kind": "web",
+        "mtime": "2026-02-04T19:06:52Z",
+        "track_count": 5,
+        "url": "/latest/web/focus/"
+      },
+      {
+        "context": "sleep",
+        "kind": "web",
+        "mtime": "2026-01-26T12:16:07Z",
+        "track_count": 1,
+        "url": "/latest/web/sleep/"
+      },
+      {
+        "context": "workout",
+        "kind": "web",
+        "mtime": "2026-01-26T12:16:07Z",
+        "track_count": 1,
+        "url": "/latest/web/workout/"
+      }
+    ]
+  },
+  "releases": [],
+  "schema_version": 1
+}

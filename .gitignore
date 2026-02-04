@@ -88,6 +88,16 @@ docs/releases/
 # keep placeholder if you use it
 !/docs/latest/.keep
 
+# allow committing GH Pages web bundle + release feed
+!docs/latest/
+docs/latest/*
+!docs/latest/web/
+!docs/latest/web/**
+docs/latest/web/*.bak.*
+!docs/releases/
+docs/releases/*
+!docs/releases/feed.json
+
 ############################
 # Allow committed sample audio (if any)
 ############################

@@ -22,125 +22,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install -U pip
-          pip install -e .
-
-      - name: Build web bundles with tracks (focus / sleep / workout)
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          OUT="${RUNNER_TEMP}/mgc_release"
-          rm -rf "${OUT}"
-          mkdir -p "${OUT}"
-
-          DB="${RUNNER_TEMP}/ci_db.sqlite"
-          cp fixtures/ci_db.sqlite "${DB}"
-
-          # Publish contract stages receipts only from repo-relative candidates.
-          mkdir -p artifacts/run/marketing
-          printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","kind":"ci_placeholder","dry_run":true}' \
-            > artifacts/run/marketing/receipts.jsonl
-
-          echo "RELEASE_OUT=${OUT}" >> "$GITHUB_ENV"
-
-          # Build each context into its own output dir (must include playlist + manifest + tracks)
-          for CTX in focus sleep workout; do
-            CTX_OUT="${OUT}/build_${CTX}"
-            rm -rf "${CTX_OUT}"
-            mkdir -p "${CTX_OUT}"
-
-            MGC_PROVIDER=stub python -m mgc.main \
-              --db "${DB}" \
-              --seed 1 \
-              run autonomous \
-              --context "${CTX}" \
-              --out-dir "${CTX_OUT}" \
-              --deterministic \
-              --contract publish
-
-            test -s "${CTX_OUT}/web/playlist.json"
-            test -s "${CTX_OUT}/web/web_manifest.json"
-            test -d "${CTX_OUT}/web/tracks"
-            test -n "$(find "${CTX_OUT}/web/tracks" -maxdepth 1 -type f | head -n 1)"
-          done
-
-          # Site root we deploy (upload-pages-artifact will upload OUT/web)
-          mkdir -p "${OUT}/web/latest/web"
-
-          # Publish bundles into /latest/web/<ctx>/ (copy contents of each CTX_OUT/web)
-          for CTX in focus sleep workout; do
-            DST="${OUT}/web/latest/web/${CTX}"
-            rm -rf "${DST}"
-            mkdir -p "${DST}"
-            cp -R "${OUT}/build_${CTX}/web/." "${DST}/"
-            test -s "${DST}/playlist.json"
-            test -s "${DST}/web_manifest.json"
-            test -d "${DST}/tracks"
-            test -n "$(find "${DST}/tracks" -maxdepth 1 -type f | head -n 1)"
-          done
-
-          # Generate releases/feed.json from a root containing "latest/..."
-          FEED_ROOT="${OUT}/feed_root"
-          rm -rf "${FEED_ROOT}"
-          mkdir -p "${FEED_ROOT}/latest"
-          cp -R "${OUT}/web/latest/." "${FEED_ROOT}/latest/"
-
-          mkdir -p "${OUT}/web/releases"
-          python scripts/release_feed.py \
-            --root-dir "${FEED_ROOT}" \
-            --out "${OUT}/web/releases/feed.json" \
-            --stable
-
-          python -m json.tool "${OUT}/web/releases/feed.json" >/dev/null
-
-          # Avoid Jekyll edge cases
-          touch "${OUT}/web/.nojekyll"
-
-      - name: Replace Pages index.html with static feed player
+      - name: Sanity check docs site
         shell: bash
         run: |
           set -euxo pipefail
           test -s docs/index.html
-          cp docs/index.html "${RELEASE_OUT}/web/index.html"
-          echo "Deployed title line:"
-          grep -i -m 1 "<title>" "${RELEASE_OUT}/web/index.html" || true
-
-      - name: Sanity check feed + deployed bundle paths
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          FEED="${RELEASE_OUT}/web/releases/feed.json"
-          test -s "${FEED}"
-
-          echo "Feed web contexts:"
-          python3 -c 'import json,sys; o=json.load(open(sys.argv[1],"r",encoding="utf-8")); w=[c for c in o.get("latest",{}).get("contexts",[]) if c.get("kind")=="web"]; print("web contexts:",len(w)); [print(c.get("context"),c.get("url")) for c in w]' "${FEED}"
-
-          for CTX in focus sleep workout; do
-            test -s "${RELEASE_OUT}/web/latest/web/${CTX}/playlist.json"
-            test -s "${RELEASE_OUT}/web/latest/web/${CTX}/web_manifest.json"
-            test -d "${RELEASE_OUT}/web/latest/web/${CTX}/tracks"
-            test -n "$(find "${RELEASE_OUT}/web/latest/web/${CTX}/tracks" -maxdepth 1 -type f | head -n 1)"
-          done
-
-          echo "Sample focus track files:"
-          find "${RELEASE_OUT}/web/latest/web/focus/tracks" -maxdepth 1 -type f | head -n 5
+          test -s docs/releases/feed.json
+          test -d docs/latest/web
+          test -s docs/latest/web/focus/playlist.json
+          test -s docs/latest/web/focus/web_manifest.json
+          test -d docs/latest/web/focus/tracks
+          test -n "$(find docs/latest/web/focus/tracks -maxdepth 1 -type f | head -n 1)"
+          touch docs/.nojekyll
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ${{ env.RELEASE_OUT }}/web
+          path: docs
 
   deploy:
     runs-on: ubuntu-latest
