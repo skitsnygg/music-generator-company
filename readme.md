@@ -136,6 +136,7 @@ Publishing never rebuilds or mutates artifacts.
 - Plans posts and records receipts
 - No live APIs required
 - Receipts staged and auditable
+- File-based publish flow (marketing/publish -> marketing/receipts)
 
 **Web Player**
 - Static HTML + JS
@@ -173,6 +174,18 @@ pip install -U pip
 pip install -e .
 
 No API keys are required for the default stub provider.
+
+### Marketing Publish (Receipts)
+
+Daily/weekly runs emit deterministic post payloads under `marketing/publish/`.  
+Publishing is file-based and writes receipts to `marketing/receipts/`.
+
+Environment toggles:
+- `MGC_PUBLISH_MARKETING=1` (default) — run `publish-marketing` in `scripts/run_daily.sh`
+- `MGC_MARKETING_PLATFORMS="x,tiktok,instagram_reels,youtube_shorts"` — platforms for publish payloads
+
+Manual publish (file mode):
+python -m mgc.main run publish-marketing --bundle-dir <out_dir>/drop_bundle --out-dir <out_dir>
 
 ---
 
