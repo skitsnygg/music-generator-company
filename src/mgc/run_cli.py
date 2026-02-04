@@ -197,6 +197,9 @@ def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
     v = (os.environ.get("MGC_DETERMINISTIC") or os.environ.get("DETERMINISTIC") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def deterministic_now_iso(deterministic: bool) -> str:
     fixed = (os.environ.get("MGC_FIXED_TIME") or "").strip()
@@ -2939,6 +2942,17 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     limit = int(getattr(args, "limit", None) or 50)
     dry_run = bool(getattr(args, "dry_run", False))
 
+    publish_live = bool(getattr(args, "publish_live", False)) or _env_truthy("MGC_PUBLISH_LIVE")
+    if dry_run:
+        publish_live = False
+    if publish_live and deterministic:
+        sys.stdout.write(stable_json_dumps({
+            "ok": False,
+            "mode": "file_or_db",
+            "reason": "deterministic_live_publish_not_allowed",
+        }) + "\n")
+        return 2
+
     filter_run_id = str(getattr(args, "run_id", "") or "").strip() or None
     filter_drop_id = str(getattr(args, "drop_id", "") or "").strip() or None
     filter_schedule = str(getattr(args, "schedule", "") or "").strip() or None
@@ -3050,6 +3064,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
         receipt_paths: List[str] = []
         base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
+        live_errors: List[Dict[str, Any]] = []
+        mp = None
+        if publish_live:
+            from mgc import marketing_publishers as mp  # type: ignore
 
         for d in posts_sorted[:limit]:
             post_id = str(d["post_id"])
@@ -3066,6 +3084,22 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
             publish_id = stable_uuid5("publish", batch_id, post_id, platform)
 
+            live_ok: Optional[bool] = None
+            live_error: Optional[str] = None
+            remote_id: Optional[str] = None
+            if publish_live and mp is not None:
+                try:
+                    res = mp.publish(platform, payload=obj)
+                    if isinstance(res, dict):
+                        remote_id = res.get("remote_id")
+                    live_ok = True
+                except Exception as e:
+                    live_ok = False
+                    live_error = str(e)
+                    live_errors.append({"post_id": post_id, "platform": platform, "error": live_error})
+
+            status = "dry_run" if dry_run else ("ok" if (not publish_live or live_ok) else "error")
+
             item = {
                 "post_id": post_id,
                 "platform": platform,
@@ -3076,6 +3110,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "published_id": publish_id,
                 "published_ts": ts,
                 "dry_run": dry_run,
+                "live": bool(publish_live),
+                "live_ok": live_ok,
+                "live_error": live_error,
+                "remote_id": remote_id,
                 "content": content,
             }
             items.append(item)
@@ -3084,7 +3122,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "receipt_id": stable_uuid5("marketing_receipt", batch_id, post_id, platform),
                 "batch_id": batch_id,
                 "ts": ts,
-                "status": "dry_run" if dry_run else "ok",
+                "status": status,
                 "mode": "file",
                 "post_id": post_id,
                 "platform": platform,
@@ -3095,6 +3133,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 "track_id": track_id,
                 "schedule": schedule,
                 "period_key": period_key,
+                "live": bool(publish_live),
+                "live_ok": live_ok,
+                "live_error": live_error,
+                "remote_id": remote_id,
                 "content": content,
             }
 
@@ -3106,14 +3148,18 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
                 )
             )
 
+        ok = True
+        if publish_live and live_errors:
+            ok = False
         out_obj = {
             "mode": "file",
-            "ok": True,
+            "ok": ok,
             "batch_id": batch_id,
             "ts": ts,
             "count": len(items),
             "limit": limit,
             "dry_run": dry_run,
+            "live": bool(publish_live),
             "filters": {
                 "run_id": filter_run_id,
                 "drop_id": filter_drop_id,
@@ -3123,10 +3169,11 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "items": items,
             "receipts_written": len(receipt_paths),
             "skipped_ids": skipped_ids,
+            "live_errors": live_errors,
         }
 
         sys.stdout.write(stable_json_dumps(out_obj) + "\n")
-        return 0
+        return 0 if ok else 2
 
     # ----------------------------
     # DB MODE (default)
@@ -3172,6 +3219,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
     receipt_paths: List[str] = []
     base_receipts = (out_dir / "marketing" / "receipts") if out_dir else None
+    live_errors: List[Dict[str, Any]] = []
+    mp = None
+    if publish_live:
+        from mgc import marketing_publishers as mp  # type: ignore
 
     def _meta_matches(meta: Dict[str, Any]) -> bool:
         if filter_run_id and str(meta.get("run_id") or "") != filter_run_id:
@@ -3210,7 +3261,30 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
 
         publish_id = stable_uuid5("publish", batch_id, post_id, platform)
 
-        if not dry_run:
+        live_ok: Optional[bool] = None
+        live_error: Optional[str] = None
+        remote_id: Optional[str] = None
+        if publish_live and mp is not None:
+            try:
+                payload_obj: Dict[str, Any]
+                try:
+                    payload_obj = json.loads(content)
+                    if not isinstance(payload_obj, dict):
+                        payload_obj = {"text": content}
+                except Exception:
+                    payload_obj = {"text": content}
+                res = mp.publish(platform, payload=payload_obj)
+                if isinstance(res, dict):
+                    remote_id = res.get("remote_id")
+                live_ok = True
+            except Exception as e:
+                live_ok = False
+                live_error = str(e)
+                live_errors.append({"post_id": post_id, "platform": platform, "error": live_error})
+
+        status = "dry_run" if dry_run else ("ok" if (not publish_live or live_ok) else "error")
+
+        if not dry_run and (not publish_live or live_ok):
             db_marketing_post_set_status(
                 con,
                 post_id=post_id,
@@ -3229,6 +3303,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "published_id": publish_id,
             "published_ts": ts,
             "dry_run": dry_run,
+            "live": bool(publish_live),
+            "live_ok": live_ok,
+            "live_error": live_error,
+            "remote_id": remote_id,
             "content": content,
             "run_id": run_id,
             "drop_id": drop_id,
@@ -3241,7 +3319,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "receipt_id": stable_uuid5("marketing_receipt", batch_id, post_id, platform),
             "batch_id": batch_id,
             "ts": ts,
-            "status": "dry_run" if dry_run else "ok",
+            "status": status,
             "mode": "db",
             "post_id": post_id,
             "platform": platform,
@@ -3250,6 +3328,10 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "drop_id": drop_id,
             "track_id": track_id,
+            "live": bool(publish_live),
+            "live_ok": live_ok,
+            "live_error": live_error,
+            "remote_id": remote_id,
             "content": content,
         }
 
@@ -3288,8 +3370,13 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         },
     )
 
+    ok = True
+    if publish_live and live_errors:
+        ok = False
+
     out_obj = {
         "mode": "db",
+        "ok": ok,
         "batch_id": batch_id,
         "ts": ts,
         "count": len(published),
@@ -3299,6 +3386,8 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
         "drops_updated": drops_updated,
         "items": published,
         "receipts_written": len(receipt_paths),
+        "live": bool(publish_live),
+        "live_errors": live_errors,
         "filters": {
             "run_id": filter_run_id,
             "drop_id": filter_drop_id,
@@ -3308,7 +3397,7 @@ def cmd_publish_marketing(args: argparse.Namespace) -> int:
     }
 
     sys.stdout.write(stable_json_dumps(out_obj) + "\n")
-    return 0
+    return 0 if ok else 2
 
 
 # ---------------------------------------------------------------------------
@@ -6490,6 +6579,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     pub.add_argument("--marketing-dir", default=None, help="Marketing directory containing publish/ (file mode; no DB fallback)")
     pub.add_argument("--bundle-dir", default=None, help="Bundle dir (e.g. <out_dir>/drop_bundle); infers <out_dir>/marketing/publish (file mode; no DB fallback)")
     pub.add_argument("--out-dir", default=None, help="Where to write receipts/artifacts (optional; default evidence dir)")
+    pub.add_argument("--publish-live", action="store_true", help="Send posts to live APIs/webhooks (requires platform credentials)")
     pub.add_argument(
         "--deterministic",
         action="store_true",

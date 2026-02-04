@@ -188,6 +188,14 @@ Manual publish (file mode):
 python -m mgc.main run publish-marketing --bundle-dir <out_dir>/drop_bundle --out-dir <out_dir>
 
 Tip: add `--drop-id <id>` or `--period-key YYYY-MM-DD` to avoid re-publishing older drafts.
+Live publish (optional, requires credentials):
+python -m mgc.main run publish-marketing --bundle-dir <out_dir>/drop_bundle --out-dir <out_dir> --publish-live
+
+Live integration env:
+- `MGC_PUBLISH_LIVE=1` (or pass `--publish-live`)
+- X (Twitter): `MGC_X_API_KEY`, `MGC_X_API_SECRET`, `MGC_X_ACCESS_TOKEN`, `MGC_X_ACCESS_TOKEN_SECRET`
+- Webhook fallback: `MGC_MARKETING_WEBHOOK_URL` or `MGC_MARKETING_WEBHOOK_<PLATFORM>`
+- Webhook media (optional): `MGC_MARKETING_WEBHOOK_INCLUDE_MEDIA=1` to include base64 media payloads
 
 ---
 
