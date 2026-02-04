@@ -61,8 +61,8 @@ def _fetch_tracks(
             f"tracks table missing expected id column. Columns: {cols}"
         )
 
-    # Path column (current)
-    path_col = _pick_first(cols, "artifact_path", "path", "file_path", "filepath")
+    # Path column (current + legacy)
+    path_col = _pick_first(cols, "artifact_path", "path", "file_path", "filepath", "full_path")
     if not path_col:
         raise SystemExit(
             f"tracks table missing expected path column. Columns: {cols}"

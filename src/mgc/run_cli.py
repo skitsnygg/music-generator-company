@@ -351,6 +351,13 @@ def _pick_preferred_audio_source(p: Path) -> Path:
     return p
 
 
+def _resolve_track_source(full_path: str, repo_root: Path) -> Path:
+    p = Path(str(full_path))
+    if not p.is_absolute():
+        p = (repo_root / p).resolve()
+    return _pick_preferred_audio_source(p)
+
+
 def _copy_track_for_bundle(src: str, dst: str) -> None:
     """
     Copy an audio file into a bundle. Be tolerant of extensionless src paths,
@@ -866,6 +873,57 @@ def _agents_marketing_plan(
     plan_path.write_text(json.dumps(out_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return out_obj
+
+
+def _marketing_platforms_from_env() -> List[str]:
+    raw = os.environ.get("MGC_MARKETING_PLATFORMS", "x,tiktok,instagram_reels,youtube_shorts")
+    platforms = [p.strip() for p in raw.split(",") if p.strip()]
+    # Deterministic ordering, de-duped
+    return sorted(dict.fromkeys(platforms))
+
+
+def _emit_marketing_publish_posts(
+    *,
+    out_dir: Path,
+    schedule: str,
+    period_key: str,
+    context: str,
+    run_id: str,
+    drop_id: str,
+    track_id: str,
+    ts: str,
+    title: str,
+    hook: str,
+    cta: str,
+) -> List[str]:
+    marketing_dir = out_dir / "marketing"
+    publish_dir = marketing_dir / "publish"
+    publish_dir.mkdir(parents=True, exist_ok=True)
+
+    post_ids: List[str] = []
+    for platform in _marketing_platforms_from_env():
+        post_id = stable_uuid5("marketing_post", schedule, period_key, str(drop_id), platform)
+        payload = {
+            "schema": "mgc.marketing_post.v1",
+            "version": 1,
+            "post_id": post_id,
+            "status": "planned",
+            "platform": platform,
+            "schedule": schedule,
+            "period_key": period_key,
+            "created_at": ts,
+            "run_id": str(run_id),
+            "drop_id": str(drop_id),
+            "track_id": str(track_id),
+            "title": title,
+            "hook": hook,
+            "cta": cta,
+            "context": context,
+        }
+        (publish_dir / f"{post_id}.json").write_text(stable_json_dumps(payload) + "\n", encoding="utf-8")
+        post_ids.append(post_id)
+
+    return post_ids
 
 
 
@@ -2643,6 +2701,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
+    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+
     now_iso = deterministic_now_iso(deterministic)
     run_date = now_iso.split("T", 1)[0] if "T" in now_iso else now_iso
     period_key = run_date
@@ -2655,7 +2715,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if gen_count > 0:
         _agents_generate_and_ingest(
             db_path=db_path,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            repo_root=repo_root,
             context=context,
             schedule="daily",
             period_key=period_key,
@@ -2689,25 +2749,33 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if not items:
         raise SystemExit("daily playlist builder produced no items")
 
-    # Copy ONLY the lead track into bundle (daily contract is one track)
-    lead = dict(items[0])
-    lead_track_id = str(lead.get("track_id") or "")
-    full_path = lead.get("full_path") or lead.get("artifact_path")
-    db_full = _db_full_path_for_track(str(db_path), lead_track_id)
-    if db_full:
-        full_path = db_full
-    if not lead_track_id or not full_path:
-        raise SystemExit("daily playlist lead item missing track_id/full_path")
+    # Copy ONLY the first available lead track into bundle (daily contract is one track)
+    lead_track_id = ""
+    lead_src: Optional[Path] = None
+    missing: List[str] = []
+    for it in items:
+        track_id = str(it.get("track_id") or "")
+        full_path = it.get("full_path") or it.get("artifact_path") or ""
+        if not track_id:
+            continue
+        if not full_path:
+            full_path = _db_full_path_for_track(str(db_path), track_id)
+        if not full_path:
+            missing.append(f"{track_id}:<missing_path>")
+            continue
+        src_pick = _resolve_track_source(full_path, repo_root)
+        if src_pick.exists():
+            lead_track_id = track_id
+            lead_src = src_pick
+            break
+        missing.append(f"{track_id}:{src_pick}")
 
-    src_path = Path(str(full_path))
-    if not src_path.is_absolute():
-        src_path = Path(getattr(args, "repo_root", ".")).expanduser().resolve() / src_path
-
-    if not src_path.exists():
-        raise SystemExit(f"[run.daily] missing source track file: {src_path}")
+    if not lead_track_id or lead_src is None:
+        hint = ", ".join(missing[:5]) if missing else "<none>"
+        raise SystemExit(f"[run.daily] no usable track files found for context={context}; missing={hint}")
 
     # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
-    src_pick = _pick_preferred_audio_source(src_path)
+    src_pick = _pick_preferred_audio_source(lead_src)
 
     _rel, dst = _bundle_track_to_dir(bundle_dir, lead_track_id, src_pick)
     copied = [{"track_id": lead_track_id, "path": f"tracks/{dst.name}"}]
@@ -2737,6 +2805,20 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     # Pipeline contract: always expose top-level playlist.json as well
     (out_dir / "playlist.json").write_text(playlist_json, encoding="utf-8")
 
+    post_ids = _emit_marketing_publish_posts(
+        out_dir=out_dir,
+        schedule="daily",
+        period_key=period_key,
+        context=context,
+        run_id=str(run_id),
+        drop_id=str(drop_id),
+        track_id=lead_track_id,
+        ts=now_iso,
+        title=f"Daily Drop {period_key} ({context})",
+        hook=f"New {context} daily drop is ready.",
+        cta="Listen now.",
+    )
+
     lead_rel_path = copied[0]["path"]
     daily_ev = {
         "schema": "mgc.daily_evidence.v1",
@@ -2754,6 +2836,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             "track": sha256_file(bundle_dir / lead_rel_path),
         },
         "period": {"label": period_key},
+        "marketing_post_ids": post_ids,
+        "marketing_publish_dir": "marketing/publish",
     }
 
     (evidence_dir / "daily_evidence.json").write_text(json.dumps(daily_ev, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -2761,7 +2845,6 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
 
     # Compute deterministic repo manifest alongside playlist (helps CI provenance)
-    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
     include = getattr(args, "include", None) or None
     exclude_dirs = getattr(args, "exclude_dir", None) or None
     exclude_globs = getattr(args, "exclude_glob", None) or None
@@ -2791,7 +2874,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         marketing_out = Path(getattr(args, "marketing_out_dir", None) or (out_dir / "marketing")).expanduser()
         marketing_obj = _agents_marketing_plan(
             drop_dir=bundle_dir,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            repo_root=repo_root,
             out_dir=marketing_out,
             seed=int(seed),
             teaser_seconds=int(getattr(args, "teaser_seconds", 15) or 15),
@@ -2805,6 +2888,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "drop_id": str(drop_id),
         "lead_track_id": lead_track_id,
         "playlist_tracks": 1,
+        "marketing_post_ids": post_ids,
         "marketing": marketing_obj,
         "paths": {
             "bundle_dir": "drop_bundle",
@@ -2814,6 +2898,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             "drop_evidence": "drop_evidence.json",
             "manifest": "manifest.json",
             "manifest_sha256": manifest_sha256,
+            "marketing_publish_dir": "marketing/publish",
         },
     }
     drop_evidence = _scrub_absolute_paths(drop_evidence, out_dir=out_dir, repo_root=Path.cwd())
@@ -4405,6 +4490,8 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     bundle_tracks_dir.mkdir(parents=True, exist_ok=True)
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
+    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+
     # Determine ISO week label
     now_iso = deterministic_now_iso(deterministic)
     today = (
@@ -4429,7 +4516,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     if gen_count > 0:
         _agents_generate_and_ingest(
             db_path=db_path,
-            repo_root=Path(getattr(args, "repo_root", ".")).expanduser().resolve(),
+            repo_root=repo_root,
             context=context,
             schedule="weekly",
             period_key=period_key,
@@ -4463,32 +4550,36 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     if not items:
         raise SystemExit("weekly playlist builder produced no items")
 
-    # Copy tracks into bundle
+    # Copy tracks into bundle (skip missing files deterministically)
     copied: List[Dict[str, Any]] = []
+    missing: List[str] = []
     for it in items:
-        track_id = str(it.get("track_id"))
-        full_path = it.get("full_path") or it.get("artifact_path")
-        db_full = _db_full_path_for_track(str(db_path), track_id)
-        if db_full:
-            full_path = db_full
+        track_id = str(it.get("track_id") or "")
+        full_path = it.get("full_path") or it.get("artifact_path") or ""
+        if not track_id:
+            continue
         if not full_path:
-            raise SystemExit(f"playlist item missing full_path for track_id={track_id}")
+            full_path = _db_full_path_for_track(str(db_path), track_id)
+        if not full_path:
+            missing.append(f"{track_id}:<missing_path>")
+            continue
 
-        src = Path(str(full_path))
-        # Allow relative paths stored in DB (repo-relative)
-        if not src.is_absolute():
-            src = Path(getattr(args, "repo_root", ".")).expanduser().resolve() / src
-
-        if not src.exists():
-            raise SystemExit(f"[run.weekly] missing source track file: {src}")
+        src_pick = _resolve_track_source(full_path, repo_root)
+        if not src_pick.exists():
+            missing.append(f"{track_id}:{src_pick}")
+            continue
 
         # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
-        src_pick = _pick_preferred_audio_source(src)
+        src_pick = _pick_preferred_audio_source(src_pick)
 
         _rel, dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
         copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
 
-    lead_track_id = str(items[0].get("track_id"))
+    if not copied:
+        hint = ", ".join(missing[:5]) if missing else "<none>"
+        raise SystemExit(f"[run.weekly] no usable track files found for context={context}; missing={hint}")
+
+    lead_track_id = str(copied[0].get("track_id") or "")
 
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
     if deterministic:
@@ -4546,41 +4637,21 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     # Emit planned marketing posts for file-mode publishing (weekly)
     # Writes: <out_dir>/marketing/publish/<post_id>.json
     # ------------------------------------------------------------------
-    marketing_dir = out_dir / "marketing"
-    publish_dir = marketing_dir / "publish"
-    publish_dir.mkdir(parents=True, exist_ok=True)
-
-    platforms_raw = os.environ.get("MGC_MARKETING_PLATFORMS", "x,tiktok,instagram_reels,youtube_shorts")
-    platforms = [p.strip() for p in platforms_raw.split(",") if p.strip()]
-    platforms = sorted(dict.fromkeys(platforms))
-
-    title = f"Weekly Drop {period_key} ({context})"
-    hook = f"New weekly {context} drop is ready."
-    cta = "Listen now."
-
-    for platform in platforms:
-        post_id = stable_uuid5("marketing_post", "weekly", period_key, str(drop_id), platform)
-        payload = {
-            "schema": "mgc.marketing_post.v1",
-            "version": 1,
-            "post_id": post_id,
-            "status": "planned",
-            "platform": platform,
-            "schedule": "weekly",
-            "period_key": period_key,
-            "created_at": now_iso,
-            "run_id": str(run_id),
-            "drop_id": str(drop_id),
-            "track_id": lead_track_id,
-            "title": title,
-            "hook": hook,
-            "cta": cta,
-            "context": context,
-        }
-        (publish_dir / f"{post_id}.json").write_text(stable_json_dumps(payload) + "\n", encoding="utf-8")
+    _emit_marketing_publish_posts(
+        out_dir=out_dir,
+        schedule="weekly",
+        period_key=period_key,
+        context=context,
+        run_id=str(run_id),
+        drop_id=str(drop_id),
+        track_id=lead_track_id,
+        ts=now_iso,
+        title=f"Weekly Drop {period_key} ({context})",
+        hook=f"New weekly {context} drop is ready.",
+        cta="Listen now.",
+    )
 
     # Compute deterministic repo manifest alongside playlist (helps CI provenance)
-    repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
     include = getattr(args, "include", None) or None
     exclude_dirs = getattr(args, "exclude_dir", None) or None
     exclude_globs = getattr(args, "exclude_glob", None) or None

@@ -21,6 +21,7 @@ CONTEXTS=(${MGC_CONTEXTS:-focus workout sleep})
 
 MARKETING="${MGC_MARKETING:-1}"          # 1=on, 0=off
 TEASER_SECONDS="${MGC_TEASER_SECONDS:-15}"
+PUBLISH_MARKETING="${MGC_PUBLISH_MARKETING:-1}"  # 1=on, 0=off (writes marketing receipts)
 
 PUBLISH_LATEST="${MGC_PUBLISH_LATEST:-1}"  # 1=on, 0=off
 
@@ -55,6 +56,7 @@ log "Seed: ${SEED}"
 log "Generate count: ${GENERATE_COUNT}"
 log "Contexts: ${CONTEXTS[*]}"
 log "Marketing: ${MARKETING} (teaser_seconds=${TEASER_SECONDS})"
+log "Publish marketing: ${PUBLISH_MARKETING}"
 log "Publish latest web: ${PUBLISH_LATEST}"
 log "Publish release feed: ${PUBLISH_FEED} (require=${REQUIRE_FEED})"
 "${PY}" -V
@@ -88,6 +90,19 @@ run_one() {
   fi
 
   "${PY}" "${args[@]}"
+
+  if [[ "${PUBLISH_MARKETING}" == "1" ]]; then
+    pub_args=(
+      -m mgc.main
+      run publish-marketing
+      --bundle-dir "${out_dir}/drop_bundle"
+      --out-dir "${out_dir}"
+    )
+    if [[ "${MGC_DETERMINISTIC:-}" == "1" ]]; then
+      pub_args+=( --deterministic )
+    fi
+    "${PY}" "${pub_args[@]}"
+  fi
 
   if [[ "${PUBLISH_LATEST}" == "1" ]]; then
     "${ROOT}/scripts/publish_latest.sh" --context "${ctx}" --src-out-dir "${out_dir}" --db "${DB_PATH}"
