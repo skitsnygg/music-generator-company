@@ -117,6 +117,7 @@ def _fetch_tracks(
     mood: str | None = None,
     context: str | None = None,
     genre: str | None = None,
+    provider: str | None = None,
     bpm_min: int | None = None,
     bpm_max: int | None = None,
     limit: int = 400,
@@ -136,6 +137,7 @@ def _fetch_tracks(
         mood = context
     mood = (mood or "").strip()
     genre = (genre or "").strip()
+    provider = (provider or "").strip()
 
     cur = conn.execute("PRAGMA table_info(tracks)")
     cols = {row[1] for row in cur.fetchall()}
@@ -185,6 +187,10 @@ def _fetch_tracks(
     if have("genre") and genre:
         where.append("genre = ?")
         params.append(genre)
+
+    if have("provider") and provider:
+        where.append("provider = ?")
+        params.append(provider)
 
     if have("bpm") and bpm_min is not None:
         where.append("bpm >= ?")
@@ -402,6 +408,7 @@ def _build_playlist_from_conn(
     context: Optional[str],
     mood: Optional[str],
     genre: Optional[str],
+    provider: Optional[str],
     target_minutes: int,
     bpm_window: Optional[Tuple[int, int]],
     base_seed: int,
@@ -422,6 +429,7 @@ def _build_playlist_from_conn(
         conn,
         mood=mood,
         genre=genre,
+        provider=provider,
         bpm_min=bpm_min,
         bpm_max=bpm_max,
         limit=400,
@@ -504,6 +512,7 @@ def _build_playlist_from_conn(
         "context": context,
         "mood": mood,
         "genre": genre,
+        "provider": provider or None,
         "bpm_window": list(bpm_window) if bpm_window else None,
         "target_minutes": int(target_minutes),
         "base_seed": int(base_seed),
@@ -547,6 +556,7 @@ def build_playlist(
     context: Optional[str] = None,
     mood: Optional[str] = None,
     genre: Optional[str] = None,
+    provider: Optional[str] = None,
     target_minutes: int | None = 20,
     bpm_window: Optional[Tuple[int, int]] = None,
     base_seed: int = 1,
@@ -574,6 +584,7 @@ def build_playlist(
             context=context,
             mood=mood,
             genre=genre,
+            provider=provider,
             target_minutes=int(target_minutes),
             bpm_window=bpm_window,
             base_seed=int(base_seed),
@@ -604,6 +615,7 @@ def build_daily_playlist(
     base_seed: int = 1,
     target_minutes: int | None = 20,
     lookback_playlists: int | None = 3,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a daily playlist (thin wrapper around build_playlist)."""
     name = "Daily Playlist"
@@ -613,6 +625,7 @@ def build_daily_playlist(
         name=name,
         slug=slug,
         context=context,
+        provider=provider,
         target_minutes=target_minutes,
         base_seed=base_seed,
         period_key=period_key,
@@ -628,6 +641,7 @@ def build_weekly_playlist(
     base_seed: int = 1,
     target_minutes: int | None = 60,
     lookback_playlists: int | None = 3,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a weekly playlist (thin wrapper around build_playlist)."""
     name = "Weekly Playlist"
@@ -637,6 +651,7 @@ def build_weekly_playlist(
         name=name,
         slug=slug,
         context=context,
+        provider=provider,
         target_minutes=target_minutes,
         base_seed=base_seed,
         period_key=period_key,
@@ -657,6 +672,7 @@ def build_weekly(
     deterministic: bool,
     target_minutes: int = 60,
     lookback_playlists: int = 3,
+    provider: Optional[str] = None,
 ) -> WeeklyResult:
     """Typed weekly builder (DB-only)."""
     conn = _connect(db_path)
@@ -668,6 +684,7 @@ def build_weekly(
             context=context,
             mood=None,
             genre=None,
+            provider=provider,
             target_minutes=int(target_minutes),
             bpm_window=None,
             base_seed=int(seed),
@@ -694,6 +711,7 @@ def build_daily(
     deterministic: bool,
     target_minutes: int = 20,
     lookback_playlists: int = 3,
+    provider: Optional[str] = None,
 ) -> DailyResult:
     """Typed daily builder (DB-only)."""
     conn = _connect(db_path)
@@ -705,6 +723,7 @@ def build_daily(
             context=context,
             mood=None,
             genre=None,
+            provider=provider,
             target_minutes=int(target_minutes),
             bpm_window=None,
             base_seed=int(seed),

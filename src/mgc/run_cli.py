@@ -1892,6 +1892,13 @@ def db_insert_track(
     if not cols:
         raise sqlite3.OperationalError("table tracks does not exist")
 
+    if "provider" not in cols:
+        try:
+            con.execute("ALTER TABLE tracks ADD COLUMN provider TEXT")
+            cols = db_table_columns(con, "tracks")
+        except Exception:
+            pass
+
     ts_col = _pick_first_existing(cols, ["ts", "created_at", "created_ts", "created", "created_on"])
 
     # Canonical schema uses full_path; other schemas vary.
@@ -2899,6 +2906,12 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if lookback_playlists is None:
         lookback_playlists = int(os.environ.get("MGC_DAILY_LOOKBACK_PLAYLISTS") or "7")
 
+    playlist_provider = (os.environ.get("MGC_DAILY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
+    if not playlist_provider:
+        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "").strip()
+    if playlist_provider.lower() in ("", "any", "all", "*"):
+        playlist_provider = ""
+
     pl = build_daily_playlist(
         db_path=Path(db_path),
         context=context,
@@ -2906,42 +2919,46 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         base_seed=int(seed),
         target_minutes=int(target_minutes),
         lookback_playlists=int(lookback_playlists),
+        provider=(playlist_provider or None),
     )
 
     items = pl.get("items") if isinstance(pl, dict) else None
     if not items:
         raise SystemExit("daily playlist builder produced no items")
 
-    # Copy ONLY the first available lead track into bundle (daily contract is one track)
-    lead_track_id = ""
-    lead_src: Optional[Path] = None
+    # Copy available tracks into bundle (daily playlist can be multi-track)
+    copied: List[Dict[str, str]] = []
     missing: List[str] = []
+    seen: set[str] = set()
+
     for it in items:
         track_id = str(it.get("track_id") or "")
-        full_path = it.get("full_path") or it.get("artifact_path") or ""
-        if not track_id:
+        if not track_id or track_id in seen:
             continue
+        seen.add(track_id)
+
+        full_path = it.get("full_path") or it.get("artifact_path") or ""
         if not full_path:
             full_path = _db_full_path_for_track(str(db_path), track_id)
         if not full_path:
             missing.append(f"{track_id}:<missing_path>")
             continue
-        src_pick = _resolve_track_source(full_path, repo_root)
-        if src_pick.exists():
-            lead_track_id = track_id
-            lead_src = src_pick
-            break
-        missing.append(f"{track_id}:{src_pick}")
 
-    if not lead_track_id or lead_src is None:
+        src_pick = _resolve_track_source(full_path, repo_root)
+        if not src_pick.exists():
+            missing.append(f"{track_id}:{src_pick}")
+            continue
+
+        # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
+        src_pick = _pick_preferred_audio_source(src_pick)
+        _rel, dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
+        copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
+
+    if not copied:
         hint = ", ".join(missing[:5]) if missing else "<none>"
         raise SystemExit(f"[run.daily] no usable track files found for context={context}; missing={hint}")
 
-    # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
-    src_pick = _pick_preferred_audio_source(lead_src)
-
-    _rel, dst = _bundle_track_to_dir(bundle_dir, lead_track_id, src_pick)
-    copied = [{"track_id": lead_track_id, "path": f"tracks/{dst.name}"}]
+    lead_track_id = str(copied[0].get("track_id") or "")
 
     ns = uuid.UUID("00000000-0000-0000-0000-000000000000")
     if deterministic:
@@ -3062,7 +3079,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "period_key": period_key,
         "drop_id": str(drop_id),
         "lead_track_id": lead_track_id,
-        "playlist_tracks": 1,
+        "playlist_tracks": int(len(copied)),
         "marketing_post_ids": post_ids,
         "marketing": marketing_obj,
         "paths": {
@@ -4646,36 +4663,74 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
         if {"id", "created_at", "title", "mood", "genre", "bpm", "duration_sec", "full_path", "preview_path", "status"}.issubset(
             cols_set
         ):
+            if "provider" not in cols_set:
+                try:
+                    con.execute("ALTER TABLE tracks ADD COLUMN provider TEXT")
+                    cols_set.add("provider")
+                except Exception:
+                    pass
             # UPSERT into the main schema used by pipeline/web
             status = "ready"
-            con.execute(
-                """
-                INSERT INTO tracks (id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  created_at=excluded.created_at,
-                  title=excluded.title,
-                  mood=excluded.mood,
-                  genre=excluded.genre,
-                  bpm=excluded.bpm,
-                  duration_sec=excluded.duration_sec,
-                  full_path=excluded.full_path,
-                  preview_path=excluded.preview_path,
-                  status=excluded.status
-                """,
-                (
-                    str(track_id),
-                    str(now_iso),
-                    str(title),
-                    str(mood),
-                    str(genre),
-                    int(bpm),
-                    float(duration_sec),
-                    str(artifact_rel),
-                    str(preview_rel),
-                    str(status),
-                ),
-            )
+            if "provider" in cols_set:
+                con.execute(
+                    """
+                    INSERT INTO tracks (id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      created_at=excluded.created_at,
+                      title=excluded.title,
+                      mood=excluded.mood,
+                      genre=excluded.genre,
+                      bpm=excluded.bpm,
+                      duration_sec=excluded.duration_sec,
+                      full_path=excluded.full_path,
+                      preview_path=excluded.preview_path,
+                      status=excluded.status,
+                      provider=excluded.provider
+                    """,
+                    (
+                        str(track_id),
+                        str(now_iso),
+                        str(title),
+                        str(mood),
+                        str(genre),
+                        int(bpm),
+                        float(duration_sec),
+                        str(artifact_rel),
+                        str(preview_rel),
+                        str(status),
+                        str(getattr(track, "provider", provider_name)),
+                    ),
+                )
+            else:
+                con.execute(
+                    """
+                    INSERT INTO tracks (id, created_at, title, mood, genre, bpm, duration_sec, full_path, preview_path, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      created_at=excluded.created_at,
+                      title=excluded.title,
+                      mood=excluded.mood,
+                      genre=excluded.genre,
+                      bpm=excluded.bpm,
+                      duration_sec=excluded.duration_sec,
+                      full_path=excluded.full_path,
+                      preview_path=excluded.preview_path,
+                      status=excluded.status
+                    """,
+                    (
+                        str(track_id),
+                        str(now_iso),
+                        str(title),
+                        str(mood),
+                        str(genre),
+                        int(bpm),
+                        float(duration_sec),
+                        str(artifact_rel),
+                        str(preview_rel),
+                        str(status),
+                    ),
+                )
         else:
             # Fallback to your minimal schema helpers (older/alternate DBs)
             ensure_tables_minimal(con)
@@ -4804,6 +4859,12 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     if lookback_playlists is None:
         lookback_playlists = int(os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3")
 
+    playlist_provider = (os.environ.get("MGC_WEEKLY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
+    if not playlist_provider:
+        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "").strip()
+    if playlist_provider.lower() in ("", "any", "all", "*"):
+        playlist_provider = ""
+
     pl = build_weekly_playlist(
         db_path=Path(db_path),
         context=context,
@@ -4811,6 +4872,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         base_seed=int(seed),
         target_minutes=int(target_minutes),
         lookback_playlists=int(lookback_playlists),
+        provider=(playlist_provider or None),
     )
 
     items = pl.get("items") if isinstance(pl, dict) else None

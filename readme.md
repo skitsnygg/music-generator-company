@@ -132,6 +132,7 @@ Publishing never rebuilds or mutates artifacts.
 **Playlist Builder**
 - Deterministic selection and ordering
 - Stable playlist JSON
+- Optional provider filter via `MGC_PLAYLIST_PROVIDER` (e.g. riffusion)
 
 **Marketing System**
 - Plans posts and records receipts
