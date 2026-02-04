@@ -89,19 +89,35 @@ run_one() {
     args+=( --marketing --teaser-seconds "${TEASER_SECONDS}" )
   fi
 
-  "${PY}" "${args[@]}"
+  daily_json="$("${PY}" "${args[@]}")"
+  printf "%s\n" "${daily_json}"
 
   if [[ "${PUBLISH_MARKETING}" == "1" ]]; then
-    pub_args=(
-      -m mgc.main
-      run publish-marketing
-      --bundle-dir "${out_dir}/drop_bundle"
-      --out-dir "${out_dir}"
-    )
-    if [[ "${MGC_DETERMINISTIC:-}" == "1" ]]; then
-      pub_args+=( --deterministic )
+    drop_id="$("${PY}" - <<'PY'
+import json, sys
+try:
+    obj = json.loads(sys.stdin.read() or "{}")
+    print(obj.get("drop_id", ""))
+except Exception:
+    print("")
+PY
+<<<"${daily_json}")"
+
+    if [[ -z "${drop_id}" ]]; then
+      log "WARN: drop_id missing from daily JSON; skipping publish-marketing to avoid replay"
+    else
+      pub_args=(
+        -m mgc.main
+        run publish-marketing
+        --bundle-dir "${out_dir}/drop_bundle"
+        --out-dir "${out_dir}"
+        --drop-id "${drop_id}"
+      )
+      if [[ "${MGC_DETERMINISTIC:-}" == "1" ]]; then
+        pub_args+=( --deterministic )
+      fi
+      "${PY}" "${pub_args[@]}"
     fi
-    "${PY}" "${pub_args[@]}"
   fi
 
   if [[ "${PUBLISH_LATEST}" == "1" ]]; then

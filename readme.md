@@ -187,6 +187,8 @@ Environment toggles:
 Manual publish (file mode):
 python -m mgc.main run publish-marketing --bundle-dir <out_dir>/drop_bundle --out-dir <out_dir>
 
+Tip: add `--drop-id <id>` or `--period-key YYYY-MM-DD` to avoid re-publishing older drafts.
+
 ---
 
 ## End-to-End Demo (One Command)
