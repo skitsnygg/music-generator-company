@@ -2004,7 +2004,31 @@ def db_insert_track(
     # Optional fields
     # ----------------------------
     if bpm_col:
-        data[bpm_col] = _stable_int_from_key(f"{track_id}|{title}|{provider}|{bpm_col}", 60, 140)
+        bpm_val: Optional[int] = None
+        try:
+            for key in ("bpm", "tempo"):
+                raw = meta.get(key)
+                if raw is None:
+                    continue
+                bpm_val = int(float(raw))
+                if bpm_val > 0:
+                    break
+        except Exception:
+            bpm_val = None
+
+        if not bpm_val or bpm_val <= 0:
+            try:
+                ctx = str(meta.get("context") or mood or "").strip().lower()
+                if ctx:
+                    spec = get_context_spec(ctx)
+                    bpm_val = int(spec.bpm_max)
+            except Exception:
+                bpm_val = None
+
+        if not bpm_val or bpm_val <= 0:
+            bpm_val = _stable_int_from_key(f"{track_id}|{title}|{provider}|{bpm_col}", 60, 140)
+
+        data[bpm_col] = int(bpm_val)
 
     _insert_row(con, "tracks", data)
 
