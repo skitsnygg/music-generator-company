@@ -1,30 +1,31 @@
-name: scheduled_drops_ci
+name: scheduled_drops_prod
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-  pull_request:
   schedule:
-    - cron: "0 6 * * *"
+    # 09:00 UTC daily
+    - cron: "0 9 * * *"
 
 jobs:
-  scheduled_drops_ci:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  scheduled_drops_prod:
+    runs-on: self-hosted
+    timeout-minutes: 120
 
     env:
       PYTHONUNBUFFERED: "1"
       MGC_NO_COLOR: "1"
 
-      # CI must never assume repo-stored audio exists.
-      # Use stub so it’s deterministic and self-contained.
-      MGC_PROVIDER: "stub"
+      # Absolute prod paths on the runner
+      MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-      # Keep any accidental outputs away from the repo checkout
-      MGC_ARTIFACTS_DIR: "/tmp/mgc_ci_artifacts"
-      MGC_EVIDENCE_DIR: "/tmp/mgc_ci_evidence"
-      MGC_TRACKS_DIR: "/tmp/mgc_ci_tracks"
+      # Provider selection via Actions variables
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
+      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL }}"
+
+      # Force all temp output off the repo checkout
+      MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
+      MGC_EVIDENCE_DIR: "/tmp/mgc_prod_evidence"
+      MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
 
     steps:
       - name: Checkout
@@ -39,47 +40,97 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Run autonomous (self-contained) and build web
+      - name: Validate environment (fail fast)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
+          echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
+
+          if [ -z "${MGC_PROVIDER:-}" ]; then
+            echo "ERROR: MGC_PROVIDER is empty"
+            exit 2
+          fi
+
+          # Prod must always use the system DB
+          test -s /var/lib/mgc/db.sqlite
+
+          if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
+            if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
+              echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
+              exit 2
+            fi
+          fi
+
+      - name: Run scheduled weekly drop (prod)
+        id: run_weekly
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
 
-          OUT="/tmp/mgc_ci_autonomous"
-          WEB_OUT="/tmp/mgc_ci_web"
-
-          rm -rf "$OUT" "$WEB_OUT" /tmp/mgc_ci_artifacts /tmp/mgc_ci_evidence /tmp/mgc_ci_tracks
+          # Keep repo clean / avoid writing into checkout
           rm -rf data/evidence tracks || true
-          mkdir -p /tmp/mgc_ci_artifacts /tmp/mgc_ci_evidence /tmp/mgc_ci_tracks
+
+          rm -rf /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+          mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          # ISO week key: YYYY-Www (this is what mgc expects for weekly)
+          PERIOD_KEY="$(date -u +%G-W%V)"
+
+          CONTEXT="focus"
+          mkdir -p "${MGC_PROD_RELEASES}/${DATE_UTC}"
+          OUT="${MGC_PROD_RELEASES}/${DATE_UTC}/${CONTEXT}"
+
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          echo "DATE_UTC=$DATE_UTC"
+          echo "PERIOD_KEY=$PERIOD_KEY"
+          echo "OUT=$OUT"
 
           python -m mgc.main \
-            --db fixtures/ci_db.sqlite \
+            --db /var/lib/mgc/db.sqlite \
             --seed 1 \
             --no-resume \
-            run autonomous \
-              --context focus \
+            run weekly \
+              --context "$CONTEXT" \
+              --period-key "$PERIOD_KEY" \
               --out-dir "$OUT" \
               --deterministic \
-              --with-web
+              --submission
 
-          test -s "$OUT/drop_bundle/playlist.json"
+          # Minimal sanity checks
+          test -s "$OUT/playlist.json" || test -s "$OUT/drop_bundle/playlist.json"
+          test -s "$OUT/web/web_manifest.json" || test -s "$OUT/web_manifest.json"
 
-          # Assert playlist track files exist inside OUT
-          python scripts/check_playlist_tracks.py "$OUT/drop_bundle/playlist.json" "$OUT"
+          echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
+          echo "period_key=${PERIOD_KEY}" >> "$GITHUB_OUTPUT"
+          echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
+          echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
 
-          # Build a separate web bundle (CI sanity)
-          python -m mgc.main web build \
-            --playlist "$OUT/drop_bundle/playlist.json" \
-            --out-dir "$WEB_OUT" \
-            --prefer-mp3 \
-            --clean \
-            --fail-if-empty \
-            --json
+      - name: Update latest symlinks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="${{ steps.run_weekly.outputs.out_dir }}"
 
-          python -m mgc.main web validate --out-dir "$WEB_OUT"
+          mkdir -p "${MGC_PROD_RELEASES}"
 
-          # Sanity: web bundle must contain audio
-          test "$(find "$WEB_OUT" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
+          ln -sfn "$OUT" "${MGC_PROD_RELEASES}/latest_release"
+          if [ -d "$OUT/web" ]; then
+            ln -sfn "$OUT/web" "${MGC_PROD_RELEASES}/latest_web"
+            test -s "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
+          else
+            # fallback if web dir is directly at OUT
+            ln -sfn "$OUT" "${MGC_PROD_RELEASES}/latest_web"
+            test -s "${MGC_PROD_RELEASES}/latest_web/web_manifest.json"
+          fi
+
+          echo "latest_release -> $(readlink -f "${MGC_PROD_RELEASES}/latest_release")"
+          echo "latest_web     -> $(readlink -f "${MGC_PROD_RELEASES}/latest_web")"
 
       - name: Repo must remain clean
         shell: bash
