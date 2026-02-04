@@ -127,7 +127,7 @@ Publishing never rebuilds or mutates artifacts.
 **Music Generation**
 - Stub provider (default, deterministic)
 - Optional Riffusion provider (local service)
-- Suno + DiffSinger providers (scaffolded; require API key/model config)
+- Suno (scaffolded) + DiffSinger provider (HTTP or local command wrapper)
 
 **Playlist Builder**
 - Deterministic selection and ordering
