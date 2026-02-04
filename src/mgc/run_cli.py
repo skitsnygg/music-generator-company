@@ -2150,7 +2150,7 @@ def db_insert_marketing_post(
             track_id = content.get("track_id") or content.get("trackId")
 
     if not track_id:
-        print(
+        eprint(
             "[db_insert_marketing_post] missing referenced track; skipping insert: "
             f"post_id={post_id}"
         )
@@ -2191,14 +2191,14 @@ def db_insert_marketing_post(
 
     except sqlite3.IntegrityError as e:
         # FK / NOT NULL issues only (duplicate PK no longer errors)
-        print(
+        eprint(
             "[db_insert_marketing_post] integrity error; skipping insert: "
             f"post_id={post_id} track_id={track_id} err={e}"
         )
         return False
 
     except Exception as e:
-        print(
+        eprint(
             "[db_insert_marketing_post] insert failed; skipping insert: "
             f"post_id={post_id} track_id={track_id} err={e}"
         )
