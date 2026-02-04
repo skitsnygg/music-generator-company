@@ -291,8 +291,18 @@ export MGC_DIFFSINGER_OUTPUT_FORMAT=wav
 Tip: auto-point to the newest DiffSinger output pool:
 
 source scripts/diffsinger_env.sh /Users/admin/ai/DiffSinger/checkpoints/lj_ds_beta6_1213
- 
+
 This helper also sets MGC_PLAYLIST_PROVIDER=any so daily/weekly playlists can mix providers.
+
+---
+
+## Scheduling
+
+Scheduled drops are implemented via GitHub Actions workflows that run on a **self-hosted** runner
+(see `.github/workflows/scheduled_drops*.yml`). These jobs only run if the self-hosted runner is online.
+
+If you prefer not to run a self-hosted runner, you can replace this with a cron job that calls
+`scripts/run_daily.sh` / `scripts/run_weekly.sh` on an always-on machine.
 
 ---
 
