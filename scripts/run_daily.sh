@@ -22,6 +22,7 @@ CONTEXTS=(${MGC_CONTEXTS:-focus workout sleep})
 MARKETING="${MGC_MARKETING:-1}"          # 1=on, 0=off
 TEASER_SECONDS="${MGC_TEASER_SECONDS:-15}"
 PUBLISH_MARKETING="${MGC_PUBLISH_MARKETING:-1}"  # 1=on, 0=off (writes marketing receipts)
+PUBLISH_MARKETING_STRICT="${MGC_PUBLISH_MARKETING_STRICT:-0}"  # 1=fail on publish-marketing errors
 
 PUBLISH_LATEST="${MGC_PUBLISH_LATEST:-1}"  # 1=on, 0=off
 
@@ -110,7 +111,14 @@ print(json.loads(data).get("drop_id",""))' <<<"${daily_json}")"
       if [[ "${MGC_DETERMINISTIC:-}" == "1" ]]; then
         pub_args+=( --deterministic )
       fi
-      "${PY}" "${pub_args[@]}"
+      if "${PY}" "${pub_args[@]}"; then
+        : # ok
+      else
+        if [[ "${PUBLISH_MARKETING_STRICT}" == "1" ]]; then
+          die "publish-marketing failed"
+        fi
+        log "WARN: publish-marketing failed (continuing)"
+      fi
     fi
   fi
 
