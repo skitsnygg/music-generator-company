@@ -319,6 +319,20 @@ _SUPPORTED_PROVIDERS: Dict[str, Dict[str, Any]] = {
             "Prefer .wav if any exist; otherwise uses any supported audio file.",
         ],
     },
+    "diffsinger": {
+        "desc": "DiffSinger provider (HTTP endpoint or local command wrapper).",
+        "env": [
+            "MGC_DIFFSINGER_ENDPOINT",
+            "MGC_DIFFSINGER_CMD",
+            "MGC_DIFFSINGER_MODEL_DIR",
+            "MGC_DIFFSINGER_VOICE",
+            "MGC_DIFFSINGER_OUTPUT_FORMAT",
+        ],
+        "notes": [
+            "Set endpoint for HTTP mode or cmd for local wrapper mode.",
+            "Local wrapper can point at scripts/diffsinger_local.py (uses MGC_DIFFSINGER_SAMPLE_DIR).",
+        ],
+    },
 }
 
 _AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff")

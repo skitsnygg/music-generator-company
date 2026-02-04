@@ -133,7 +133,11 @@ class RiffusionAdapter:
         mood = spec.mood
         genre = spec.genre
 
-        server_url = _normalize_url(_env_str("MGC_RIFFUSION_URL", "http://127.0.0.1:3013/run_inference/"))
+        server_url = _normalize_url(
+            _env_str("MGC_RIFFUSION_URL")
+            or _env_str("RIFFUSION_URL")
+            or "http://127.0.0.1:3013/run_inference/"
+        )
         prov = RiffusionProvider(server_url=server_url)
 
         prompt = req.prompt or spec.prompt

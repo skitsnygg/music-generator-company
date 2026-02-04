@@ -277,7 +277,22 @@ export MGC_PROVIDER=stub
 Requires a local inference server.
 
 export MGC_PROVIDER=riffusion  
-export RIFFUSION_URL=http://127.0.0.1:3013/run_inference
+export MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference
+
+**Optional: DiffSinger**  
+Use a local command wrapper or an HTTP endpoint.
+
+export MGC_PROVIDER=diffsinger  
+export MGC_DIFFSINGER_CMD="python3 scripts/diffsinger_local.py"  
+export MGC_DIFFSINGER_SAMPLE_DIR=/path/to/diffsinger/generated/wavs  
+export MGC_DIFFSINGER_OUTPUT_FORMAT=wav  
+# or: export MGC_DIFFSINGER_ENDPOINT=http://127.0.0.1:8000/generate
+
+Tip: auto-point to the newest DiffSinger output pool:
+
+source scripts/diffsinger_env.sh /Users/admin/ai/DiffSinger/checkpoints/lj_ds_beta6_1213
+ 
+This helper also sets MGC_PLAYLIST_PROVIDER=any so daily/weekly playlists can mix providers.
 
 ---
 
