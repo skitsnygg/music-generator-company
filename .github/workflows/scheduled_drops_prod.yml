@@ -19,8 +19,8 @@ jobs:
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
       # Provider selection via Actions variables
-      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
-      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL }}"
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER || 'riffusion' }}"
+      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
