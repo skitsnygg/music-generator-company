@@ -106,16 +106,12 @@ done
 
 # Update the internal release feed (served by nginx under /releases/feed.json)
 if [[ "${PUBLISH_LATEST}" == "1" && "${PUBLISH_FEED}" == "1" ]]; then
-  if [[ -d "/var/lib/mgc/releases" ]]; then
-    log "Updating release feed..."
-    if ! "${ROOT}/scripts/publish_release_feed.sh"; then
-      if [[ "${REQUIRE_FEED}" == "1" ]]; then
-        die "publish_release_feed failed"
-      fi
-      log "WARN: publish_release_feed failed (continuing)"
+  log "Updating release feed..."
+  if ! "${ROOT}/scripts/publish_release_feed.sh"; then
+    if [[ "${REQUIRE_FEED}" == "1" ]]; then
+      die "publish_release_feed failed"
     fi
-  else
-    log "NOTE: /var/lib/mgc/releases not present; skipping feed update"
+    log "WARN: publish_release_feed failed (continuing)"
   fi
 fi
 
