@@ -282,6 +282,14 @@ If riffusion is selected but unreachable, allow auto-fallback to stub:
 
 MGC_PROVIDER=riffusion MGC_DEMO_FALLBACK_TO_STUB=1 scripts/demo_smoke.sh
 
+**Demo reset (clean + smoke + web health):**
+
+scripts/demo_reset.sh
+
+Reset the local demo DB too:
+
+MGC_DEMO_RESET_DB=1 scripts/demo_reset.sh
+
 **Web health (feed + web bundle integrity):**
 
 scripts/web_health.sh
