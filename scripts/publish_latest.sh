@@ -27,8 +27,7 @@ DB_PATH="data/db.sqlite"
 
 WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
 WEB_BUILD_ARGS="${MGC_WEB_BUILD_ARGS:-}"
-MARKETING_MEDIA_SRC=""
-MARKETING_MEDIA_COPIED="0"
+MARKETING_ASSET_COPIED="0"
 
 die() { echo "[publish_latest] ERROR: $*" >&2; exit 2; }
 log() { echo "[publish_latest] $*"; }
@@ -99,12 +98,39 @@ if [[ $RC -ne 0 ]]; then
   die "web build failed (rc=${RC}). Re-run without redirect to see error."
 fi
 
-# Optional: copy marketing media into the web bundle (for public video_url)
-MARKETING_MEDIA_SRC="${SRC_OUT_DIR}/marketing/media"
-if [[ -d "${MARKETING_MEDIA_SRC}" ]]; then
+# Optional: copy marketing assets into the web bundle (for previews/links)
+MARKETING_DIR="${SRC_OUT_DIR}/marketing"
+if [[ -d "${MARKETING_DIR}" ]]; then
   mkdir -p "${TMP_DIR}/marketing"
-  cp -a "${MARKETING_MEDIA_SRC}" "${TMP_DIR}/marketing/"
-  MARKETING_MEDIA_COPIED="1"
+
+  copy_marketing_file() {
+    local src="$1"
+    local dst="$2"
+    if [[ -f "${src}" ]]; then
+      mkdir -p "$(dirname "${dst}")"
+      cp -a "${src}" "${dst}"
+      MARKETING_ASSET_COPIED="1"
+    fi
+  }
+
+  copy_marketing_file "${MARKETING_DIR}/marketing_plan.json" "${TMP_DIR}/marketing/marketing_plan.json"
+  copy_marketing_file "${MARKETING_DIR}/summary.txt" "${TMP_DIR}/marketing/summary.txt"
+  copy_marketing_file "${MARKETING_DIR}/hashtags.txt" "${TMP_DIR}/marketing/hashtags.txt"
+  copy_marketing_file "${MARKETING_DIR}/teaser.wav" "${TMP_DIR}/marketing/teaser.wav"
+  copy_marketing_file "${MARKETING_DIR}/cover.png" "${TMP_DIR}/marketing/cover.png"
+  copy_marketing_file "${MARKETING_DIR}/cover.svg" "${TMP_DIR}/marketing/cover.svg"
+
+  shopt -s nullglob
+  for f in "${MARKETING_DIR}"/post_*.txt; do
+    cp -a "${f}" "${TMP_DIR}/marketing/"
+    MARKETING_ASSET_COPIED="1"
+  done
+  shopt -u nullglob
+
+  if [[ -d "${MARKETING_DIR}/media" ]]; then
+    cp -a "${MARKETING_DIR}/media" "${TMP_DIR}/marketing/"
+    MARKETING_ASSET_COPIED="1"
+  fi
 fi
 
 update_manifest_tree() {
@@ -146,8 +172,8 @@ print(tree_hash)
 PY
 }
 
-if [[ "${MARKETING_MEDIA_COPIED}" == "1" ]]; then
-  log "updating web_manifest.json tree hash after marketing media copy"
+if [[ "${MARKETING_ASSET_COPIED}" == "1" ]]; then
+  log "updating web_manifest.json tree hash after marketing asset copy"
   update_manifest_tree "${TMP_DIR}" "${TMP_DIR}/web_manifest.json" >/dev/null
 fi
 

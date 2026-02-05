@@ -650,6 +650,8 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       width: 86px;
       height: 86px;
       border-radius: 16px;
+      position: relative;
+      overflow: hidden;
       background:
         radial-gradient(60px 60px at 30% 30%, rgba(124,92,255,0.55), transparent 60%),
         radial-gradient(70px 70px at 70% 60%, rgba(53,214,199,0.45), transparent 62%),
@@ -658,6 +660,13 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       box-shadow: var(--shadow);
       flex: 0 0 auto;
     }
+    .cover img{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: none;
+    }
+    .cover.hasImage img{ display: block; }
     .now h2{
       margin:0;
       font-size: 16px;
@@ -860,7 +869,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
 
         <div class="cardBody">
           <div class="now">
-            <div class="cover" id="cover"></div>
+            <div class="cover" id="cover"><img id="coverImg" alt="Cover art"></div>
             <div style="min-width:0;">
               <h2 id="trackTitle">—</h2>
               <div class="muted" id="trackSub" style="margin-top:6px;">—</div>
@@ -981,6 +990,14 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
                 <div class="inspectValue mono" id="inspectMarketingHashtags">—</div>
                 <div class="inspectActions">
                   <button class="btn small" data-copy="marketing_hashtags" data-label="Hashtags">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Marketing cover URL</div>
+                <div class="inspectValue mono" id="inspectMarketingCover">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="marketing_cover_url" data-label="Marketing cover URL">Copy</button>
                 </div>
               </div>
 
@@ -1392,6 +1409,19 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       el.title = (display !== raw) ? raw : "";
     }
 
+    function setCoverImage(url){
+      const cover = $("cover");
+      const img = $("coverImg");
+      if (!cover || !img) return;
+      if (url){
+        cover.classList.add("hasImage");
+        img.src = url;
+      }else{
+        cover.classList.remove("hasImage");
+        img.removeAttribute("src");
+      }
+    }
+
     function setInspector(state){
       const cur = state.current || null;
       const pl = cur ? findPlaylistByName(state, cur.playlist_context) : state.selected;
@@ -1415,6 +1445,16 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
           marketingMediaUrl = computeTrackSrc(pl ? pl.bundleBase : "", "marketing/" + String(marketing.media_path || "").replace(/^\/+/, ""));
         }
       }
+      let marketingCoverUrl = "";
+      if (marketing){
+        if (marketing.cover_url){
+          marketingCoverUrl = String(marketing.cover_url || "").trim();
+        }else if (marketing.marketing_cover_path){
+          marketingCoverUrl = computeTrackSrc(pl ? pl.bundleBase : "", String(marketing.marketing_cover_path || "").trim());
+        }else if (marketing.cover_path){
+          marketingCoverUrl = computeTrackSrc(pl ? pl.bundleBase : "", "marketing/" + String(marketing.cover_path || "").replace(/^\/+/, ""));
+        }
+      }
 
       const values = {
         feed_sha: state.feed && state.feed.content_sha256 ? state.feed.content_sha256 : "",
@@ -1429,6 +1469,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         marketing_summary: marketing && marketing.summary ? String(marketing.summary) : "",
         marketing_hashtags: hashtagsText,
         marketing_media_url: marketingMediaUrl,
+        marketing_cover_url: marketingCoverUrl,
       };
 
       state.inspector = values;
@@ -1444,7 +1485,9 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       setInspectorValue("inspectTrackBytes", values.track_bytes, { bytes: true });
       setInspectorValue("inspectMarketingSummary", values.marketing_summary, {});
       setInspectorValue("inspectMarketingHashtags", values.marketing_hashtags, {});
+      setInspectorValue("inspectMarketingCover", values.marketing_cover_url, { shortUrl: true });
       setInspectorValue("inspectMarketingMedia", values.marketing_media_url, { shortUrl: true });
+      setCoverImage(values.marketing_cover_url);
     }
 
     function inspectorSummary(state){
@@ -1461,6 +1504,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         ["track_bytes", v.track_bytes],
         ["marketing_summary", v.marketing_summary],
         ["marketing_hashtags", v.marketing_hashtags],
+        ["marketing_cover_url", v.marketing_cover_url],
         ["marketing_media_url", v.marketing_media_url],
       ];
       return pairs.map((p) => p[0] + ": " + (p[1] || "—")).join("\n");
@@ -1927,6 +1971,24 @@ def _marketing_meta_from_plan(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         out["media_url"] = media_url
     if marketing_media_path:
         out["marketing_media_path"] = marketing_media_path
+
+    cover_path = ""
+    cover_obj = plan.get("cover") if isinstance(plan.get("cover"), dict) else None
+    if isinstance(cover_obj, dict):
+        cover_path = str(cover_obj.get("dst") or cover_obj.get("path") or "").strip()
+    if not cover_path and isinstance(plan.get("paths"), dict):
+        cover_path = str(plan.get("paths", {}).get("cover") or "").strip()
+
+    marketing_cover_path = ""
+    if cover_path:
+        posix_path = Path(cover_path).as_posix().lstrip("/")
+        marketing_cover_path = posix_path if posix_path.startswith("marketing/") else f"marketing/{posix_path}"
+
+    if cover_path:
+        out["cover_path"] = cover_path
+    if marketing_cover_path:
+        out["marketing_cover_path"] = marketing_cover_path
+
     return out if out else None
 
 def cmd_web_build(args: argparse.Namespace) -> int:
