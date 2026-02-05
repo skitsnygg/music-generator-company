@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      MGC_PROVIDER: "stub"
 
     steps:
       - name: Checkout repo
