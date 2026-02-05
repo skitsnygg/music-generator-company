@@ -92,6 +92,22 @@ def _preflight_riffusion() -> str:
     raise ProviderError(f"riffusion not reachable at {url} (set MGC_FALLBACK_TO_STUB=1 to continue)")
 
 
+def _is_riffusion_unreachable(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(
+        token in msg
+        for token in (
+            "riffusion server request failed",
+            "failed to establish a new connection",
+            "max retries exceeded",
+            "connection refused",
+            "connectionerror",
+            "newconnectionerror",
+            "connection pool",
+        )
+    )
+
+
 def _fixed_now_iso(deterministic: bool) -> str:
     if deterministic:
         fixed = (os.environ.get("MGC_FIXED_TIME") or "2020-01-01T00:00:00Z").strip()
@@ -258,16 +274,36 @@ class MusicAgent:
         provider, fallback_from = self._resolve_provider()
         ts = now_iso or _fixed_now_iso(deterministic)
 
-        art = provider.generate(
-            out_dir=out_dir,
-            track_id=str(track_id),
-            context=str(context),
-            seed=int(seed),
-            deterministic=bool(deterministic),
-            now_iso=str(ts),
-            schedule=str(schedule),
-            period_key=str(period_key),
-        )
+        try:
+            art = provider.generate(
+                out_dir=out_dir,
+                track_id=str(track_id),
+                context=str(context),
+                seed=int(seed),
+                deterministic=bool(deterministic),
+                now_iso=str(ts),
+                schedule=str(schedule),
+                period_key=str(period_key),
+            )
+        except ProviderError as e:
+            prov_name = str(getattr(provider, "name", "") or "")
+            if prov_name == "riffusion" and _fallback_to_stub_enabled() and _is_riffusion_unreachable(e):
+                if not fallback_from:
+                    _eprint(f"[provider] fallback to stub from {prov_name}: {e}")
+                    fallback_from = prov_name
+                provider = get_provider("stub")
+                art = provider.generate(
+                    out_dir=out_dir,
+                    track_id=str(track_id),
+                    context=str(context),
+                    seed=int(seed),
+                    deterministic=bool(deterministic),
+                    now_iso=str(ts),
+                    schedule=str(schedule),
+                    period_key=str(period_key),
+                )
+            else:
+                raise
 
         # Normalize provider return -> dict
         if isinstance(art, dict):
