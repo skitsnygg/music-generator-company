@@ -83,7 +83,11 @@ def _post_json_with_retry(url: str, payload: Dict[str, Any], *, timeout: Tuple[f
         try:
             r = requests.post(url, json=payload, timeout=timeout, allow_redirects=True)
             return r
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
             last_err = e
             if attempt >= retries:
                 break

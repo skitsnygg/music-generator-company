@@ -22,6 +22,8 @@ jobs:
       MGC_PROVIDER: "${{ vars.MGC_PROVIDER || 'riffusion' }}"
       MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
       MGC_RIFFUSION_TIMEOUT: "${{ vars.MGC_RIFFUSION_TIMEOUT || '180' }}"
+      MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
+      MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
@@ -61,6 +63,8 @@ jobs:
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
           echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
           echo "MGC_RIFFUSION_TIMEOUT=${MGC_RIFFUSION_TIMEOUT:-}"
+          echo "MGC_RIFFUSION_RETRIES=${MGC_RIFFUSION_RETRIES:-}"
+          echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
 
           # Prod must always use the system DB
           test -s /var/lib/mgc/db.sqlite
