@@ -62,13 +62,24 @@ log "Publish latest web: ${PUBLISH_LATEST}"
 log "Publish release feed: ${PUBLISH_FEED} (require=${REQUIRE_FEED})"
 "${PY}" -V
 
+_owner_fix_hint() {
+  local base="$1"
+  local target_user="${SUDO_USER:-${USER}}"
+  if ! id "${target_user}" >/dev/null 2>&1; then
+    target_user="${USER}"
+  fi
+  local target_group
+  target_group="$(id -gn "${target_user}" 2>/dev/null || id -gn)"
+  printf 'sudo chown -R "%s:%s" "%s"' "${target_user}" "${target_group}" "${base}"
+}
+
 check_root_owned() {
   local base="$1"
   [[ -d "${base}" ]] || return 0
   local hit=""
   hit="$(find "${base}" -type f -user root -print -quit 2>/dev/null || true)"
   if [[ -n "${hit}" ]]; then
-    die "Found root-owned files under ${base}. Fix with: sudo chown -R \"${USER}:$(id -gn)\" \"${base}\""
+    die "Found root-owned files under ${base}. Fix with: $(_owner_fix_hint "${base}")"
   fi
 }
 
