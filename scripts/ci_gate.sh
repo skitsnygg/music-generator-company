@@ -102,6 +102,7 @@ echo "[ci_gate] autonomous smoke test (deterministic) out_dir=$AUTO_OUT"
   --json \
   run autonomous \
   --context focus \
+  --provider stub \
   --out-dir "$AUTO_OUT" \
   --deterministic >"$AUTO_OUT/autonomous.json" 2>"$AUTO_OUT/autonomous.err"
 

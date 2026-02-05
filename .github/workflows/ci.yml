@@ -240,10 +240,10 @@ jobs:
           mkdir -p "${OUT1}" "${OUT2}"
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT1}" --deterministic --contract publish
+            run autonomous --context focus --out-dir "${OUT1}" --deterministic --contract publish --provider stub
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 \
-            run autonomous --context focus --out-dir "${OUT2}" --deterministic --contract publish
+            run autonomous --context focus --out-dir "${OUT2}" --deterministic --contract publish --provider stub
 
           test -s "${OUT1}/contract_report.json"
           test -s "${OUT2}/contract_report.json"

@@ -7305,6 +7305,11 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     auto = run_sub.add_parser("autonomous", help="Run end-to-end drop + verify submission (cron-safe)")
     auto.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     auto.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    auto.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to use for generation (default: MGC_PROVIDER or 'riffusion')",
+    )
     auto.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     auto.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
     auto.add_argument(
