@@ -25,6 +25,7 @@ jobs:
       MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
       MGC_MIN_FREE_MB: "${{ vars.MGC_MIN_FREE_MB || '1024' }}"
+      MGC_FALLBACK_TO_STUB: "${{ vars.MGC_FALLBACK_TO_STUB || '0' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
@@ -68,6 +69,7 @@ jobs:
           echo "MGC_RIFFUSION_RETRIES=${MGC_RIFFUSION_RETRIES:-}"
           echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
           echo "MGC_MIN_FREE_MB=${MGC_MIN_FREE_MB:-}"
+          echo "MGC_FALLBACK_TO_STUB=${MGC_FALLBACK_TO_STUB:-}"
 
           # Validate provider selection (fast, no network calls).
           python -m mgc.main providers check
@@ -99,22 +101,39 @@ jobs:
           test -s /var/lib/mgc/db.sqlite
           python -m mgc.main --db /var/lib/mgc/db.sqlite db status || exit 2
 
+          fallback_to_stub() {
+            local reason="$1"
+            if [ "${MGC_FALLBACK_TO_STUB:-0}" = "1" ]; then
+              echo "WARN: ${reason}; falling back to stub provider"
+              echo "MGC_PROVIDER=stub" >> "$GITHUB_ENV"
+              echo "MGC_PROVIDER_FALLBACK_FROM=riffusion" >> "$GITHUB_ENV"
+              export MGC_PROVIDER="stub"
+              export MGC_PROVIDER_FALLBACK_FROM="riffusion"
+              return 0
+            fi
+            return 1
+          }
+
           if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
             if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
-              echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
-              exit 2
-            fi
-            if command -v curl >/dev/null 2>&1; then
+              if ! fallback_to_stub "riffusion selected but MGC_RIFFUSION_URL is empty"; then
+                echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
+                exit 2
+              fi
+            elif command -v curl >/dev/null 2>&1; then
               base="${MGC_RIFFUSION_URL%/run_inference*}"
               if [ -z "$base" ]; then
                 base="${MGC_RIFFUSION_URL}"
               fi
               code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 "$base" || true)"
               if [ "$code" = "000" ]; then
-                echo "ERROR: riffusion not reachable at ${base}"
-                exit 2
+                if ! fallback_to_stub "riffusion not reachable at ${base}"; then
+                  echo "ERROR: riffusion not reachable at ${base}"
+                  exit 2
+                fi
+              else
+                echo "riffusion_base_http_code=${code}"
               fi
-              echo "riffusion_base_http_code=${code}"
             else
               echo "WARN: curl not found; skipping riffusion reachability check"
             fi
@@ -207,6 +226,19 @@ jobs:
           rm -rf data/evidence tracks || true
           test -z "$(git status --porcelain)"
 
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduled_drops_prod_${{ github.run_id }}_${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            /var/lib/mgc/releases/run_${{ github.run_id }}_${{ github.run_attempt }}/focus/**
+            /tmp/mgc_prod_artifacts/**
+            /tmp/mgc_prod_evidence/**
+            /tmp/mgc_prod_tracks/**
+
       - name: Write job summary
         if: always()
         shell: bash
@@ -220,6 +252,7 @@ jobs:
 
           PROVIDER="${MGC_PROVIDER:-}"
           RIFF_URL="${MGC_RIFFUSION_URL:-}"
+          FALLBACK_FROM="${MGC_PROVIDER_FALLBACK_FROM:-}"
           REF_NAME="${GITHUB_REF_NAME:-${GITHUB_REF:-}}"
 
           TRACKS="n/a"
@@ -240,6 +273,9 @@ jobs:
             echo "- Ref: ${REF_NAME}"
             echo "- SHA: ${GITHUB_SHA}"
             echo "- Provider: ${PROVIDER}"
+            if [ -n "${FALLBACK_FROM}" ]; then
+              echo "- Provider fallback: ${FALLBACK_FROM} -> ${PROVIDER}"
+            fi
             echo "- Riffusion URL: ${RIFF_URL}"
             echo "- Context: ${CONTEXT:-focus}"
             echo "- Output dir: ${OUT_DIR:-}"
