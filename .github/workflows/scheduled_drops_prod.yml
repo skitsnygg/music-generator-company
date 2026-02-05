@@ -46,10 +46,13 @@ jobs:
           python -m pip install -e .
 
       - name: Validate environment (fail fast)
+        id: preflight
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
+
+          START_TS="$(date -u +%s)"
 
           if [ -z "${MGC_PROVIDER:-}" ]; then
             echo "WARN: MGC_PROVIDER is empty; defaulting to riffusion"
@@ -139,12 +142,18 @@ jobs:
             fi
           fi
 
+          END_TS="$(date -u +%s)"
+          echo "start_ts=${START_TS}" >> "$GITHUB_OUTPUT"
+          echo "end_ts=${END_TS}" >> "$GITHUB_OUTPUT"
+          echo "duration_sec=$((END_TS - START_TS))" >> "$GITHUB_OUTPUT"
+
       - name: Run autonomous drop (self-contained, builds web)
         id: run_auto
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
+          START_TS="$(date -u +%s)"
 
           # Ensure repo stays clean
           rm -rf data/evidence tracks || true
@@ -178,6 +187,10 @@ jobs:
           echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
           echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
           echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
+          END_TS="$(date -u +%s)"
+          echo "start_ts=${START_TS}" >> "$GITHUB_OUTPUT"
+          echo "end_ts=${END_TS}" >> "$GITHUB_OUTPUT"
+          echo "duration_sec=$((END_TS - START_TS))" >> "$GITHUB_OUTPUT"
 
       - name: Assert playlist track files exist (inside OUT)
         shell: bash
@@ -191,10 +204,12 @@ jobs:
           python scripts/check_playlist_tracks.py "$PLAYLIST_PATH" "$OUT"
 
       - name: Validate web bundle contains audio
+        id: web_validate
         shell: bash
         run: |
           set -euxo pipefail
           . .venv/bin/activate
+          START_TS="$(date -u +%s)"
 
           WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
 
@@ -202,6 +217,10 @@ jobs:
 
           test "$(find "$WEB_DIR" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')" != "0"
           test -s "$WEB_DIR/web_manifest.json"
+          END_TS="$(date -u +%s)"
+          echo "start_ts=${START_TS}" >> "$GITHUB_OUTPUT"
+          echo "end_ts=${END_TS}" >> "$GITHUB_OUTPUT"
+          echo "duration_sec=$((END_TS - START_TS))" >> "$GITHUB_OUTPUT"
 
       - name: Update latest symlinks
         shell: bash
@@ -249,6 +268,9 @@ jobs:
           WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
           PLAYLIST_PATH="${{ steps.run_auto.outputs.playlist_path }}"
           CONTEXT="${{ steps.run_auto.outputs.context }}"
+          PREFLIGHT_DUR="${{ steps.preflight.outputs.duration_sec }}"
+          RUN_DUR="${{ steps.run_auto.outputs.duration_sec }}"
+          WEB_DUR="${{ steps.web_validate.outputs.duration_sec }}"
 
           PROVIDER="${MGC_PROVIDER:-}"
           RIFF_URL="${MGC_RIFFUSION_URL:-}"
@@ -263,6 +285,12 @@ jobs:
           AUDIO_COUNT="0"
           if [ -d "${WEB_DIR}" ]; then
             AUDIO_COUNT="$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
+          fi
+
+          TOTAL_DUR="n/a"
+          if [ -n "${PREFLIGHT_DUR}" ] && [ -n "${RUN_DUR}" ]; then
+            WEB_DUR_SAFE="${WEB_DUR:-0}"
+            TOTAL_DUR="$((PREFLIGHT_DUR + RUN_DUR + WEB_DUR_SAFE))"
           fi
 
           {
@@ -283,4 +311,8 @@ jobs:
             echo "- Playlist: ${PLAYLIST_PATH:-}"
             echo "- Playlist tracks: ${TRACKS}"
             echo "- Web audio files: ${AUDIO_COUNT}"
+            echo "- Preflight duration: ${PREFLIGHT_DUR:-n/a}s"
+            echo "- Run duration: ${RUN_DUR:-n/a}s"
+            echo "- Web validate duration: ${WEB_DUR:-n/a}s"
+            echo "- Total (preflight+run+web): ${TOTAL_DUR}s"
           } >> "$GITHUB_STEP_SUMMARY"
