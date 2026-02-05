@@ -6,6 +6,10 @@ on:
     # 09:00 UTC daily
     - cron: "0 9 * * *"
 
+concurrency:
+  group: scheduled_drops_prod
+  cancel-in-progress: true
+
 jobs:
   scheduled_drops_prod:
     runs-on: self-hosted
@@ -26,6 +30,8 @@ jobs:
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
       MGC_MIN_FREE_MB: "${{ vars.MGC_MIN_FREE_MB || '1024' }}"
       MGC_FALLBACK_TO_STUB: "${{ vars.MGC_FALLBACK_TO_STUB || '0' }}"
+      MGC_RUN_AUTONOMOUS_RETRIES: "${{ vars.MGC_RUN_AUTONOMOUS_RETRIES || '2' }}"
+      MGC_RUN_AUTONOMOUS_RETRY_SLEEP: "${{ vars.MGC_RUN_AUTONOMOUS_RETRY_SLEEP || '10' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
@@ -73,6 +79,8 @@ jobs:
           echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
           echo "MGC_MIN_FREE_MB=${MGC_MIN_FREE_MB:-}"
           echo "MGC_FALLBACK_TO_STUB=${MGC_FALLBACK_TO_STUB:-}"
+          echo "MGC_RUN_AUTONOMOUS_RETRIES=${MGC_RUN_AUTONOMOUS_RETRIES:-}"
+          echo "MGC_RUN_AUTONOMOUS_RETRY_SLEEP=${MGC_RUN_AUTONOMOUS_RETRY_SLEEP:-}"
 
           # Validate provider selection (fast, no network calls).
           python -m mgc.main providers check
@@ -170,15 +178,30 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT"
 
-          python -m mgc.main \
-            --db /var/lib/mgc/db.sqlite \
-            --seed 1 \
-            --no-resume \
-            run autonomous \
-              --context "$CONTEXT" \
-              --out-dir "$OUT" \
-              --deterministic \
-              --with-web
+          retries="${MGC_RUN_AUTONOMOUS_RETRIES:-2}"
+          sleep_s="${MGC_RUN_AUTONOMOUS_RETRY_SLEEP:-10}"
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            if python -m mgc.main \
+              --db /var/lib/mgc/db.sqlite \
+              --seed 1 \
+              --no-resume \
+              run autonomous \
+                --context "$CONTEXT" \
+                --out-dir "$OUT" \
+                --deterministic \
+                --with-web; then
+              break
+            fi
+            if [ "$attempt" -gt "$retries" ]; then
+              echo "run_autonomous_retries_exhausted=${attempt}" >> "$GITHUB_OUTPUT"
+              exit 2
+            fi
+            echo "WARN: run autonomous failed (attempt ${attempt}/${retries}); retrying in ${sleep_s}s..."
+            sleep "${sleep_s}"
+          done
+          echo "run_autonomous_attempts=${attempt}" >> "$GITHUB_OUTPUT"
 
           test -s "$OUT/drop_bundle/playlist.json"
           test -s "$OUT/web/web_manifest.json"
@@ -271,6 +294,7 @@ jobs:
           PREFLIGHT_DUR="${{ steps.preflight.outputs.duration_sec }}"
           RUN_DUR="${{ steps.run_auto.outputs.duration_sec }}"
           WEB_DUR="${{ steps.web_validate.outputs.duration_sec }}"
+          RUN_ATTEMPTS="${{ steps.run_auto.outputs.run_autonomous_attempts }}"
 
           PROVIDER="${MGC_PROVIDER:-}"
           RIFF_URL="${MGC_RIFFUSION_URL:-}"
@@ -362,6 +386,7 @@ jobs:
             echo "- Web tree sha256: ${WEB_TREE_SHA}"
             echo "- Preflight duration: ${PREFLIGHT_DUR:-n/a}s"
             echo "- Run duration: ${RUN_DUR:-n/a}s"
+            echo "- Run attempts: ${RUN_ATTEMPTS:-1}"
             echo "- Web validate duration: ${WEB_DUR:-n/a}s"
             echo "- Total (preflight+run+web): ${TOTAL_DUR}s"
           } >> "$GITHUB_STEP_SUMMARY"
