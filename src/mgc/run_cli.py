@@ -2611,8 +2611,29 @@ def _stub_daily_run(
         except TypeError:
             result = provider.generate(req_obj)  # type: ignore[misc]
 
-    if getattr(result, "ext", None):
-        ext = result.ext if result.ext.startswith(".") else f".{result.ext}"
+    provider_used = provider_name
+    meta_from_result: Dict[str, Any] = {}
+    artifact_bytes: Optional[bytes] = None
+    ext: Optional[str] = None
+    try:
+        artifact_bytes, ext_norm, _mime, meta_from_result = _normalize_provider_result(result)
+        ext = f".{ext_norm}" if ext_norm and not str(ext_norm).startswith(".") else str(ext_norm or "")
+    except Exception:
+        if isinstance(result, dict):
+            artifact_bytes = result.get("artifact_bytes")
+            ext = result.get("ext")
+            meta_from_result = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+            provider_used = result.get("provider") or provider_used
+        else:
+            artifact_bytes = getattr(result, "artifact_bytes", None)
+            ext = getattr(result, "ext", None)
+            meta_from_result = getattr(result, "meta", None) if isinstance(getattr(result, "meta", None), dict) else {}
+
+    if isinstance(meta_from_result, dict):
+        provider_used = meta_from_result.get("provider") or provider_used
+
+    if ext:
+        ext = ext if str(ext).startswith(".") else f".{ext}"
         if artifact_path.suffix != ext:
             artifact_rel = artifact_rel.with_suffix(ext)
             artifact_path = (Path.cwd() / artifact_rel).resolve()
@@ -2634,7 +2655,6 @@ def _stub_daily_run(
                 artifact_rel = artifact_rel.with_suffix(_ext)
                 break
 
-    artifact_bytes = getattr(result, "artifact_bytes", None)
     if isinstance(artifact_bytes, (bytes, bytearray)) and len(artifact_bytes) > 0:
         artifact_path.write_bytes(bytes(artifact_bytes))
     db_insert_track(
@@ -2642,9 +2662,9 @@ def _stub_daily_run(
         track_id=track_id,
         ts=ts,
         title=title,
-        provider=getattr(result, "provider", provider_name),
+        provider=provider_used,
         mood=context,
-        genre=(result.meta.get("genre") if isinstance(getattr(result, "meta", None), dict) else None),
+        genre=(meta_from_result.get("genre") if isinstance(meta_from_result, dict) else None),
         artifact_path=_posix(artifact_rel),
         meta={
             "run_id": run_id,
@@ -2652,7 +2672,7 @@ def _stub_daily_run(
             "context": context,
             "seed": seed,
             "deterministic": deterministic,
-            **(getattr(result, "meta", None) or {}),
+            **(meta_from_result or {}),
         },
     )
 
@@ -2668,7 +2688,7 @@ def _stub_daily_run(
             "run_id": run_id,
             "drop_id": drop_id,
             "track_id": track_id,
-            "provider": getattr(result, "provider", provider_name),
+            "provider": provider_used,
             "deterministic": deterministic,
             "seed": seed,
             "context": context,
@@ -2725,7 +2745,7 @@ def _stub_daily_run(
                 "run_id": run_id,
                 "drop_id": drop_id,
                 "track_id": track_id,
-                "provider": getattr(result, "provider", provider_name),
+                "provider": provider_used,
                 "context": context,
             },
         )
@@ -2764,7 +2784,7 @@ def _stub_daily_run(
             {
                 "track_id": track_id,
                 "title": title,
-                "provider": getattr(result, "provider", provider_name),
+                "provider": provider_used,
                 "path": _posix(bundled_track_rel),
             }
         ],
@@ -2785,7 +2805,7 @@ def _stub_daily_run(
         "context": context,
         "seed": seed,
         "deterministic": deterministic,
-        "provider": getattr(result, "provider", provider_name),
+        "provider": provider_used,
         "ids": {
             "run_id": run_id,
             "drop_id": drop_id,
