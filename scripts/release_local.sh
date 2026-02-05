@@ -27,6 +27,9 @@ else
   CONTEXTS=(focus sleep workout)
 fi
 
+MARKETING="${MGC_RELEASE_MARKETING:-1}"
+TEASER_SECONDS="${MGC_TEASER_SECONDS:-15}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PY="${MGC_PYTHON:-}"
@@ -61,12 +64,22 @@ for ctx in "${CONTEXTS[@]}"; do
   echo "[release] run pipeline ctx=${ctx} out=${OUT}"
 
   rm -rf "${OUT}"
-  "${PY}" -m mgc.main --db "${DB_PATH}" run pipeline \
-    --schedule daily \
-    --context "${ctx}" \
-    --seed 1 \
-    --out-dir "${OUT}" \
+  daily_args=(
+    -m mgc.main
+    --db "${DB_PATH}"
+    run daily
+    --context "${ctx}"
+    --seed 1
+    --out-dir "${OUT}"
     --deterministic
+  )
+  if [[ "${MARKETING}" == "1" ]]; then
+    daily_args+=( --marketing --teaser-seconds "${TEASER_SECONDS}" )
+  fi
+  "${PY}" "${daily_args[@]}"
+
+  # Verify bundle contract (fail fast).
+  "${PY}" "${ROOT_DIR}/scripts/verify_drop_contract.py" --out-dir "${OUT}"
 
   echo "[release] rebuild web bundle (marketing assets)"
   "${PY}" -m mgc.main --db "${DB_PATH}" web build \

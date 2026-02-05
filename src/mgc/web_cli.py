@@ -229,6 +229,21 @@ def _prefer_mp3_path(p: Path) -> Path:
     return p
 
 
+def _prefer_existing_audio_path(p: Path) -> Path:
+    if p.exists():
+        return p
+    suf = p.suffix.lower()
+    if suf == ".mp3":
+        wav = p.with_suffix(".wav")
+        if wav.exists():
+            return wav
+    elif suf == ".wav":
+        mp3 = p.with_suffix(".mp3")
+        if mp3.exists():
+            return mp3
+    return p
+
+
 def _list_audio_files(dir_path: Path) -> List[Path]:
     if not dir_path.exists():
         return []
@@ -1215,13 +1230,25 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return urlJoin(prefix, "/releases/feed.json");
     }
 
+    function repoBaseFromPrefix(prefix){
+      const markers = ["/latest/web/", "/releases/"];
+      for (const m of markers){
+        const idx = prefix.indexOf(m);
+        if (idx >= 0) return prefix.slice(0, idx);
+      }
+      return prefix;
+    }
+
     function feedUrlCandidates(){
       const primary = resolveFeedUrl();
+      const prefix = basePrefix();
+      const repoBase = repoBaseFromPrefix(prefix);
+      const repoFeed = urlJoin(repoBase, "/releases/feed.json");
       const root = "/releases/feed.json";
       const out = [primary];
+      if (repoFeed && repoFeed !== primary) out.push(repoFeed);
       if (primary !== root) out.push(root);
       if (window.location.protocol === "file:"){
-        const prefix = basePrefix();
         const rels = [
           "../releases/feed.json",
           "../../releases/feed.json",
@@ -2670,6 +2697,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                     rp = _resolve_input_path(d[k], playlist_dir=playlist_dir, repo_root=repo_root)
                     if prefer_mp3:
                         rp = _prefer_mp3_path(rp)
+                    rp = _prefer_existing_audio_path(rp)
                     attempted.append(str(rp))
                     if rp.exists() and rp.is_file():
                         src_path = rp
@@ -2686,6 +2714,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
                 rp = _resolve_input_path(c, playlist_dir=playlist_dir, repo_root=repo_root)
                 if prefer_mp3:
                     rp = _prefer_mp3_path(rp)
+                rp = _prefer_existing_audio_path(rp)
                 attempted.append(str(rp))
                 if rp.exists() and rp.is_file():
                     src_path = rp

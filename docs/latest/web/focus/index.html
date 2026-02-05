@@ -798,13 +798,25 @@
       return urlJoin(prefix, "/releases/feed.json");
     }
 
+    function repoBaseFromPrefix(prefix){
+      const markers = ["/latest/web/", "/releases/"];
+      for (const m of markers){
+        const idx = prefix.indexOf(m);
+        if (idx >= 0) return prefix.slice(0, idx);
+      }
+      return prefix;
+    }
+
     function feedUrlCandidates(){
       const primary = resolveFeedUrl();
+      const prefix = basePrefix();
+      const repoBase = repoBaseFromPrefix(prefix);
+      const repoFeed = urlJoin(repoBase, "/releases/feed.json");
       const root = "/releases/feed.json";
       const out = [primary];
+      if (repoFeed && repoFeed !== primary) out.push(repoFeed);
       if (primary !== root) out.push(root);
       if (window.location.protocol === "file:"){
-        const prefix = basePrefix();
         const rels = [
           "../releases/feed.json",
           "../../releases/feed.json",
