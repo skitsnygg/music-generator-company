@@ -28,12 +28,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import socket
+import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from mgc.providers import get_provider
+from mgc.providers.base import ProviderError
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -41,6 +45,51 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not v:
         return default
     return v in ("1", "true", "yes", "on")
+
+
+def _eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def _fallback_to_stub_enabled() -> bool:
+    return _env_bool("MGC_FALLBACK_TO_STUB", False) or _env_bool("MGC_DEMO_FALLBACK_TO_STUB", False)
+
+
+def _riffusion_url_from_env() -> str:
+    url = (
+        os.environ.get("MGC_RIFFUSION_URL")
+        or os.environ.get("RIFFUSION_URL")
+        or "http://127.0.0.1:3013/run_inference/"
+    )
+    url = (url or "").strip()
+    return url or "http://127.0.0.1:3013/run_inference/"
+
+
+def _riffusion_reachable(url: str, timeout_s: float = 1.5) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
+def _preflight_riffusion() -> str:
+    url = _riffusion_url_from_env()
+    try:
+        timeout_s = float(os.environ.get("MGC_RIFFUSION_PREFLIGHT_TIMEOUT") or "1.5")
+    except Exception:
+        timeout_s = 1.5
+    if _riffusion_reachable(url, timeout_s=timeout_s):
+        return ""
+    if _fallback_to_stub_enabled():
+        _eprint(f"[provider] riffusion unreachable at {url}; preflight fallback to stub")
+        return "riffusion"
+    raise ProviderError(f"riffusion not reachable at {url} (set MGC_FALLBACK_TO_STUB=1 to continue)")
 
 
 def _fixed_now_iso(deterministic: bool) -> str:
@@ -174,16 +223,24 @@ class MusicAgent:
     def _resolve_provider_name(self) -> str:
         return (self.cfg.provider or "riffusion").strip().lower()
 
-    def _resolve_provider(self):
+    def _resolve_provider(self) -> tuple[Any, str]:
         name = self._resolve_provider_name()
+        fallback_from = ""
+        if name == "riffusion":
+            fallback_from = _preflight_riffusion()
+            if fallback_from:
+                name = "stub"
+                self.cfg.provider = "stub"
         try:
-            return get_provider(name)
+            return get_provider(name), fallback_from
         except Exception as e:
             if self.cfg.strict_provider:
                 raise
             if name != "stub":
+                if not fallback_from:
+                    fallback_from = name
                 self.cfg.provider = "stub"
-                return get_provider("stub")
+                return get_provider("stub"), fallback_from
             raise e
 
     def generate(
@@ -198,7 +255,7 @@ class MusicAgent:
         out_dir: str | Path,
         now_iso: Optional[str] = None,
     ) -> TrackArtifact:
-        provider = self._resolve_provider()
+        provider, fallback_from = self._resolve_provider()
         ts = now_iso or _fixed_now_iso(deterministic)
 
         art = provider.generate(
@@ -281,6 +338,8 @@ class MusicAgent:
         meta.setdefault("schedule", schedule)
         meta.setdefault("period_key", period_key)
         meta.setdefault("deterministic", bool(deterministic))
+        if fallback_from:
+            meta.setdefault("provider_fallback_from", fallback_from)
 
         # Carry ext/mime and preview_path into meta for downstream tools
         if art.get("ext") and not meta.get("ext"):
