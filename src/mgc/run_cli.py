@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Sequ
 
 from mgc.context import build_prompt, get_context_spec
 from mgc.hash_utils import sha256_file, sha256_tree
+from mgc.providers.base import ProviderError
 try:
     from mgc.providers import get_provider  # type: ignore
 except Exception:  # pragma: no cover
@@ -199,6 +200,33 @@ def is_deterministic(args: Optional[argparse.Namespace] = None) -> bool:
 
 def _env_truthy(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+def _fallback_to_stub_enabled() -> bool:
+    return _env_truthy("MGC_FALLBACK_TO_STUB") or _env_truthy("MGC_DEMO_FALLBACK_TO_STUB")
+
+
+def _is_riffusion_unreachable(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(
+        token in msg
+        for token in (
+            "riffusion server request failed",
+            "failed to establish a new connection",
+            "max retries exceeded",
+            "connection refused",
+            "connectionerror",
+            "newconnectionerror",
+            "connection pool",
+        )
+    )
+
+
+def _should_fallback_to_stub(provider_name: str, err: Exception) -> bool:
+    if provider_name != "riffusion":
+        return False
+    if not _fallback_to_stub_enabled():
+        return False
+    return _is_riffusion_unreachable(err)
 
 
 def deterministic_now_iso(deterministic: bool) -> str:
@@ -640,7 +668,9 @@ def _agents_generate_and_ingest(
         return []
 
     pname = (provider_name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
-    provider = get_provider(pname)
+    provider_used = pname
+    provider = get_provider(provider_used)
+    provider_fallback_from = ""
 
     tracks_dir = (repo_root / "tracks").resolve()
     tracks_dir.mkdir(parents=True, exist_ok=True)
@@ -656,19 +686,42 @@ def _agents_generate_and_ingest(
             else:
                 track_id = str(uuid.uuid4())
 
-            res = provider.generate(
-                track_id=track_id,
-                context=context,
-                seed=int(seed),
-                prompt=prompt,
-                deterministic=bool(deterministic),
-                schedule=schedule,
-                period_key=period_key,
-                ts=now_iso,
-                out_dir=str(repo_root),
-                out_rel=None,
-                run_id=None,
-            )
+            track_fallback_from = provider_fallback_from
+            try:
+                res = provider.generate(
+                    track_id=track_id,
+                    context=context,
+                    seed=int(seed),
+                    prompt=prompt,
+                    deterministic=bool(deterministic),
+                    schedule=schedule,
+                    period_key=period_key,
+                    ts=now_iso,
+                    out_dir=str(repo_root),
+                    out_rel=None,
+                    run_id=None,
+                )
+            except ProviderError as e:
+                if _should_fallback_to_stub(provider_used, e):
+                    provider_fallback_from = provider_used
+                    provider_used = "stub"
+                    provider = get_provider(provider_used)
+                    track_fallback_from = provider_fallback_from
+                    res = provider.generate(
+                        track_id=track_id,
+                        context=context,
+                        seed=int(seed),
+                        prompt=prompt,
+                        deterministic=bool(deterministic),
+                        schedule=schedule,
+                        period_key=period_key,
+                        ts=now_iso,
+                        out_dir=str(repo_root),
+                        out_rel=None,
+                        run_id=None,
+                    )
+                else:
+                    raise
             audio_bytes, ext, mime, meta = _normalize_provider_result(res)
             ext = ext or "wav"
             filename = f"{track_id}.{ext}"
@@ -677,32 +730,37 @@ def _agents_generate_and_ingest(
             abs_path.write_bytes(audio_bytes)
 
             title = str(meta.get("title") or f"{context} track {track_id[:8]}")
-            genre = str(meta.get("genre") or (pname if pname != "filesystem" else "library"))
+            genre = str(meta.get("genre") or (provider_used if provider_used != "filesystem" else "library"))
+
+            track_meta = {
+                "context": context,
+                "schedule": schedule,
+                "period_key": period_key,
+                "deterministic": bool(deterministic),
+                "seed": int(seed),
+                "prompt": prompt,
+                **meta,
+            }
+            if track_fallback_from:
+                track_meta["provider_fallback_from"] = track_fallback_from
 
             db_insert_track(
                 con,
                 track_id=str(track_id),
                 ts=now_iso,
                 title=title,
-                provider=pname,
+                provider=provider_used,
                 mood=context,
                 genre=genre,
                 artifact_path=_posix(rel_path),
-                meta={
-                    "context": context,
-                    "schedule": schedule,
-                    "period_key": period_key,
-                    "deterministic": bool(deterministic),
-                    "seed": int(seed),
-                    "prompt": prompt,
-                    **meta,
-                },
+                meta=track_meta,
             )
             generated.append(
                 {
                     "track_id": str(track_id),
                     "artifact_path": _posix(rel_path),
-                    "provider": pname,
+                    "provider": provider_used,
+                    "provider_fallback_from": track_fallback_from or "",
                     "ext": ext,
                     "mime": mime,
                     "meta": meta,
@@ -2674,7 +2732,9 @@ def _stub_daily_run(
     provider_name = str(provider_name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
     if not provider_name:
         provider_name = "riffusion"
-    provider = get_provider(provider_name)
+    provider_used = provider_name
+    provider_fallback_from = ""
+    provider = get_provider(provider_used)
 
     req_obj = GenerateRequest(
         track_id=track_id,
@@ -2702,10 +2762,10 @@ def _stub_daily_run(
         "period_key": ("2020-01-01" if deterministic else ts.split("T", 1)[0]),
     }
 
-    def _call_generate_with_filtered_kwargs():
+    def _call_generate_with_filtered_kwargs(prov):
         import inspect
 
-        fn = getattr(provider, "generate")
+        fn = getattr(prov, "generate")
         sig = inspect.signature(fn)
         params = sig.parameters
 
@@ -2723,14 +2783,25 @@ def _stub_daily_run(
         return fn(**filtered)  # type: ignore[misc]
 
     try:
-        result = _call_generate_with_filtered_kwargs()
-    except TypeError:
-        try:
-            result = provider.generate()  # type: ignore[misc]
-        except TypeError:
-            result = provider.generate(req_obj)  # type: ignore[misc]
+        def _generate_with_provider(prov):
+            try:
+                return _call_generate_with_filtered_kwargs(prov)
+            except TypeError:
+                try:
+                    return prov.generate()  # type: ignore[misc]
+                except TypeError:
+                    return prov.generate(req_obj)  # type: ignore[misc]
 
-    provider_used = provider_name
+        result = _generate_with_provider(provider)
+    except ProviderError as e:
+        if _should_fallback_to_stub(provider_used, e):
+            provider_fallback_from = provider_used
+            provider_used = "stub"
+            provider = get_provider(provider_used)
+            result = _generate_with_provider(provider)
+        else:
+            raise
+
     meta_from_result: Dict[str, Any] = {}
     artifact_bytes: Optional[bytes] = None
     ext: Optional[str] = None
@@ -2776,6 +2847,17 @@ def _stub_daily_run(
 
     if isinstance(artifact_bytes, (bytes, bytearray)) and len(artifact_bytes) > 0:
         artifact_path.write_bytes(bytes(artifact_bytes))
+    track_meta = {
+        "run_id": run_id,
+        "drop_id": drop_id,
+        "context": context,
+        "seed": seed,
+        "deterministic": deterministic,
+        **(meta_from_result or {}),
+    }
+    if provider_fallback_from:
+        track_meta["provider_fallback_from"] = provider_fallback_from
+
     db_insert_track(
         con,
         track_id=track_id,
@@ -2785,15 +2867,20 @@ def _stub_daily_run(
         mood=context,
         genre=(meta_from_result.get("genre") if isinstance(meta_from_result, dict) else None),
         artifact_path=_posix(artifact_rel),
-        meta={
-            "run_id": run_id,
-            "drop_id": drop_id,
-            "context": context,
-            "seed": seed,
-            "deterministic": deterministic,
-            **(meta_from_result or {}),
-        },
+        meta=track_meta,
     )
+
+    drop_meta = {
+        "run_id": run_id,
+        "drop_id": drop_id,
+        "track_id": track_id,
+        "provider": provider_used,
+        "deterministic": deterministic,
+        "seed": seed,
+        "context": context,
+    }
+    if provider_fallback_from:
+        drop_meta["provider_fallback_from"] = provider_fallback_from
 
     db_insert_drop(
         con,
@@ -2803,15 +2890,7 @@ def _stub_daily_run(
         seed=seed,
         run_id=run_id,
         track_id=track_id,
-        meta={
-            "run_id": run_id,
-            "drop_id": drop_id,
-            "track_id": track_id,
-            "provider": provider_used,
-            "deterministic": deterministic,
-            "seed": seed,
-            "context": context,
-        },
+        meta=drop_meta,
     )
 
     db_insert_event(
@@ -2834,7 +2913,8 @@ def _stub_daily_run(
             "drop_id": drop_id,
             "track_id": track_id,
             "artifact_path": _posix(artifact_rel),
-            "provider": getattr(result, "provider", provider_name),
+            "provider": provider_used,
+            **({"provider_fallback_from": provider_fallback_from} if provider_fallback_from else {}),
         },
     )
 
@@ -2925,6 +3005,7 @@ def _stub_daily_run(
         "seed": seed,
         "deterministic": deterministic,
         "provider": provider_used,
+        **({"provider_fallback_from": provider_fallback_from} if provider_fallback_from else {}),
         "ids": {
             "run_id": run_id,
             "drop_id": drop_id,
@@ -2975,7 +3056,8 @@ def _stub_daily_run(
         "run_id": run_id,
         "drop_id": drop_id,
         "track_id": track_id,
-        "provider": getattr(result, "provider", provider_name),
+        "provider": provider_used,
+        **({"provider_fallback_from": provider_fallback_from} if provider_fallback_from else {}),
         "context": context,
         "seed": seed,
         "deterministic": deterministic,
