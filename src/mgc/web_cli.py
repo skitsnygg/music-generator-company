@@ -1377,6 +1377,48 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return out;
     }
 
+    function marketingMetaFromPlan(plan, bundleBase){
+      if (!plan || typeof plan !== "object") return null;
+      const paths = (plan && typeof plan.paths === "object") ? plan.paths : {};
+      const coverObj = (plan.cover && typeof plan.cover === "object") ? plan.cover : {};
+      const mediaObj = (plan.media && typeof plan.media === "object") ? plan.media : {};
+
+      let summary = String(plan.summary || "").trim();
+      let hashtagsText = "";
+      if (plan.hashtags_text) hashtagsText = String(plan.hashtags_text || "").trim();
+      else if (Array.isArray(plan.hashtags)){
+        hashtagsText = plan.hashtags.map(t => "#" + String(t || "").trim()).join(" ").trim();
+      }
+
+      let coverUrl = "";
+      if (plan.cover_url) coverUrl = String(plan.cover_url || "").trim();
+      let coverRel = "";
+      if (!coverUrl){
+        coverRel = String(coverObj.dst || coverObj.path || "").trim();
+        if (!coverRel && paths.cover) coverRel = String(paths.cover || "").trim();
+        if (coverRel) coverUrl = marketingAssetUrl(bundleBase, coverRel);
+      }
+
+      let mediaUrl = "";
+      if (mediaObj.video_url || mediaObj.media_url){
+        mediaUrl = String(mediaObj.video_url || mediaObj.media_url || "").trim();
+      }
+      let mediaRel = "";
+      if (!mediaUrl){
+        mediaRel = String(mediaObj.video_path || mediaObj.media_path || "").trim();
+        if (!mediaRel && paths.media) mediaRel = String(paths.media || "").trim();
+        if (mediaRel) mediaUrl = marketingAssetUrl(bundleBase, mediaRel);
+      }
+
+      if (!summary && !hashtagsText && !coverUrl && !mediaUrl) return null;
+      return {
+        summary,
+        hashtags_text: hashtagsText,
+        cover_url: coverUrl,
+        media_url: mediaUrl,
+      };
+    }
+
     function embeddedBundle(){
       const b = window.__MGC_BUNDLE__;
       if (!b || typeof b !== "object") return null;
@@ -1777,6 +1819,11 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       const manifest = pl && pl.manifest ? pl.manifest : null;
       const mTrack = findManifestTrack(manifest, cur);
       const marketing = manifest && manifest.marketing ? manifest.marketing : null;
+      const plan = pl && pl.marketingPlan ? pl.marketingPlan : null;
+      const planMeta = marketingMetaFromPlan(plan, pl ? pl.bundleBase : "");
+      let summaryText = "";
+      if (marketing && marketing.summary) summaryText = String(marketing.summary || "").trim();
+      if (!summaryText && planMeta && planMeta.summary) summaryText = planMeta.summary;
       let hashtagsText = "";
       if (marketing){
         if (marketing.hashtags_text) hashtagsText = String(marketing.hashtags_text || "").trim();
@@ -1784,6 +1831,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
           hashtagsText = marketing.hashtags.map(t => "#" + String(t || "").trim()).join(" ").trim();
         }
       }
+      if (!hashtagsText && planMeta && planMeta.hashtags_text) hashtagsText = planMeta.hashtags_text;
       let marketingMediaUrl = "";
       if (marketing){
         if (marketing.media_url){
@@ -1794,6 +1842,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
           marketingMediaUrl = computeTrackSrc(pl ? pl.bundleBase : "", "marketing/" + String(marketing.media_path || "").replace(/^\/+/, ""));
         }
       }
+      if (!marketingMediaUrl && planMeta && planMeta.media_url) marketingMediaUrl = planMeta.media_url;
       let marketingCoverUrl = "";
       if (marketing){
         if (marketing.cover_url){
@@ -1804,6 +1853,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
           marketingCoverUrl = computeTrackSrc(pl ? pl.bundleBase : "", "marketing/" + String(marketing.cover_path || "").replace(/^\/+/, ""));
         }
       }
+      if (!marketingCoverUrl && planMeta && planMeta.cover_url) marketingCoverUrl = planMeta.cover_url;
 
       const values = {
         feed_sha: state.feed && state.feed.content_sha256 ? state.feed.content_sha256 : "",
@@ -1815,7 +1865,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         track_relpath: (mTrack && mTrack.relpath) || (cur && cur.path) || "",
         track_sha: (mTrack && mTrack.sha256) || "",
         track_bytes: (mTrack && mTrack.bytes != null) ? String(mTrack.bytes) : "",
-        marketing_summary: marketing && marketing.summary ? String(marketing.summary) : "",
+        marketing_summary: summaryText,
         marketing_hashtags: hashtagsText,
         marketing_media_url: marketingMediaUrl,
         marketing_cover_url: marketingCoverUrl,
@@ -2002,6 +2052,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
                 playlistUrl: bundle.playlistUrl,
                 manifestUrl: bundle.manifestUrl,
                 manifest: bundle.manifest,
+                marketingPlan: bundle.marketingPlan || null,
                 marketing: bundle.marketingPreview || null,
                 tracks: rawTracks,
               });
@@ -2048,6 +2099,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
           playlistUrl: bundle.playlistUrl,
           manifestUrl: bundle.manifestUrl,
           manifest: bundle.manifest,
+          marketingPlan: bundle.marketingPlan || null,
           marketing: bundle.marketingPreview || null,
           tracks: rawTracks,
         });
