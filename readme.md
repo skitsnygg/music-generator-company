@@ -222,9 +222,19 @@ Live integration env:
 
 ---
 
-## End-to-End Demo (One Command)
+## Demo Guide
 
-This repository includes a **single command** that proves the entire system end-to-end.
+Choose the demo path that matches your environment:
+
+**Offline / local (no external services):**
+
+scripts/verify_all.sh
+
+This runs a deterministic end-to-end check using the fixture DB and stub provider:
+music generation, daily/weekly playlists, drop bundle, web build, submission zip,
+marketing receipts, and billing CLI.
+
+**Production-style / VM (requires system services):**
 
 sudo -E scripts/demo_check.sh
 
@@ -236,7 +246,17 @@ This command:
 - Ensures backup contexts are filtered
 - Proves deterministic content via stable hashing
 
-If this script exits successfully, the entire release surface is valid.
+If either script exits successfully, the end-to-end flow is valid for that environment.
+
+---
+
+## Observability & Traceability
+
+Artifacts and logs are emitted on every run for auditability:
+- `data/evidence/` (drop bundles, evidence JSON, manifests)
+- `data/submissions/` (submission.zip + receipts)
+- `data/evidence/marketing/receipts/` (marketing publish receipts)
+- `logs/` and `artifacts/` (run logs, CI artifacts)
 
 ---
 
