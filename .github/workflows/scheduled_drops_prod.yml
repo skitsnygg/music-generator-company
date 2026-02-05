@@ -224,20 +224,7 @@ jobs:
 
           TRACKS="n/a"
           if [ -s "${PLAYLIST_PATH}" ]; then
-            TRACKS="$(python - "$PLAYLIST_PATH" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    tracks = data.get("tracks") or []
-    print(len(tracks))
-except Exception:
-    print("n/a")
-PY
-)"
+            TRACKS="$(python -c 'import json,sys; p=sys.argv[1]; data=json.load(open(p,"r",encoding="utf-8")); print(len(data.get("tracks") or []))' "$PLAYLIST_PATH" 2>/dev/null || echo n/a)"
           fi
 
           AUDIO_COUNT="0"
