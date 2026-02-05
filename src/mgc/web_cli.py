@@ -1214,6 +1214,13 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return urlJoin(prefix, "/releases/feed.json");
     }
 
+    function feedUrlCandidates(){
+      const primary = resolveFeedUrl();
+      const root = "/releases/feed.json";
+      if (primary === root) return [primary];
+      return [primary, root];
+    }
+
     async function fetchJson(url){
       const r = await fetch(url, { cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
@@ -1905,61 +1912,111 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadAllPlaylists(state){
-      const feedUrl = resolveFeedUrl();
-      $("pillFeed").textContent = feedUrl.replace(window.location.origin, "");
-      const feed = await fetchJson(feedUrl);
-      state.feed = feed;
-
-      const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
-      const webCtxs = ctxs.filter(x => x.kind === "web");
-
-      $("plMeta").textContent = webCtxs.length ? `Found ${webCtxs.length} playlists. Loading bundles…` : "No web playlists found in feed.";
-
-      // Load each bundle with a small concurrency limit to avoid a burst
-      const limit = 4;
-      const q = webCtxs.slice();
-      const out = [];
-      let failed = 0;
-
-      async function worker(){
-        while (q.length){
-          const ctx = q.shift();
-          try{
-            const bundle = await loadBundle(ctx);
-            const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
-              const d = trackDisplay(t, i);
-              return {
-                title: d.title,
-                path: d.path,
-                raw: d.raw,
-                src: computeTrackSrc(bundle.bundleBase, d.path),
-              };
-            });
-
-            out.push({
-              context: ctx.context,
-              mtime: ctx.mtime,
-              url: ctx.url,
-              track_count: ctx.track_count,
-              bundleBase: bundle.bundleBase,
-              playlistUrl: bundle.playlistUrl,
-              manifestUrl: bundle.manifestUrl,
-              manifest: bundle.manifest,
-              marketing: bundle.marketingPreview || null,
-              tracks: rawTracks,
-            });
-          }catch (e){
-            failed++;
-            console.error("Failed to load playlist:", ctx && ctx.context, e);
-          }
+      const feedUrls = feedUrlCandidates();
+      let feed = null;
+      let feedUrl = "";
+      for (const cand of feedUrls){
+        try{
+          feed = await fetchJson(cand);
+          feedUrl = cand;
+          break;
+        }catch (e){
+          // try next candidate
         }
       }
 
-      const workers = [];
-      for (let i = 0; i < Math.min(limit, webCtxs.length); i++){
-        workers.push(worker());
+      const out = [];
+      let failed = 0;
+
+      if (feed){
+        $("pillFeed").textContent = stripOrigin(feedUrl);
+        state.feed = feed;
+
+        const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+        const webCtxs = ctxs.filter(x => x.kind === "web");
+
+        $("plMeta").textContent = webCtxs.length ? `Found ${webCtxs.length} playlists. Loading bundles…` : "No web playlists found in feed.";
+
+        // Load each bundle with a small concurrency limit to avoid a burst
+        const limit = 4;
+        const q = webCtxs.slice();
+
+        async function worker(){
+          while (q.length){
+            const ctx = q.shift();
+            try{
+              const bundle = await loadBundle(ctx);
+              const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
+                const d = trackDisplay(t, i);
+                return {
+                  title: d.title,
+                  path: d.path,
+                  raw: d.raw,
+                  src: computeTrackSrc(bundle.bundleBase, d.path),
+                };
+              });
+
+              out.push({
+                context: ctx.context,
+                mtime: ctx.mtime,
+                url: ctx.url,
+                track_count: ctx.track_count,
+                bundleBase: bundle.bundleBase,
+                playlistUrl: bundle.playlistUrl,
+                manifestUrl: bundle.manifestUrl,
+                manifest: bundle.manifest,
+                marketing: bundle.marketingPreview || null,
+                tracks: rawTracks,
+              });
+            }catch (e){
+              failed++;
+              console.error("Failed to load playlist:", ctx && ctx.context, e);
+            }
+          }
+        }
+
+        const workers = [];
+        for (let i = 0; i < Math.min(limit, webCtxs.length); i++){
+          workers.push(worker());
+        }
+        await Promise.all(workers);
+
+        const msg = failed ? `Loaded ${out.length}/${webCtxs.length} playlists (${failed} failed).` : `Loaded ${out.length} playlists.`;
+        $("plMeta").textContent = msg;
+      }else{
+        $("pillFeed").textContent = "local";
+        $("plMeta").textContent = "Feed not available. Loading local bundle…";
+        state.feed = null;
+
+        const ctx = { context: "local", url: "" };
+        const bundle = await loadBundle(ctx);
+        const playlist = bundle.playlist || {};
+        const ctxName = playlist.context || playlist.name || "local";
+        const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
+          const d = trackDisplay(t, i);
+          return {
+            title: d.title,
+            path: d.path,
+            raw: d.raw,
+            src: computeTrackSrc(bundle.bundleBase, d.path),
+          };
+        });
+
+        out.push({
+          context: ctxName,
+          mtime: (bundle.manifest && bundle.manifest.generated_at) ? bundle.manifest.generated_at : "",
+          url: "",
+          track_count: rawTracks.length,
+          bundleBase: bundle.bundleBase,
+          playlistUrl: bundle.playlistUrl,
+          manifestUrl: bundle.manifestUrl,
+          manifest: bundle.manifest,
+          marketing: bundle.marketingPreview || null,
+          tracks: rawTracks,
+        });
+        $("plMeta").textContent = `Loaded local bundle (${ctxName}).`;
+        toast("Local bundle", "Feed not available; loaded playlist.json in this bundle.");
       }
-      await Promise.all(workers);
 
       // Sort playlists (context name)
       out.sort((a,b) => String(a.context).localeCompare(String(b.context)));
@@ -1988,9 +2045,6 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       state.allTracks = all;
 
       setCounts(state);
-
-      const msg = failed ? `Loaded ${out.length}/${webCtxs.length} playlists (${failed} failed).` : `Loaded ${out.length} playlists.`;
-      $("plMeta").textContent = msg;
 
       if (!state.current){
         const pick = pickPlayable(state.allTracks);
@@ -2578,8 +2632,9 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
     if not (out_dir / "index.html").exists():
         for cand in (
-            repo_root / "artifacts" / "player" / "index.html",
+            repo_root / "index.html",
             repo_root / "web" / "index.html",
+            repo_root / "artifacts" / "player" / "index.html",
             repo_root / "assets" / "web" / "index.html",
         ):
             if cand.exists():
