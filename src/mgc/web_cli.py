@@ -1148,6 +1148,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
     <p class="t2" id="toastT2"></p>
   </div>
 
+  <script src="bundle_data.js"></script>
   <script>
     "use strict";
 
@@ -1376,6 +1377,12 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return out;
     }
 
+    function embeddedBundle(){
+      const b = window.__MGC_BUNDLE__;
+      if (!b || typeof b !== "object") return null;
+      return b;
+    }
+
     function findManifestTrack(manifest, track){
       if (!manifest || !track) return null;
       const tracks = Array.isArray(manifest.tracks) ? manifest.tracks : [];
@@ -1437,6 +1444,36 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       const playlistUrl = bundleBase + "playlist.json";
       const manifestUrl = bundleBase + "web_manifest.json";
       const marketingUrl = bundleBase + "marketing/marketing_plan.json";
+
+      const embedded = embeddedBundle();
+      if (embedded && (!ctx || !ctx.url)){
+        const preview = embedded.marketing_preview || null;
+        let teaserUrl = preview && preview.teaser_path ? marketingAssetUrl(bundleBase, preview.teaser_path) : "";
+        let posts = [];
+        if (preview && Array.isArray(preview.posts)){
+          posts = preview.posts.map((p, i) => ({
+            index: p.index || (i + 1),
+            url: "",
+            text: (p && p.text) ? String(p.text).trim() : "",
+          }));
+        }
+        const marketingPreview = preview ? {
+          summary: preview.summary || "",
+          hashtags: preview.hashtags || "",
+          teaser_url: teaserUrl,
+          posts,
+        } : null;
+
+        return {
+          bundleBase,
+          playlistUrl,
+          manifestUrl,
+          playlist: embedded.playlist || null,
+          manifest: embedded.manifest || null,
+          marketingPlan: embedded.marketing_plan || null,
+          marketingPreview,
+        };
+      }
 
       const [playlist, manifest, marketingPlan] = await Promise.all([
         fetchJson(playlistUrl),
@@ -2319,7 +2356,7 @@ def _normalize_playlist_path_arg(p: Path) -> Path:
     return p
 
 
-def _load_marketing_plan_for_playlist(playlist_path: Path) -> Optional[Dict[str, Any]]:
+def _load_marketing_plan_for_playlist(playlist_path: Path) -> Optional[Tuple[Dict[str, Any], Path]]:
     playlist_dir = playlist_path.parent
     candidates = [
         playlist_dir / "marketing" / "marketing_plan.json",
@@ -2333,7 +2370,7 @@ def _load_marketing_plan_for_playlist(playlist_path: Path) -> Optional[Dict[str,
         except Exception:
             continue
         if isinstance(obj, dict):
-            return obj
+            return obj, cand.parent
     return None
 
 
@@ -2394,6 +2431,48 @@ def _marketing_meta_from_plan(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return out if out else None
 
+
+def _read_text_optional(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _marketing_preview_from_plan(plan: Dict[str, Any], plan_dir: Path) -> Optional[Dict[str, Any]]:
+    if not isinstance(plan, dict):
+        return None
+
+    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+
+    summary_text = _read_text_optional(plan_dir / str(paths.get("summary") or ""))
+    if not summary_text:
+        summary_text = str(plan.get("summary") or "").strip()
+
+    hashtags_text = _read_text_optional(plan_dir / str(paths.get("hashtags") or ""))
+    if not hashtags_text:
+        hashtags_text = str(plan.get("hashtags_text") or "").strip()
+    if not hashtags_text and isinstance(plan.get("hashtags"), list):
+        tags = [str(t).strip() for t in plan.get("hashtags") if str(t).strip()]
+        hashtags_text = " ".join([f"#{t}" for t in tags]).strip()
+
+    teaser_rel = str(paths.get("teaser") or "").strip()
+    posts: List[Dict[str, Any]] = []
+    post_paths = paths.get("posts") if isinstance(paths.get("posts"), list) else []
+    for idx, rel in enumerate(post_paths, start=1):
+        text = _read_text_optional(plan_dir / str(rel))
+        posts.append({"index": idx, "text": text})
+
+    if not summary_text and not hashtags_text and not teaser_rel and not posts:
+        return None
+
+    return {
+        "summary": summary_text,
+        "hashtags": hashtags_text,
+        "teaser_path": teaser_rel,
+        "posts": posts,
+    }
+
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(getattr(args, "playlist"))).expanduser().resolve()
     playlist_path = _normalize_playlist_path_arg(playlist_path)
@@ -2412,8 +2491,15 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_dir = playlist_path.parent
 
     playlist_obj = json.loads(playlist_path.read_text(encoding="utf-8"))
-    marketing_plan = _load_marketing_plan_for_playlist(playlist_path)
+    marketing_plan = None
+    marketing_plan_dir = None
+    marketing_preview = None
+    plan_data = _load_marketing_plan_for_playlist(playlist_path)
+    if plan_data:
+        marketing_plan, marketing_plan_dir = plan_data
     marketing_meta = _marketing_meta_from_plan(marketing_plan) if marketing_plan else None
+    if marketing_plan and marketing_plan_dir:
+        marketing_preview = _marketing_preview_from_plan(marketing_plan, marketing_plan_dir)
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
     fail_if_empty = bool(getattr(args, "fail_if_empty", False))
@@ -2645,6 +2731,16 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     if not (out_dir / "index.html").exists():
         (out_dir / "index.html").write_text(_EMBEDDED_INDEX_HTML, encoding="utf-8")
 
+    bundle_data = {
+        "playlist": playlist_obj,
+        "manifest": None,
+        "marketing_plan": marketing_plan,
+        "marketing_preview": marketing_preview,
+    }
+    (out_dir / "bundle_data.js").write_text(
+        "window.__MGC_BUNDLE__ = " + _stable_json_dumps(bundle_data) + ";\n", encoding="utf-8"
+    )
+
     # Build + write manifest LAST (tree hash sees final bundle)
     manifest = _build_web_manifest(
         out_dir=out_dir,
@@ -2655,6 +2751,11 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         marketing=marketing_meta,
     )
     (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
+    # Update embedded bundle data with manifest now that it's available.
+    bundle_data["manifest"] = manifest
+    (out_dir / "bundle_data.js").write_text(
+        "window.__MGC_BUNDLE__ = " + _stable_json_dumps(bundle_data) + ";\n", encoding="utf-8"
+    )
 
     # Validate (emit JSON on failure rather than a silent SystemExit)
     try:

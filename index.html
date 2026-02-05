@@ -731,6 +731,7 @@
     <p class="t2" id="toastT2"></p>
   </div>
 
+  <script src="bundle_data.js"></script>
   <script>
     "use strict";
 
@@ -959,6 +960,12 @@
       return out;
     }
 
+    function embeddedBundle(){
+      const b = window.__MGC_BUNDLE__;
+      if (!b || typeof b !== "object") return null;
+      return b;
+    }
+
     function findManifestTrack(manifest, track){
       if (!manifest || !track) return null;
       const tracks = Array.isArray(manifest.tracks) ? manifest.tracks : [];
@@ -1020,6 +1027,36 @@
       const playlistUrl = bundleBase + "playlist.json";
       const manifestUrl = bundleBase + "web_manifest.json";
       const marketingUrl = bundleBase + "marketing/marketing_plan.json";
+
+      const embedded = embeddedBundle();
+      if (embedded && (!ctx || !ctx.url)){
+        const preview = embedded.marketing_preview || null;
+        let teaserUrl = preview && preview.teaser_path ? marketingAssetUrl(bundleBase, preview.teaser_path) : "";
+        let posts = [];
+        if (preview && Array.isArray(preview.posts)){
+          posts = preview.posts.map((p, i) => ({
+            index: p.index || (i + 1),
+            url: "",
+            text: (p && p.text) ? String(p.text).trim() : "",
+          }));
+        }
+        const marketingPreview = preview ? {
+          summary: preview.summary || "",
+          hashtags: preview.hashtags || "",
+          teaser_url: teaserUrl,
+          posts,
+        } : null;
+
+        return {
+          bundleBase,
+          playlistUrl,
+          manifestUrl,
+          playlist: embedded.playlist || null,
+          manifest: embedded.manifest || null,
+          marketingPlan: embedded.marketing_plan || null,
+          marketingPreview,
+        };
+      }
 
       const [playlist, manifest, marketingPlan] = await Promise.all([
         fetchJson(playlistUrl),
