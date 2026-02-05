@@ -330,10 +330,10 @@ jobs:
           mkdir -p "${WEEKLY1}" "${WEEKLY2}" "${OUT1}" "${OUT2}"
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
-            --context focus --out-dir "${WEEKLY1}" --deterministic --period-key "${PERIOD_KEY}"
+            --context focus --out-dir "${WEEKLY1}" --deterministic --period-key "${PERIOD_KEY}" --provider stub
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
-            --context focus --out-dir "${WEEKLY2}" --deterministic --period-key "${PERIOD_KEY}"
+            --context focus --out-dir "${WEEKLY2}" --deterministic --period-key "${PERIOD_KEY}" --provider stub
 
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${WEEKLY1}/drop_bundle" --deterministic --dry-run \
@@ -364,10 +364,10 @@ jobs:
           mkdir -p "${OUT1}" "${OUT2}"
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
-            --context focus --out-dir "${OUT1}" --deterministic --period-key 2020-W01
+            --context focus --out-dir "${OUT1}" --deterministic --period-key 2020-W01 --provider stub
 
           python -m mgc.main --db "${MGC_DB}" --seed 1 run weekly \
-            --context focus --out-dir "${OUT2}" --deterministic --period-key 2020-W01
+            --context focus --out-dir "${OUT2}" --deterministic --period-key 2020-W01 --provider stub
 
           python -m mgc.main --db "${MGC_DB}" run publish-marketing \
             --bundle-dir "${OUT1}/drop_bundle" --deterministic --dry-run --out-dir "${OUT1}" \
