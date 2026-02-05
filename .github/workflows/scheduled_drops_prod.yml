@@ -2,6 +2,39 @@ name: scheduled_drops_prod
 
 on:
   workflow_dispatch:
+    inputs:
+      context:
+        description: "Context/mood (focus/workout/sleep)"
+        required: false
+        default: "focus"
+      provider:
+        description: "Provider override (riffusion/stub/filesystem/diffsinger)"
+        required: false
+        default: ""
+      riffusion_url:
+        description: "Riffusion URL override (http://host:3013/run_inference)"
+        required: false
+        default: ""
+      seed:
+        description: "Seed override (default 1)"
+        required: false
+        default: "1"
+      fallback_to_stub:
+        description: "Fallback to stub if riffusion unreachable (0/1)"
+        required: false
+        default: "0"
+      min_free_mb:
+        description: "Minimum free disk MB required"
+        required: false
+        default: "1024"
+      run_retries:
+        description: "Retries for run autonomous"
+        required: false
+        default: "2"
+      run_retry_sleep:
+        description: "Seconds between run autonomous retries"
+        required: false
+        default: "10"
   schedule:
     # 09:00 UTC daily
     - cron: "0 9 * * *"
@@ -22,16 +55,20 @@ jobs:
       # Absolute prod paths on the runner
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
 
-      # Provider selection via Actions variables
-      MGC_PROVIDER: "${{ vars.MGC_PROVIDER || 'riffusion' }}"
-      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
+      # Inputs override defaults; fall back to repo variables.
+      MGC_CONTEXT: "${{ github.event.inputs.context || 'focus' }}"
+      MGC_SEED: "${{ github.event.inputs.seed || '1' }}"
+
+      # Provider selection via inputs/variables.
+      MGC_PROVIDER: "${{ github.event.inputs.provider || vars.MGC_PROVIDER || 'riffusion' }}"
+      MGC_RIFFUSION_URL: "${{ github.event.inputs.riffusion_url || vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
       MGC_RIFFUSION_TIMEOUT: "${{ vars.MGC_RIFFUSION_TIMEOUT || '180' }}"
       MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
-      MGC_MIN_FREE_MB: "${{ vars.MGC_MIN_FREE_MB || '1024' }}"
-      MGC_FALLBACK_TO_STUB: "${{ vars.MGC_FALLBACK_TO_STUB || '0' }}"
-      MGC_RUN_AUTONOMOUS_RETRIES: "${{ vars.MGC_RUN_AUTONOMOUS_RETRIES || '2' }}"
-      MGC_RUN_AUTONOMOUS_RETRY_SLEEP: "${{ vars.MGC_RUN_AUTONOMOUS_RETRY_SLEEP || '10' }}"
+      MGC_MIN_FREE_MB: "${{ github.event.inputs.min_free_mb || vars.MGC_MIN_FREE_MB || '1024' }}"
+      MGC_FALLBACK_TO_STUB: "${{ github.event.inputs.fallback_to_stub || vars.MGC_FALLBACK_TO_STUB || '0' }}"
+      MGC_RUN_AUTONOMOUS_RETRIES: "${{ github.event.inputs.run_retries || vars.MGC_RUN_AUTONOMOUS_RETRIES || '2' }}"
+      MGC_RUN_AUTONOMOUS_RETRY_SLEEP: "${{ github.event.inputs.run_retry_sleep || vars.MGC_RUN_AUTONOMOUS_RETRY_SLEEP || '10' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
@@ -77,6 +114,8 @@ jobs:
           echo "MGC_RIFFUSION_TIMEOUT=${MGC_RIFFUSION_TIMEOUT:-}"
           echo "MGC_RIFFUSION_RETRIES=${MGC_RIFFUSION_RETRIES:-}"
           echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
+          echo "MGC_CONTEXT=${MGC_CONTEXT:-}"
+          echo "MGC_SEED=${MGC_SEED:-}"
           echo "MGC_MIN_FREE_MB=${MGC_MIN_FREE_MB:-}"
           echo "MGC_FALLBACK_TO_STUB=${MGC_FALLBACK_TO_STUB:-}"
           echo "MGC_RUN_AUTONOMOUS_RETRIES=${MGC_RUN_AUTONOMOUS_RETRIES:-}"
@@ -171,7 +210,8 @@ jobs:
 
           mkdir -p "${MGC_PROD_RELEASES}"
 
-          CONTEXT="focus"
+          CONTEXT="${MGC_CONTEXT:-focus}"
+          SEED="${MGC_SEED:-1}"
           RUN_KEY="run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
           OUT="${MGC_PROD_RELEASES}/${RUN_KEY}/${CONTEXT}"
 
@@ -185,7 +225,7 @@ jobs:
             attempt=$((attempt + 1))
             if python -m mgc.main \
               --db /var/lib/mgc/db.sqlite \
-              --seed 1 \
+              --seed "${SEED}" \
               --no-resume \
               run autonomous \
                 --context "$CONTEXT" \
@@ -207,6 +247,7 @@ jobs:
           test -s "$OUT/web/web_manifest.json"
 
           echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
+          echo "seed=${SEED}" >> "$GITHUB_OUTPUT"
           echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
           echo "web_dir=${OUT}/web" >> "$GITHUB_OUTPUT"
           echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
@@ -330,6 +371,7 @@ jobs:
           WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
           PLAYLIST_PATH="${{ steps.run_auto.outputs.playlist_path }}"
           CONTEXT="${{ steps.run_auto.outputs.context }}"
+          SEED="${{ steps.run_auto.outputs.seed }}"
           PREFLIGHT_DUR="${{ steps.preflight.outputs.duration_sec }}"
           RUN_DUR="${{ steps.run_auto.outputs.duration_sec }}"
           WEB_DUR="${{ steps.web_validate.outputs.duration_sec }}"
@@ -411,6 +453,7 @@ jobs:
             fi
             echo "- Riffusion URL: ${RIFF_URL}"
             echo "- Context: ${CONTEXT:-focus}"
+            echo "- Seed: ${SEED:-n/a}"
             echo "- Drop ID: ${DROP_ID}"
             echo "- Run ID: ${RUN_ID}"
             echo "- Output dir: ${OUT_DIR:-}"
