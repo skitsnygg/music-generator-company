@@ -80,6 +80,29 @@ def maybe_get(d, key, default="n/a"):
         return d[key]
     return default
 
+def discover_web_contexts(root: Path):
+    if not root.exists() or not root.is_dir():
+        return []
+    include_backups = os.environ.get("MGC_REPORT_INCLUDE_BACKUPS", "0") == "1"
+    out = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name.startswith("."):
+            continue
+        if ".bak." in child.name and not include_backups:
+            continue
+        if (child / "web_manifest.json").exists() or (child / "playlist.json").exists() or (child / "index.html").exists():
+            out.append(child.name)
+    return sorted(out)
+
+def parse_contexts_env():
+    raw = os.environ.get("MGC_REPORT_CONTEXTS", "").strip()
+    if not raw:
+        return []
+    parts = raw.replace(",", " ").split()
+    return [p for p in parts if p]
+
 def report_text(feed):
     if feed is None:
         print("[demo_report] feed: missing")
@@ -100,16 +123,13 @@ def report_text(feed):
 
     return contexts
 
-def report_context(ctx_obj):
-    if not isinstance(ctx_obj, dict):
-        return
-    ctx = str(ctx_obj.get("context") or "")
+def report_context(ctx_name, ctx_obj):
+    ctx = str(ctx_name or "")
     if not ctx:
         return
 
     ctx_dir = web_root / ctx
     manifest = read_json(ctx_dir / "web_manifest.json") if ctx_dir.exists() else None
-    playlist = read_json(ctx_dir / "playlist.json") if ctx_dir.exists() else None
 
     manifest_tracks = manifest.get("tracks") if isinstance(manifest, dict) else None
     manifest_track_count = len(manifest_tracks) if isinstance(manifest_tracks, list) else "n/a"
@@ -131,13 +151,36 @@ def report_context(ctx_obj):
     print(f"[demo_report]  drop_id={drop_id} run_id={run_id}")
 
 feed = read_json(feed_path) if feed_path.exists() else None
-contexts = report_text(feed)
+feed_contexts = report_text(feed)
+feed_names = [c.get("context") for c in feed_contexts if isinstance(c, dict) and c.get("context")]
+feed_map = {c["context"]: c for c in feed_contexts if isinstance(c, dict) and c.get("context")}
+web_contexts = discover_web_contexts(web_root)
 
-if not contexts:
-    print("[demo_report] WARN: no contexts in feed")
+print(f"[demo_report] web.latest.contexts: {len(web_contexts)}")
+if web_contexts:
+    print(f"[demo_report] web.latest.context_names: {', '.join(web_contexts)}")
+
+if feed_names:
+    missing_on_disk = [c for c in feed_names if c not in web_contexts]
+    missing_in_feed = [c for c in web_contexts if c not in feed_names]
+    if missing_on_disk:
+        print(f"[demo_report] WARN: feed contexts missing on disk: {missing_on_disk}")
+    if missing_in_feed:
+        print(f"[demo_report] WARN: web contexts missing in feed: {missing_in_feed}")
+
+requested = parse_contexts_env()
+if requested:
+    report_contexts = requested
+elif feed_names:
+    report_contexts = feed_names
 else:
-    for ctx in contexts:
-        report_context(ctx)
+    report_contexts = web_contexts
+
+if not report_contexts:
+    print("[demo_report] WARN: no contexts to report")
+else:
+    for ctx in report_contexts:
+        report_context(ctx, feed_map.get(ctx))
 
 if os.environ.get("MGC_REPORT_JSON") == "1":
     summary = {
@@ -145,6 +188,9 @@ if os.environ.get("MGC_REPORT_JSON") == "1":
         "feed": feed,
         "web_root": str(web_root),
         "out_base": str(out_base) if out_base else "",
+        "feed_contexts": feed_names,
+        "web_contexts": web_contexts,
+        "report_contexts": report_contexts,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
 PY

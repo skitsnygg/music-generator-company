@@ -286,6 +286,11 @@ MGC_PROVIDER=riffusion MGC_DEMO_FALLBACK_TO_STUB=1 scripts/demo_smoke.sh
 
 scripts/demo_report.sh
 
+Filter contexts or include backups:
+
+MGC_REPORT_CONTEXTS="focus sleep" scripts/demo_report.sh  
+MGC_REPORT_INCLUDE_BACKUPS=1 scripts/demo_report.sh
+
 **Demo cleanup (safe, prompt-based):**
 
 scripts/demo_clean.sh
