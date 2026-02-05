@@ -493,6 +493,28 @@ def _run_ffmpeg(cmd: list[str]) -> None:
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", errors="replace")[-2000:])
 
+def _mp3_quality_args() -> list[str]:
+    q = (os.environ.get("MGC_MP3_QUALITY") or "v0").strip().lower()
+    if q in ("v0", "0", "vbr0"):
+        return ["-q:a", "0"]
+    if q in ("v1", "1", "vbr1"):
+        return ["-q:a", "1"]
+    if q in ("v2", "2", "vbr2"):
+        return ["-q:a", "2"]
+    if q in ("v4", "4", "vbr4"):
+        return ["-q:a", "4"]
+    if q in ("v5", "5", "vbr5"):
+        return ["-q:a", "5"]
+    if q in ("320", "320k", "cbr320"):
+        return ["-b:a", "320k"]
+    if q in ("256", "256k", "cbr256"):
+        return ["-b:a", "256k"]
+    if q in ("192", "192k", "cbr192"):
+        return ["-b:a", "192k"]
+    if q in ("server", ""):
+        return ["-q:a", "0"]
+    return ["-q:a", "0"]
+
 def _transcode_wav_to_mp3(src_wav: Path, dst_mp3: Path) -> None:
     dst_mp3.parent.mkdir(parents=True, exist_ok=True)
     _require_nonempty_file(src_wav)
@@ -511,7 +533,7 @@ def _transcode_wav_to_mp3(src_wav: Path, dst_mp3: Path) -> None:
         "-map_metadata", "-1",
         "-write_id3v2", "0",
         "-codec:a", "libmp3lame",
-        "-b:a", "192k",
+        *_mp3_quality_args(),
         str(dst_mp3),
     ]
     _run_ffmpeg(cmd)
@@ -2126,6 +2148,7 @@ def db_insert_track(
     path_col = _pick_first_existing(cols, ["full_path", "artifact_path", "audio_path", "path", "file_path", "uri"])
     preview_col = _pick_first_existing(cols, ["preview_path", "preview", "teaser_path"])
     bpm_col = _pick_first_existing(cols, ["bpm", "tempo"])
+    duration_col = _pick_first_existing(cols, ["duration_sec", "duration_s", "duration"])
 
     # tracks.genre is NOT NULL in our canonical schema.
     genre_norm = (genre or "").strip()
@@ -2250,6 +2273,20 @@ def db_insert_track(
             bpm_val = _stable_int_from_key(f"{track_id}|{title}|{provider}|{bpm_col}", 60, 140)
 
         data[bpm_col] = int(bpm_val)
+
+    if duration_col:
+        dur_val: Optional[float] = None
+        for key in ("duration_sec", "duration_s", "duration", "seconds"):
+            raw = meta.get(key)
+            if raw is None:
+                continue
+            try:
+                dur_val = float(raw)
+                break
+            except Exception:
+                dur_val = None
+        if dur_val is not None:
+            data[duration_col] = float(dur_val)
 
     _insert_row(con, "tracks", data)
 

@@ -447,6 +447,16 @@ Requires a local inference server.
 export MGC_PROVIDER=riffusion  
 export MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference
 export MGC_RIFFUSION_PREFLIGHT_TIMEOUT=1.5
+export MGC_RIFFUSION_READ_TIMEOUT=120
+export MGC_MP3_QUALITY=v0
+export MGC_RIFFUSION_TARGET_SECONDS=120
+export MGC_RIFFUSION_SEGMENT_SECONDS=8
+export MGC_RIFFUSION_CROSSFADE_SECONDS=1.5
+export MGC_RIFFUSION_MAX_SEGMENTS=32
+export MGC_RIFFUSION_LONGFORM_PROMPT=1
+
+Notes:
+- VBR encoding + crossfaded long-form stitching use `ffmpeg` (or `lame` if available).
 
 **Optional: Stub Provider (Deterministic/CI)**  
 Fully deterministic, offline, CI-safe.

@@ -37,6 +37,16 @@ def _env_str(name: str, default: str = "") -> str:
     return (v if v is not None else default).strip()
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+
 def _has_kw(fn: Any, key: str) -> bool:
     try:
         sig = inspect.signature(fn)
@@ -52,21 +62,56 @@ def _which(cmd: str) -> Optional[str]:
         return None
 
 
+def _parse_mp3_quality(quality: str) -> tuple[str, Optional[int], str]:
+    q = (quality or "").strip().lower()
+    if not q or q == "server":
+        return ("server", None, "server")
+    if q in ("v0", "0", "vbr0"):
+        return ("vbr", 0, "v0")
+    if q in ("v1", "1", "vbr1"):
+        return ("vbr", 1, "v1")
+    if q in ("v2", "2", "vbr2"):
+        return ("vbr", 2, "v2")
+    if q in ("v3", "3", "vbr3"):
+        return ("vbr", 3, "v3")
+    if q in ("v4", "4", "vbr4"):
+        return ("vbr", 4, "v4")
+    if q in ("v5", "5", "vbr5"):
+        return ("vbr", 5, "v5")
+    if q in ("v6", "6", "vbr6"):
+        return ("vbr", 6, "v6")
+    if q in ("v7", "7", "vbr7"):
+        return ("vbr", 7, "v7")
+    if q in ("v8", "8", "vbr8"):
+        return ("vbr", 8, "v8")
+    if q in ("v9", "9", "vbr9"):
+        return ("vbr", 9, "v9")
+    if q in ("320", "320k", "cbr320"):
+        return ("cbr", 320, "320")
+    if q in ("256", "256k", "cbr256"):
+        return ("cbr", 256, "256")
+    if q in ("192", "192k", "cbr192"):
+        return ("cbr", 192, "192")
+    raise ProviderError(
+        f"Unsupported MGC_MP3_QUALITY='{quality}'. Use 'v0', 'v2', 'v4', '320', or 'server'."
+    )
+
+
 def _encode_mp3_with_lame(wav_path: Path, mp3_path: Path, *, quality: str) -> Dict[str, Any]:
     """
     Deterministic MP3 encoding via LAME.
 
     quality:
-      - "v0": VBR V0 (recommended)
+      - "v0"/"v2"/"v4": VBR levels (0 = best)
       - "320": CBR 320kbps
     """
     lame = _which("lame")
     if not lame:
         raise ProviderError("MGC_MP3_QUALITY requested LAME encoding but 'lame' was not found on PATH.")
 
-    q = (quality or "").strip().lower()
-    if q not in ("v0", "320"):
-        raise ProviderError(f"Unsupported MGC_MP3_QUALITY='{quality}'. Use 'v0' or '320' or 'server'.")
+    mode, qval, qnorm = _parse_mp3_quality(quality)
+    if mode == "server":
+        raise ProviderError("MGC_MP3_QUALITY='server' does not require LAME encoding.")
 
     cmd = [
         lame,
@@ -75,10 +120,11 @@ def _encode_mp3_with_lame(wav_path: Path, mp3_path: Path, *, quality: str) -> Di
         "--silent",
     ]
 
-    if q == "v0":
-        cmd += ["-V0"]
+    if mode == "vbr":
+        qval_i = int(qval or 0)
+        cmd += [f"-V{qval_i}"]
     else:
-        cmd += ["--cbr", "-b", "320"]
+        cmd += ["--cbr", "-b", str(int(qval or 320))]
 
     cmd += [str(wav_path), str(mp3_path)]
     subprocess.run(cmd, check=True)
@@ -86,8 +132,168 @@ def _encode_mp3_with_lame(wav_path: Path, mp3_path: Path, *, quality: str) -> Di
     # keep meta small + path-free (determinism / privacy)
     return {
         "mp3_encoder": "lame",
-        "mp3_quality": q,
+        "mp3_quality": qnorm,
         "mp3_flags": " ".join(cmd[1:7]),
+    }
+
+
+def _encode_mp3_with_ffmpeg(wav_path: Path, mp3_path: Path, *, quality: str) -> Dict[str, Any]:
+    ffmpeg = _which("ffmpeg")
+    if not ffmpeg:
+        raise ProviderError("MGC_MP3_QUALITY requested MP3 encoding but 'ffmpeg' was not found on PATH.")
+
+    mode, qval, qnorm = _parse_mp3_quality(quality)
+    if mode == "server":
+        raise ProviderError("MGC_MP3_QUALITY='server' does not require ffmpeg encoding.")
+
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(wav_path),
+        "-vn",
+        "-map_metadata",
+        "-1",
+        "-write_id3v2",
+        "0",
+        "-codec:a",
+        "libmp3lame",
+    ]
+
+    if mode == "vbr":
+        cmd += ["-q:a", str(int(qval or 0))]
+    else:
+        cmd += ["-b:a", f"{int(qval or 320)}k"]
+
+    cmd += [str(mp3_path)]
+    subprocess.run(cmd, check=True)
+
+    return {
+        "mp3_encoder": "ffmpeg",
+        "mp3_quality": qnorm,
+        "mp3_flags": " ".join(cmd[1:9]),
+    }
+
+
+def _encode_mp3(wav_path: Path, mp3_path: Path, *, quality: str) -> Dict[str, Any]:
+    if _which("lame"):
+        try:
+            return _encode_mp3_with_lame(wav_path, mp3_path, quality=quality)
+        except Exception:
+            pass
+    return _encode_mp3_with_ffmpeg(wav_path, mp3_path, quality=quality)
+
+
+def _probe_duration_seconds(path: Path) -> float:
+    try:
+        if path.suffix.lower() == ".wav":
+            import wave
+
+            with wave.open(str(path), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or 1
+                return float(frames) / float(rate)
+    except Exception:
+        pass
+
+    ffprobe = _which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path),
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        return float(out.decode("utf-8", errors="replace").strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _stitch_segments_with_crossfade(
+    segments: list[Path],
+    out_mp3: Path,
+    *,
+    crossfade_s: float,
+    target_s: float,
+    mp3_quality: str,
+) -> Dict[str, Any]:
+    ffmpeg = _which("ffmpeg")
+    if not ffmpeg:
+        raise ProviderError("Crossfades require ffmpeg, but it was not found on PATH.")
+
+    if not segments:
+        raise ProviderError("no riffusion segments to stitch")
+    if len(segments) == 1:
+        shutil.copy2(segments[0], out_mp3)
+        return {"mp3_encoder": "copy", "mp3_quality": "server"}
+
+    inputs: list[str] = []
+    for seg in segments:
+        inputs += ["-i", str(seg)]
+
+    parts: list[str] = []
+    prev = "[0:a]"
+    for i in range(1, len(segments)):
+        out = f"[a{i}]"
+        parts.append(f"{prev}[{i}:a]acrossfade=d={crossfade_s}:c1=tri:c2=tri{out}")
+        prev = out
+
+    filter_complex = ";".join(parts)
+
+    mode, qval, qnorm = _parse_mp3_quality(mp3_quality)
+    if mode == "server":
+        mode = "vbr"
+        qval = 0
+        qnorm = "v0"
+
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        prev,
+    ]
+    if target_s > 0:
+        cmd += ["-t", f"{float(target_s):.3f}"]
+    cmd += [
+        "-vn",
+        "-map_metadata",
+        "-1",
+        "-write_id3v2",
+        "0",
+        "-codec:a",
+        "libmp3lame",
+    ]
+    if mode == "vbr":
+        cmd += ["-q:a", str(int(qval or 0))]
+    else:
+        cmd += ["-b:a", f"{int(qval or 320)}k"]
+    cmd += [str(out_mp3)]
+
+    subprocess.run(cmd, check=True)
+
+    return {
+        "mp3_encoder": "ffmpeg",
+        "mp3_quality": qnorm,
+        "segment_count": int(len(segments)),
+        "crossfade_seconds": float(crossfade_s),
     }
 
 
@@ -95,8 +301,8 @@ class RiffusionAdapter:
     """
     Adapter returns a dict so downstream kwarg filtering doesn't drop ext/mime.
 
-    We prefer: server WAV -> LAME encode -> MP3 bytes.
-    Fallback: server MP3 bytes (quality="server").
+    We prefer: server WAV -> VBR encode -> MP3 bytes.
+    Fallback: server MP3 bytes (quality="server") when re-encode isn't possible.
     """
 
     name = "riffusion"
@@ -142,6 +348,29 @@ class RiffusionAdapter:
 
         prompt = req.prompt or spec.prompt
 
+        target_seconds = _env_float("MGC_RIFFUSION_TARGET_SECONDS", 120.0)
+        segment_seconds = _env_float("MGC_RIFFUSION_SEGMENT_SECONDS", 8.0)
+        crossfade_seconds = _env_float("MGC_RIFFUSION_CROSSFADE_SECONDS", 1.5)
+        max_segments = int(_env_float("MGC_RIFFUSION_MAX_SEGMENTS", 32.0))
+        if max_segments <= 0:
+            max_segments = 1
+
+        longform_hint = _env_str("MGC_RIFFUSION_LONGFORM_PROMPT", "1").strip()
+        if target_seconds > 0:
+            hint_text = ""
+            if longform_hint.lower() in ("0", "false", "no", "off"):
+                hint_text = ""
+            elif longform_hint.lower() in ("1", "true", "yes", "on"):
+                tags = ", ".join(spec.tags)
+                hint_text = (
+                    f"Playlist context: {spec.name} ({tags}). "
+                    f"Long-form, cohesive, evolving structure, ~{int(target_seconds)}s. No vocals."
+                )
+            else:
+                hint_text = longform_hint
+            if hint_text:
+                prompt = f"{prompt}\n{hint_text}".strip()
+
         # optional overrides
         steps_env = _env_str("RIFFUSION_STEPS") or _env_str("MGC_RIFFUSION_STEPS")
         guidance_env = _env_str("RIFFUSION_GUIDANCE") or _env_str("MGC_RIFFUSION_GUIDANCE")
@@ -155,95 +384,142 @@ class RiffusionAdapter:
 
         # MP3 quality selection:
         #   server: trust server MP3
-        #   v0: LAME V0 from server WAV (preferred)
-        #   320: LAME 320 from server WAV
-        mp3_quality = (_env_str("MGC_MP3_QUALITY", "server") or "server").lower()
-        want_lame = mp3_quality in ("v0", "320")
+        #   v0: VBR V0 (default)
+        #   320: CBR 320kbps
+        mp3_quality = (_env_str("MGC_MP3_QUALITY", "v0") or "v0").lower()
+        mode, _, mp3_quality_norm = _parse_mp3_quality(mp3_quality)
+        want_reencode = mode != "server"
 
         mp3_bytes: bytes
         preview_bytes: Optional[bytes] = None
         enc_meta: Dict[str, Any] = {}
+        duration_sec = 0.0
+        segment_count = 1
+        xfade_used = 0.0
 
         with tempfile.TemporaryDirectory(prefix="mgc_riffusion_") as td:
             td_path = Path(td)
             out_preview = td_path / f"{req.track_id}.jpg"
             out_mp3 = td_path / f"{req.track_id}.mp3"
-            out_wav = td_path / f"{req.track_id}.wav"
 
-            # Prefer WAV path if provider supports it and we want LAME encoding.
-            used_wav = False
+            segments: list[Path] = []
+            seg_durations: list[float] = []
+            total_seconds = 0.0
+            longform = target_seconds > 0
 
-            try:
-                if want_lame and _has_kw(prov.generate, "out_wav"):
-                    prov.generate(
-                        out_wav=out_wav,
-                        out_preview_jpg=out_preview,
-                        title=title,
-                        mood=mood,
-                        genre=genre,
-                        bpm=int(bpm),
-                        prompt=prompt,
-                        seed=seed_int,
-                        num_inference_steps=num_steps,
-                        guidance=guidance,
-                        denoising=denoise,
-                        timeout_s=timeout_s,
+            for i in range(max_segments):
+                seg_mp3 = td_path / f"{req.track_id}_seg{i}.mp3"
+                seg_wav = td_path / f"{req.track_id}_seg{i}.wav"
+                seg_preview = out_preview if i == 0 else None
+
+                seg_seed = seed_int
+                if seed_int is not None:
+                    seg_seed = _stable_int_from_key(
+                        f"{req.track_id}|seg={i}|seed={req.seed}|context={req.context}",
+                        1,
+                        2_000_000_000,
                     )
-                    if out_wav.exists() and out_wav.stat().st_size > 0:
-                        used_wav = True
-                else:
-                    prov.generate(
-                        out_mp3=out_mp3,
-                        out_preview_jpg=out_preview,
-                        title=title,
-                        mood=mood,
-                        genre=genre,
-                        bpm=int(bpm),
-                        prompt=prompt,
-                        seed=seed_int,
-                        num_inference_steps=num_steps,
-                        guidance=guidance,
-                        denoising=denoise,
-                        timeout_s=timeout_s,
-                    )
-            except TypeError:
-                # Signature mismatch (older provider): retry with MP3-only
-                prov.generate(
-                    out_mp3=out_mp3,
-                    out_preview_jpg=out_preview,
+
+                call_kwargs = dict(
+                    out_mp3=seg_mp3,
+                    out_preview_jpg=seg_preview,
                     title=title,
                     mood=mood,
                     genre=genre,
                     bpm=int(bpm),
                     prompt=prompt,
-                    seed=seed_int,
+                    seed=seg_seed,
                     num_inference_steps=num_steps,
                     guidance=guidance,
                     denoising=denoise,
                     timeout_s=timeout_s,
                 )
-            except Exception as e:
-                raise ProviderError(f"riffusion.generate failed: {e}") from e
 
-            if out_preview.exists() and out_preview.stat().st_size > 0:
-                preview_bytes = out_preview.read_bytes()
+                if _has_kw(prov.generate, "out_wav") and (want_reencode or longform):
+                    call_kwargs["out_wav"] = seg_wav
 
-            if used_wav:
-                # encode with LAME
                 try:
-                    enc_meta = _encode_mp3_with_lame(out_wav, out_mp3, quality=mp3_quality)
+                    prov.generate(**call_kwargs)
+                except TypeError:
+                    # Signature mismatch (older provider): retry with MP3-only
+                    call_kwargs.pop("out_wav", None)
+                    prov.generate(**call_kwargs)
                 except Exception as e:
-                    raise ProviderError(f"riffusion mp3 re-encode failed: {e}") from e
+                    raise ProviderError(f"riffusion.generate failed: {e}") from e
+
+                if i == 0 and seg_preview and seg_preview.exists() and seg_preview.stat().st_size > 0:
+                    preview_bytes = seg_preview.read_bytes()
+
+                seg_path: Optional[Path] = None
+                if seg_wav.exists() and seg_wav.stat().st_size > 0:
+                    seg_path = seg_wav
+                elif seg_mp3.exists() and seg_mp3.stat().st_size > 0:
+                    seg_path = seg_mp3
+
+                if not seg_path:
+                    raise ProviderError("riffusion did not produce an audio artifact (missing or empty).")
+
+                segments.append(seg_path)
+                seg_dur = _probe_duration_seconds(seg_path)
+                if seg_dur <= 0:
+                    seg_dur = float(segment_seconds)
+                seg_durations.append(seg_dur)
+
+                if i == 0:
+                    total_seconds += seg_dur
+                else:
+                    total_seconds += max(0.0, seg_dur - crossfade_seconds)
+
+                if not longform:
+                    break
+                if total_seconds >= target_seconds:
+                    break
+
+            if not segments:
+                raise ProviderError("riffusion did not produce any segments.")
+
+            segment_count = len(segments)
+            if len(segments) > 1:
+                min_seg = min(seg_durations) if seg_durations else float(segment_seconds)
+                xfade = max(0.1, min(float(crossfade_seconds), max(0.1, min_seg * 0.5)))
+                xfade_used = float(xfade)
+                trim_target = float(target_seconds) if total_seconds >= target_seconds else 0.0
+                enc_meta = _stitch_segments_with_crossfade(
+                    segments,
+                    out_mp3,
+                    crossfade_s=xfade,
+                    target_s=trim_target,
+                    mp3_quality=mp3_quality,
+                )
+                if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
+                    raise ProviderError("riffusion crossfade output missing or empty.")
+                mp3_bytes = out_mp3.read_bytes()
+                duration_sec = _probe_duration_seconds(out_mp3) or (trim_target or total_seconds)
             else:
-                # fallback: server MP3 must exist
-                if want_lame:
-                    # We wanted LAME but couldn't get WAV; record that for debugging.
-                    enc_meta = {"mp3_encoder": "server", "mp3_quality": "server", "mp3_note": "no_wav_available"}
+                seg = segments[0]
+                if seg.suffix.lower() == ".wav":
+                    try:
+                        enc_meta = _encode_mp3(seg, out_mp3, quality=mp3_quality)
+                    except Exception as e:
+                        raise ProviderError(f"riffusion mp3 re-encode failed: {e}") from e
+                    if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
+                        raise ProviderError("riffusion mp3 encode output missing or empty.")
+                    mp3_bytes = out_mp3.read_bytes()
+                    duration_sec = _probe_duration_seconds(out_mp3)
+                else:
+                    mp3_bytes = seg.read_bytes()
+                    duration_sec = _probe_duration_seconds(seg)
+                    if want_reencode:
+                        enc_meta = {
+                            "mp3_encoder": "server",
+                            "mp3_quality": "server",
+                            "mp3_note": "no_wav_available",
+                        }
 
-            if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
-                raise ProviderError("riffusion did not produce an mp3 artifact (missing or empty).")
-
-            mp3_bytes = out_mp3.read_bytes()
+            if duration_sec <= 0 and seg_durations:
+                duration_sec = float(seg_durations[0])
+            if duration_sec <= 0 and target_seconds > 0:
+                duration_sec = float(target_seconds)
 
         meta: Dict[str, Any] = {
             "provider": self.name,
@@ -262,7 +538,12 @@ class RiffusionAdapter:
             "mime": "audio/mpeg",
             "sha256": sha256_bytes(mp3_bytes),
             "bytes": len(mp3_bytes),
-            "mp3_quality": mp3_quality,
+            "mp3_quality": enc_meta.get("mp3_quality") or mp3_quality_norm,
+            "duration_sec": float(duration_sec),
+            "riffusion_target_seconds": float(target_seconds) if target_seconds > 0 else 0.0,
+            "riffusion_segment_seconds": float(segment_seconds),
+            "riffusion_crossfade_seconds": float(xfade_used),
+            "riffusion_segment_count": int(segment_count),
         }
         if enc_meta:
             meta.update(enc_meta)

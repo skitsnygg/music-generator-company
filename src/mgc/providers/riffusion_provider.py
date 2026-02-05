@@ -56,7 +56,7 @@ def _timeout_tuple(timeout_s: Optional[int]) -> Tuple[float, float]:
     Adapter may pass timeout_s via RIFFUSION_TIMEOUT; we treat that as read timeout.
     """
     connect_default = float(_env_int("MGC_RIFFUSION_CONNECT_TIMEOUT", 2))
-    read_default = float(_env_int("MGC_RIFFUSION_READ_TIMEOUT", 30))
+    read_default = float(_env_int("MGC_RIFFUSION_READ_TIMEOUT", 120))
 
     if timeout_s is None:
         return (connect_default, read_default)
