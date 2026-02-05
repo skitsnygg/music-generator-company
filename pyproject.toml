@@ -9,6 +9,7 @@ description = "Music Generator Company - autonomous pipeline MVP"
 requires-python = ">=3.11"
 dependencies = [
   "python-dotenv>=1.0.1",
+  "requests>=2.31.0",
 ]
 
 [tool.setuptools]
