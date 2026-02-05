@@ -177,6 +177,17 @@ pip install -e .
 
 No API keys are required for the default stub provider.
 
+### Docker (Optional)
+
+Build and run the offline end-to-end verification inside a container:
+
+docker build -t mgc .  
+docker run --rm mgc
+
+Or with compose:
+
+docker compose run --rm mgc
+
 ### End-to-end verification (offline-friendly)
 
 Run a full deterministic smoke that exercises music generation (stub), playlists, drop, web build,

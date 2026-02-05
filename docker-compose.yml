@@ -1,0 +1,7 @@
+version: "3.8"
+
+services:
+  mgc:
+    build: .
+    image: mgc:local
+    command: ["bash", "scripts/verify_all.sh"]
