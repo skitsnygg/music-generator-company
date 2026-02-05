@@ -3113,6 +3113,9 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     provider_override = getattr(args, "provider", None)
     if provider_override is not None:
         provider_override = str(provider_override).strip() or None
+    provider_override = getattr(args, "provider", None)
+    if provider_override is not None:
+        provider_override = str(provider_override).strip() or None
 
     out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
     bundle_dir = out_dir / "drop_bundle"
