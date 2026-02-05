@@ -801,8 +801,20 @@
     function feedUrlCandidates(){
       const primary = resolveFeedUrl();
       const root = "/releases/feed.json";
-      if (primary === root) return [primary];
-      return [primary, root];
+      const out = [primary];
+      if (primary !== root) out.push(root);
+      if (window.location.protocol === "file:"){
+        const prefix = basePrefix();
+        const rels = [
+          "../releases/feed.json",
+          "../../releases/feed.json",
+          "../../../releases/feed.json",
+          "../../../../releases/feed.json",
+          "../../../../../releases/feed.json",
+        ];
+        rels.forEach((rel) => out.push(urlJoin(prefix, rel)));
+      }
+      return Array.from(new Set(out));
     }
 
     async function fetchJson(url){
@@ -1071,7 +1083,8 @@
       const marketingUrl = bundleBase + "marketing/marketing_plan.json";
 
       const embedded = embeddedBundle();
-      if (embedded && (!ctx || !ctx.url)){
+      let embeddedPreview = null;
+      if (embedded && embedded.marketing_preview){
         const preview = embedded.marketing_preview || null;
         let teaserUrl = preview && preview.teaser_path ? marketingAssetUrl(bundleBase, preview.teaser_path) : "";
         let posts = [];
@@ -1082,20 +1095,39 @@
             text: (p && p.text) ? String(p.text).trim() : "",
           }));
         }
-        const marketingPreview = preview ? {
+        embeddedPreview = {
           summary: preview.summary || "",
           hashtags: preview.hashtags || "",
           teaser_url: teaserUrl,
           posts,
-        } : null;
+        };
+      }
+
+      if (embedded && (!ctx || !ctx.url)){
+        const [playlist, manifest, marketingPlan] = await Promise.all([
+          fetchJson(playlistUrl).catch(() => null),
+          fetchJson(manifestUrl).catch(() => null),
+          fetchJson(marketingUrl).catch(() => null),
+        ]);
+
+        const pickedPlaylist = playlist || embedded.playlist || null;
+        const pickedPlan = marketingPlan || embedded.marketing_plan || null;
+        let marketingPreview = embeddedPreview;
+        if (!marketingPreview){
+          try{
+            marketingPreview = await loadMarketingPreview(pickedPlan, bundleBase);
+          }catch (e){
+            marketingPreview = null;
+          }
+        }
 
         return {
           bundleBase,
           playlistUrl,
           manifestUrl,
-          playlist: embedded.playlist || null,
-          manifest: embedded.manifest || null,
-          marketingPlan: embedded.marketing_plan || null,
+          playlist: pickedPlaylist,
+          manifest,
+          marketingPlan: pickedPlan,
           marketingPreview,
         };
       }
