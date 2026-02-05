@@ -15,7 +15,8 @@ jobs:
       MGC_NO_COLOR: "1"
 
       MGC_PROD_RELEASES: "/var/lib/mgc/releases"
-      MGC_PROVIDER: "${{ vars.MGC_PROVIDER }}"
+      MGC_PROVIDER: "${{ vars.MGC_PROVIDER || 'riffusion' }}"
+      MGC_RIFFUSION_URL: "${{ vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
 
       # Keep any accidental outputs away from the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
