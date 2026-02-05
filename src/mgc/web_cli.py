@@ -757,6 +757,80 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       color: var(--muted2);
     }
 
+    .marketing{
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.02);
+    }
+    .marketingHead{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom: 10px;
+    }
+    .marketingGrid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap:10px;
+    }
+    @media (max-width: 720px){
+      .marketingGrid{ grid-template-columns: 1fr; }
+    }
+    .marketingItem{
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+      border-radius: 12px;
+      padding: 10px;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-height: 72px;
+    }
+    .marketingLabel{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--muted2);
+    }
+    .marketingValue{
+      font-size: 12px;
+      color: var(--text);
+    }
+    .marketingActions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .marketingPosts{
+      margin-top: 10px;
+      display:grid;
+      gap:10px;
+    }
+    .postItem{
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+      border-radius: 12px;
+      padding: 10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .postTitle{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--muted2);
+    }
+    .postText{
+      font-size: 13px;
+      color: var(--text);
+      white-space: pre-wrap;
+    }
+
     .toast{
       position: fixed;
       left: 16px;
@@ -1013,6 +1087,48 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
             <div class="inspectHint">Updates with the current track and selected playlist.</div>
           </div>
 
+          <div class="marketing" id="marketing">
+            <div class="marketingHead">
+              <p class="cardTitle">Marketing Preview</p>
+              <div class="row" style="gap:8px;">
+                <button class="btn small" id="btnCopyMarketingAll" title="Copy summary + hashtags + posts">Copy all</button>
+              </div>
+            </div>
+
+            <div class="marketingGrid">
+              <div class="marketingItem">
+                <div class="marketingLabel">Summary</div>
+                <div class="marketingValue" id="mkSummary">—</div>
+                <div class="marketingActions">
+                  <button class="btn small" data-mkcopy="summary" data-mklabel="Summary">Copy</button>
+                </div>
+              </div>
+
+              <div class="marketingItem">
+                <div class="marketingLabel">Hashtags</div>
+                <div class="marketingValue mono" id="mkHashtags">—</div>
+                <div class="marketingActions">
+                  <button class="btn small" data-mkcopy="hashtags" data-mklabel="Hashtags">Copy</button>
+                </div>
+              </div>
+
+              <div class="marketingItem">
+                <div class="marketingLabel">Teaser audio</div>
+                <div class="marketingValue">
+                  <audio id="mkTeaser" controls preload="metadata"></audio>
+                  <div class="muted" id="mkTeaserEmpty">No teaser available.</div>
+                </div>
+                <div class="marketingActions">
+                  <button class="btn small" data-mkcopy="teaser_url" data-mklabel="Teaser URL">Copy link</button>
+                  <button class="btn small" id="mkTeaserOpen">Open</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="marketingPosts" id="mkPosts"></div>
+            <div class="muted" id="mkEmpty">No marketing preview available for this playlist.</div>
+          </div>
+
           <div class="hr"></div>
 
           <div class="row" style="margin-bottom:10px;">
@@ -1104,6 +1220,16 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return await r.json();
     }
 
+    async function fetchText(url){
+      try{
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.text();
+      }catch (e){
+        return null;
+      }
+    }
+
     function isAudioPath(p){
       return typeof p === "string" && (p.endsWith(".mp3") || p.endsWith(".wav") || p.endsWith(".ogg") || p.endsWith(".m4a"));
     }
@@ -1166,6 +1292,83 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       return String(p || "").replace(/^\.?\//, "");
     }
 
+    function sanitizeRelpath(p){
+      let out = normalizeRelpath(p);
+      while (out.startsWith("../")){
+        out = out.slice(3);
+      }
+      return out;
+    }
+
+    function marketingAssetUrl(bundleBase, rel){
+      const cleaned = sanitizeRelpath(rel);
+      if (!cleaned) return "";
+      if (cleaned.startsWith("marketing/")){
+        return withTrailingSlash(bundleBase) + cleaned;
+      }
+      return withTrailingSlash(bundleBase) + "marketing/" + cleaned;
+    }
+
+    function planHashtagsText(plan){
+      if (!plan) return "";
+      if (plan.hashtags_text) return String(plan.hashtags_text || "").trim();
+      if (Array.isArray(plan.hashtags)){
+        return plan.hashtags.map(t => "#" + String(t || "").trim()).join(" ").trim();
+      }
+      return "";
+    }
+
+    async function loadMarketingPreview(plan, bundleBase){
+      if (!plan) return null;
+      const paths = (plan && plan.paths) ? plan.paths : {};
+
+      let summary = String(plan.summary || "").trim();
+      const summaryRel = paths.summary || "";
+      if (summaryRel){
+        const text = await fetchText(marketingAssetUrl(bundleBase, summaryRel));
+        if (text) summary = text.trim();
+      }
+
+      let hashtags = planHashtagsText(plan);
+      const hashtagsRel = paths.hashtags || "";
+      if (hashtagsRel){
+        const text = await fetchText(marketingAssetUrl(bundleBase, hashtagsRel));
+        if (text) hashtags = text.trim();
+      }
+
+      const teaserRel = paths.teaser || "";
+      const teaserUrl = teaserRel ? marketingAssetUrl(bundleBase, teaserRel) : "";
+
+      const postPaths = Array.isArray(paths.posts) ? paths.posts : [];
+      const posts = [];
+      if (postPaths.length){
+        const items = await Promise.all(
+          postPaths.map(async (rel, idx) => {
+            const url = marketingAssetUrl(bundleBase, rel);
+            const text = await fetchText(url);
+            return {
+              index: idx + 1,
+              url,
+              text: text ? text.trim() : "",
+            };
+          })
+        );
+        for (const it of items){
+          posts.push(it);
+        }
+      }
+
+      const out = {
+        summary,
+        hashtags,
+        teaser_url: teaserUrl,
+        posts,
+      };
+
+      if (!summary && !hashtags && !teaserUrl && !posts.length) return null;
+      return out;
+    }
+
     function findManifestTrack(manifest, track){
       if (!manifest || !track) return null;
       const tracks = Array.isArray(manifest.tracks) ? manifest.tracks : [];
@@ -1226,13 +1429,22 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       const bundleBase = withTrailingSlash(normalizeBundleBase(ctx));
       const playlistUrl = bundleBase + "playlist.json";
       const manifestUrl = bundleBase + "web_manifest.json";
+      const marketingUrl = bundleBase + "marketing/marketing_plan.json";
 
-      const [playlist, manifest] = await Promise.all([
+      const [playlist, manifest, marketingPlan] = await Promise.all([
         fetchJson(playlistUrl),
         fetchJson(manifestUrl).catch(() => null),
+        fetchJson(marketingUrl).catch(() => null),
       ]);
 
-      return { bundleBase, playlistUrl, manifestUrl, playlist, manifest };
+      let marketingPreview = null;
+      try{
+        marketingPreview = await loadMarketingPreview(marketingPlan, bundleBase);
+      }catch (e){
+        marketingPreview = null;
+      }
+
+      return { bundleBase, playlistUrl, manifestUrl, playlist, manifest, marketingPlan, marketingPreview };
     }
 
     function setModeLabel(){
@@ -1422,6 +1634,99 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function setMarketingValue(id, value){
+      const el = $(id);
+      if (!el) return;
+      const has = value !== undefined && value !== null && String(value).length;
+      el.textContent = has ? String(value) : "—";
+    }
+
+    function marketingSummaryText(mk){
+      if (!mk) return "";
+      const lines = [];
+      if (mk.summary) lines.push("Summary: " + mk.summary);
+      if (mk.hashtags) lines.push("Hashtags: " + mk.hashtags);
+      if (mk.teaser_url) lines.push("Teaser: " + mk.teaser_url);
+      if (mk.posts && mk.posts.length){
+        lines.push("Posts:");
+        mk.posts.forEach((p, i) => {
+          const txt = p && p.text ? String(p.text).trim() : "";
+          if (txt) lines.push((i + 1) + ". " + txt);
+        });
+      }
+      return lines.join("\n");
+    }
+
+    function setMarketingPreview(state){
+      const pl = state.selected ? state.selected : (state.current ? findPlaylistByName(state, state.current.playlist_context) : null);
+      const mk = pl && pl.marketing ? pl.marketing : null;
+      state.marketingPreview = mk;
+
+      const empty = $("mkEmpty");
+      const postsEl = $("mkPosts");
+      const teaser = $("mkTeaser");
+      const teaserEmpty = $("mkTeaserEmpty");
+      const teaserOpen = $("mkTeaserOpen");
+
+      if (!mk){
+        setMarketingValue("mkSummary", "");
+        setMarketingValue("mkHashtags", "");
+        if (postsEl) postsEl.innerHTML = "";
+        if (teaser){
+          teaser.removeAttribute("src");
+          teaser.load();
+          teaser.style.display = "none";
+        }
+        if (teaserEmpty) teaserEmpty.style.display = "";
+        if (teaserOpen) teaserOpen.setAttribute("disabled", "disabled");
+        if (empty) empty.style.display = "";
+        return;
+      }
+
+      if (empty) empty.style.display = "none";
+      setMarketingValue("mkSummary", mk.summary || "");
+      setMarketingValue("mkHashtags", mk.hashtags || "");
+
+      if (teaser){
+        if (mk.teaser_url){
+          teaser.src = mk.teaser_url;
+          teaser.style.display = "";
+          if (teaserEmpty) teaserEmpty.style.display = "none";
+          if (teaserOpen) teaserOpen.removeAttribute("disabled");
+        }else{
+          teaser.removeAttribute("src");
+          teaser.load();
+          teaser.style.display = "none";
+          if (teaserEmpty) teaserEmpty.style.display = "";
+          if (teaserOpen) teaserOpen.setAttribute("disabled", "disabled");
+        }
+      }
+
+      if (postsEl){
+        postsEl.innerHTML = "";
+        if (mk.posts && mk.posts.length){
+          mk.posts.forEach((p, i) => {
+            const text = p && p.text ? String(p.text).trim() : "";
+            const div = document.createElement("div");
+            div.className = "postItem";
+            div.innerHTML = `
+              <div class="postTitle">Post ${i + 1}</div>
+              <div class="postText">${escapeHtml(text || "(missing)")}</div>
+              <div class="marketingActions">
+                <button class="btn small" data-mkpost="${i}">Copy</button>
+              </div>
+            `;
+            postsEl.appendChild(div);
+          });
+        }else{
+          const div = document.createElement("div");
+          div.className = "muted";
+          div.textContent = "No posts available.";
+          postsEl.appendChild(div);
+        }
+      }
+    }
+
     function setInspector(state){
       const cur = state.current || null;
       const pl = cur ? findPlaylistByName(state, cur.playlist_context) : state.selected;
@@ -1536,6 +1841,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       if (t.manifestUrl) footBits.push(`manifest: ${t.manifestUrl}`);
       $("bundleFoot").textContent = footBits.join(" • ");
       setInspector(state);
+      setMarketingPreview(state);
     }
 
     function setAudioSource(state){
@@ -1639,6 +1945,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
               playlistUrl: bundle.playlistUrl,
               manifestUrl: bundle.manifestUrl,
               manifest: bundle.manifest,
+              marketing: bundle.marketingPreview || null,
               tracks: rawTracks,
             });
           }catch (e){
@@ -1720,6 +2027,8 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         state.current = pickPlayable(shown);
         setNowPlaying(state);
         setAudioSource(state);
+      }else{
+        setMarketingPreview(state);
       }
     }
 
@@ -1743,6 +2052,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         selected: null, // null = All
         current: null,
         inspector: {},
+        marketingPreview: null,
       };
 
       setModeLabel();
@@ -1857,6 +2167,45 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         const label = btn.dataset.label || key;
         const val = state.inspector && state.inspector[key] ? state.inspector[key] : "";
         copyText(val, label);
+      });
+
+      $("btnCopyMarketingAll").addEventListener("click", () => {
+        const mk = state.marketingPreview;
+        copyText(marketingSummaryText(mk), "Marketing preview");
+      });
+
+      $("marketing").addEventListener("click", (ev) => {
+        const btn = ev.target.closest("button");
+        if (!btn) return;
+        const mk = state.marketingPreview;
+        if (!mk) return;
+
+        const mkcopy = btn.dataset.mkcopy || "";
+        if (mkcopy){
+          let val = "";
+          if (mkcopy === "summary") val = mk.summary || "";
+          if (mkcopy === "hashtags") val = mk.hashtags || "";
+          if (mkcopy === "teaser_url") val = mk.teaser_url || "";
+          const label = btn.dataset.mklabel || mkcopy;
+          copyText(val, label);
+          return;
+        }
+
+        const mkpost = btn.dataset.mkpost || "";
+        if (mkpost){
+          const idx = parseInt(mkpost, 10);
+          if (Number.isFinite(idx) && mk.posts && mk.posts[idx]){
+            const txt = mk.posts[idx].text || "";
+            copyText(txt, `Post ${idx + 1}`);
+          }
+        }
+      });
+
+      $("mkTeaserOpen").addEventListener("click", () => {
+        const mk = state.marketingPreview;
+        if (mk && mk.teaser_url){
+          window.open(mk.teaser_url, "_blank", "noopener");
+        }
       });
 
       $("btnOpenBundle").addEventListener("click", () => {
