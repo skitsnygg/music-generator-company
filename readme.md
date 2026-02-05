@@ -262,6 +262,10 @@ This command:
 - Ensures backup contexts are filtered
 - Proves deterministic content via stable hashing
 
+If nginx is not serving `/releases/feed.json`, run:
+
+sudo -E scripts/setup_nginx.sh
+
 **Local demo check (no sudo / no nginx):**
 
 MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh
