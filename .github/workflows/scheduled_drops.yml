@@ -55,6 +55,7 @@ jobs:
           mkdir -p /tmp/mgc_prod_artifacts /tmp/mgc_prod_evidence /tmp/mgc_prod_tracks
 
           DATE_UTC="$(date -u +%Y-%m-%d)"
+          PERIOD_KEY="$(date -u +%G-W%V)"
           CONTEXT="${{ steps.vars.outputs.context }}"
 
           # IMPORTANT: ensure the date directory exists
@@ -70,7 +71,7 @@ jobs:
             --seed 1 \
             run weekly \
               --context "$CONTEXT" \
-              --period-key "${DATE_UTC}" \
+              --period-key "${PERIOD_KEY}" \
               --out-dir "$OUT" \
               --deterministic \
               --submission
@@ -78,6 +79,7 @@ jobs:
           test -s "$OUT/drop_bundle/playlist.json"
 
           echo "date_utc=${DATE_UTC}" >> "$GITHUB_OUTPUT"
+          echo "period_key=${PERIOD_KEY}" >> "$GITHUB_OUTPUT"
           echo "context=${CONTEXT}" >> "$GITHUB_OUTPUT"
           echo "out_dir=${OUT}" >> "$GITHUB_OUTPUT"
           echo "playlist_path=${OUT}/drop_bundle/playlist.json" >> "$GITHUB_OUTPUT"
