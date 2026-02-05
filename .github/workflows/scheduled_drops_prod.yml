@@ -282,6 +282,48 @@ jobs:
             TRACKS="$(python -c 'import json,sys; p=sys.argv[1]; data=json.load(open(p,"r",encoding="utf-8")); print(len(data.get("tracks") or []))' "$PLAYLIST_PATH" 2>/dev/null || echo n/a)"
           fi
 
+          HASH_CMD=""
+          if command -v sha256sum >/dev/null 2>&1; then
+            HASH_CMD="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            HASH_CMD="shasum -a 256"
+          fi
+
+          hash_file() {
+            local path="$1"
+            if [ -n "${HASH_CMD}" ] && [ -s "${path}" ]; then
+              # shellcheck disable=SC2086
+              ${HASH_CMD} "${path}" | awk '{print $1}'
+            else
+              echo "n/a"
+            fi
+          }
+
+          DROP_ID="n/a"
+          RUN_ID="n/a"
+          if [ -s "${PLAYLIST_PATH}" ]; then
+            DROP_ID="$(python -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print(data.get("drop_id",""))' "$PLAYLIST_PATH" 2>/dev/null || true)"
+            RUN_ID="$(python -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print(data.get("run_id",""))' "$PLAYLIST_PATH" 2>/dev/null || true)"
+            [ -n "${DROP_ID}" ] || DROP_ID="n/a"
+            [ -n "${RUN_ID}" ] || RUN_ID="n/a"
+          fi
+
+          PLAYLIST_SHA="$(hash_file "${PLAYLIST_PATH}")"
+
+          MANIFEST_PATH="${WEB_DIR}/web_manifest.json"
+          MANIFEST_SHA="$(hash_file "${MANIFEST_PATH}")"
+          WEB_TREE_SHA="n/a"
+          MANIFEST_VERSION="n/a"
+          BUNDLE_AUDIO="n/a"
+          if [ -s "${MANIFEST_PATH}" ]; then
+            WEB_TREE_SHA="$(python -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print(data.get("web_tree_sha256",""))' "$MANIFEST_PATH" 2>/dev/null || true)"
+            MANIFEST_VERSION="$(python -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print(data.get("version",""))' "$MANIFEST_PATH" 2>/dev/null || true)"
+            BUNDLE_AUDIO="$(python -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print(data.get("bundle_audio",""))' "$MANIFEST_PATH" 2>/dev/null || true)"
+            [ -n "${WEB_TREE_SHA}" ] || WEB_TREE_SHA="n/a"
+            [ -n "${MANIFEST_VERSION}" ] || MANIFEST_VERSION="n/a"
+            [ -n "${BUNDLE_AUDIO}" ] || BUNDLE_AUDIO="n/a"
+          fi
+
           AUDIO_COUNT="0"
           if [ -d "${WEB_DIR}" ]; then
             AUDIO_COUNT="$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
@@ -306,11 +348,18 @@ jobs:
             fi
             echo "- Riffusion URL: ${RIFF_URL}"
             echo "- Context: ${CONTEXT:-focus}"
+            echo "- Drop ID: ${DROP_ID}"
+            echo "- Run ID: ${RUN_ID}"
             echo "- Output dir: ${OUT_DIR:-}"
             echo "- Web dir: ${WEB_DIR:-}"
             echo "- Playlist: ${PLAYLIST_PATH:-}"
             echo "- Playlist tracks: ${TRACKS}"
+            echo "- Playlist sha256: ${PLAYLIST_SHA}"
             echo "- Web audio files: ${AUDIO_COUNT}"
+            echo "- Web manifest sha256: ${MANIFEST_SHA}"
+            echo "- Web manifest version: ${MANIFEST_VERSION}"
+            echo "- Web manifest bundle_audio: ${BUNDLE_AUDIO}"
+            echo "- Web tree sha256: ${WEB_TREE_SHA}"
             echo "- Preflight duration: ${PREFLIGHT_DUR:-n/a}s"
             echo "- Run duration: ${RUN_DUR:-n/a}s"
             echo "- Web validate duration: ${WEB_DUR:-n/a}s"
