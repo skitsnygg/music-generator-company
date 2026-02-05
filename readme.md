@@ -188,6 +188,11 @@ Or with compose:
 
 docker compose run --rm mgc
 
+If Docker Hub is slow/unreachable, use a public mirror:
+
+docker build -t mgc --build-arg PY_BASE=public.ecr.aws/docker/library/python:3.12-slim .  
+docker run --rm mgc
+
 ### End-to-end verification (offline-friendly)
 
 Run a full deterministic smoke that exercises music generation (stub), playlists, drop, web build,

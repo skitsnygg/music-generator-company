@@ -1,5 +1,6 @@
 # Optional Dockerfile for reproducibility (offline-friendly)
-FROM python:3.12-slim
+ARG PY_BASE=python:3.12-slim
+FROM ${PY_BASE}
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
