@@ -446,11 +446,16 @@ Requires a local inference server.
 
 export MGC_PROVIDER=riffusion  
 export MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference
+export MGC_RIFFUSION_PREFLIGHT_TIMEOUT=1.5
 
 **Optional: Stub Provider (Deterministic/CI)**  
 Fully deterministic, offline, CI-safe.
 
 export MGC_PROVIDER=stub
+
+Preflight behavior:
+- If riffusion is unreachable and `MGC_FALLBACK_TO_STUB=1`, we auto-fallback to stub and log it.
+- If fallback is not enabled, runs fail fast with a clear error.
 
 **Optional: DiffSinger**  
 Use a local command wrapper or an HTTP endpoint.
