@@ -5,7 +5,11 @@ echo "[demo_smoke] starting demo smoke"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-0}"
+MGC_DEMO_NO_SUDO_DEFAULT="0"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  MGC_DEMO_NO_SUDO_DEFAULT="1"
+fi
+MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-${MGC_DEMO_NO_SUDO_DEFAULT}}"
 MGC_DEMO_CLEAN="${MGC_DEMO_CLEAN:-0}"
 MGC_DEMO_FAST="${MGC_DEMO_FAST:-0}"
 MGC_SETUP_NGINX="${MGC_SETUP_NGINX:-1}"
