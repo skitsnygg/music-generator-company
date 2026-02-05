@@ -20,4 +20,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-exec "${PY}" "${ROOT}/scripts/release_feed.py" "${args[@]}"
+if (( ${#args[@]} )); then
+  exec "${PY}" "${ROOT}/scripts/release_feed.py" "${args[@]}"
+else
+  exec "${PY}" "${ROOT}/scripts/release_feed.py"
+fi
