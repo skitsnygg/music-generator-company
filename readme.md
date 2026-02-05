@@ -177,6 +177,13 @@ pip install -e .
 
 No API keys are required for the default stub provider.
 
+### End-to-end verification (offline-friendly)
+
+Run a full deterministic smoke that exercises music generation (stub), playlists, drop, web build,
+submission zip, marketing receipts, and billing CLI using the fixture DB:
+
+scripts/verify_all.sh
+
 ### Marketing Publish (Receipts)
 
 Daily/weekly runs emit deterministic post payloads under `marketing/publish/`.  
