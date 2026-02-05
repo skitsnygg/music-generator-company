@@ -4,8 +4,10 @@ set -euo pipefail
 echo "[demo_check] starting full demo verification"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FEED_PATH="/var/lib/mgc/releases/feed.json"
-FEED_URL="http://127.0.0.1/releases/feed.json"
+FEED_PATH="${MGC_FEED_PATH:-/var/lib/mgc/releases/feed.json}"
+FEED_URL="${MGC_FEED_URL:-http://127.0.0.1/releases/feed.json}"
+SKIP_NGINX="${MGC_SKIP_NGINX:-0}"
+REQUIRE_NGINX="${MGC_REQUIRE_NGINX:-1}"
 
 cd "$REPO_ROOT"
 
@@ -26,9 +28,20 @@ python3 -m json.tool "$FEED_PATH" >/dev/null
 echo "[demo_check] feed json ok"
 
 # 4) Verify nginx serves the feed
-echo "[demo_check] fetching feed via nginx..."
-curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null
-echo "[demo_check] nginx serving feed ok"
+if [[ "${SKIP_NGINX}" == "1" ]]; then
+  echo "[demo_check] skipping nginx check (MGC_SKIP_NGINX=1)"
+else
+  echo "[demo_check] fetching feed via nginx..."
+  if curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null; then
+    echo "[demo_check] nginx serving feed ok"
+  else
+    if [[ "${REQUIRE_NGINX}" == "1" ]]; then
+      echo "[demo_check] nginx check failed (set MGC_SKIP_NGINX=1 to skip)" >&2
+      exit 2
+    fi
+    echo "[demo_check] WARN: nginx check failed (continuing)"
+  fi
+fi
 
 # 5) Verify contexts are filtered (no .bak, no run)
 echo "[demo_check] verifying context filtering..."
