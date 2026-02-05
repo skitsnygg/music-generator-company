@@ -27,6 +27,16 @@ elif [[ "${MGC_DEMO_CLEAN}" == "1" ]]; then
   echo "[demo_check] WARN: MGC_DEMO_CLEAN only cleans local demo outputs (set MGC_DEMO_NO_SUDO=1)" >&2
 fi
 
+if [[ -z "${MGC_RELEASE_ROOT:-}" ]]; then
+  export MGC_RELEASE_ROOT="/var/lib/mgc/releases"
+fi
+if [[ -z "${MGC_WEB_LATEST_ROOT:-}" ]]; then
+  export MGC_WEB_LATEST_ROOT="${MGC_RELEASE_ROOT}/latest/web"
+fi
+if [[ -z "${MGC_RELEASE_FEED_OUT:-}" ]]; then
+  export MGC_RELEASE_FEED_OUT="${MGC_RELEASE_ROOT}/feed.json"
+fi
+
 FEED_PATH="${MGC_FEED_PATH:-${MGC_RELEASE_FEED_OUT:-/var/lib/mgc/releases/feed.json}}"
 FEED_URL="${MGC_FEED_URL:-http://127.0.0.1/releases/feed.json}"
 SKIP_NGINX="${MGC_SKIP_NGINX:-0}"
