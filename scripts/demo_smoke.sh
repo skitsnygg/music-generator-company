@@ -31,6 +31,9 @@ FEED_PATH="${MGC_FEED_PATH:-${MGC_RELEASE_FEED_OUT:-/var/lib/mgc/releases/feed.j
 FEED_URL="${MGC_FEED_URL:-http://127.0.0.1/releases/feed.json}"
 SKIP_NGINX="${MGC_SKIP_NGINX:-0}"
 REQUIRE_NGINX="${MGC_REQUIRE_NGINX:-1}"
+PUBLISH_FEED="${MGC_PUBLISH_FEED:-1}"
+PUBLISH_LATEST="${MGC_PUBLISH_LATEST:-1}"
+DEMO_VALIDATE_AUDIO="${MGC_DEMO_VALIDATE_AUDIO:-1}"
 
 cd "$REPO_ROOT"
 
@@ -52,10 +55,38 @@ fi
 echo "[demo_smoke] running daily pipeline..."
 "${RUN_DAILY_CMD[@]}"
 
-echo "[demo_smoke] checking feed on disk..."
-test -s "$FEED_PATH"
-python3 -m json.tool "$FEED_PATH" >/dev/null
-echo "[demo_smoke] feed json ok"
+echo "[demo_smoke] verifying playlist track files..."
+OUT_BASE="${MGC_OUT_BASE:-data/evidence}"
+CONTEXTS=(${MGC_CONTEXTS:-focus})
+for ctx in "${CONTEXTS[@]}"; do
+  PLAYLIST="${OUT_BASE}/${ctx}/drop_bundle/playlist.json"
+  test -s "$PLAYLIST"
+  python3 scripts/check_playlist_tracks.py "$PLAYLIST" "${OUT_BASE}/${ctx}"
+done
+
+if [[ "${PUBLISH_LATEST}" == "1" ]]; then
+  echo "[demo_smoke] verifying latest web bundles..."
+  WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
+  for ctx in "${CONTEXTS[@]}"; do
+    WEB_DIR="${WEB_ROOT}/${ctx}"
+    test -s "${WEB_DIR}/web_manifest.json"
+    if [[ "${DEMO_VALIDATE_AUDIO}" == "1" ]]; then
+      AUDIO_COUNT="$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
+      test "${AUDIO_COUNT}" != "0"
+    fi
+  done
+else
+  echo "[demo_smoke] skipping web bundle checks (MGC_PUBLISH_LATEST=0)"
+fi
+
+if [[ "${PUBLISH_FEED}" == "1" ]]; then
+  echo "[demo_smoke] checking feed on disk..."
+  test -s "$FEED_PATH"
+  python3 -m json.tool "$FEED_PATH" >/dev/null
+  echo "[demo_smoke] feed json ok"
+else
+  echo "[demo_smoke] skipping feed checks (MGC_PUBLISH_FEED=0)"
+fi
 
 WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
 for ctx in ${MGC_CONTEXTS}; do
@@ -77,7 +108,9 @@ setup_nginx() {
   fi
 }
 
-if [[ "${SKIP_NGINX}" == "1" ]]; then
+if [[ "${PUBLISH_FEED}" != "1" ]]; then
+  echo "[demo_smoke] skipping nginx check (MGC_PUBLISH_FEED=0)"
+elif [[ "${SKIP_NGINX}" == "1" ]]; then
   echo "[demo_smoke] skipping nginx check (MGC_SKIP_NGINX=1)"
 elif command -v curl >/dev/null 2>&1; then
   echo "[demo_smoke] fetching feed via nginx..."
