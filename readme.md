@@ -276,6 +276,44 @@ Artifacts and logs are emitted on every run for auditability:
 
 ---
 
+## Billing
+
+Billing uses the same SQLite DB as the rest of MGC and is managed by the CLI.
+Migrations live in `scripts/migrations/0002_billing.sql` and are applied by `scripts/migrate_db.py` or `mgc db migrate`.
+
+Basic setup:
+
+python -m mgc.main --db data/db.sqlite db migrate
+
+Quickstart:
+
+python -m mgc.main --db data/db.sqlite billing users add demo --email demo@example.com  
+python -m mgc.main --db data/db.sqlite billing tokens mint demo --label demo --show-token  
+python -m mgc.main --db data/db.sqlite billing entitlements grant-user demo pro --starts-ts 2020-01-01T00:00:00Z  
+python -m mgc.main --db data/db.sqlite billing check --token <token>  
+python -m mgc.main --db data/db.sqlite billing whoami --token <token>
+
+Token lifecycle:
+
+python -m mgc.main --db data/db.sqlite billing tokens list --user-id demo  
+python -m mgc.main --db data/db.sqlite billing tokens revoke --token <token> --reason manual  
+python -m mgc.main --db data/db.sqlite billing tokens rotate demo --revoke-token <old_token> --show-token
+
+Entitlements:
+
+python -m mgc.main --db data/db.sqlite billing entitlements active demo  
+python -m mgc.main --db data/db.sqlite billing entitlements list --user-id demo  
+python -m mgc.main --db data/db.sqlite billing entitlements revoke demo --now 2020-01-01T00:00:00Z
+
+Notes:
+- Tokens are stored as SHA256 hashes; plaintext is only shown on mint/rotate with `--show-token`.
+- Revocations are tombstones in `billing_token_revocations` (no hard deletes).
+- Deterministic flags: `--token`, `--created-ts`, `--now`.
+- Receipts: mutating commands write JSON receipts to `<db_dir>/billing_receipts` (override with `--receipts-dir`). If receipts cannot be written, the mutation is aborted.
+- Web serving: `mgc web serve --billing-db <db>` or `MGC_BILLING_DB`. Library lookups use `MGC_LIBRARY_DB` (defaults to the billing DB).
+
+---
+
 ## Analytics
 
 The analytics CLI provides reporting over the SQLite DB:
