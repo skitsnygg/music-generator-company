@@ -333,6 +333,42 @@ def _cover_rng(seed_material: str):
     return rnd
 
 
+def _marketing_hashtag_slug(s: str) -> str:
+    out = []
+    for ch in (s or "").lower():
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+def _marketing_hashtags(context: str, schedule: str) -> List[str]:
+    tags = ["mgc", "newmusic", "music"]
+    if context:
+        tags.append(context)
+        tags.append(f"{context}music")
+    if schedule:
+        tags.append(schedule)
+    seen = set()
+    out: List[str] = []
+    for t in tags:
+        slug = _marketing_hashtag_slug(t)
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(slug)
+    return out
+
+
+def _marketing_summary(context: str, schedule: str, period_key: str, now_iso: str) -> str:
+    label = " ".join([p for p in (context, schedule) if p]).strip()
+    summary = f"New {label} drop" if label else "New drop"
+    if period_key:
+        summary = f"{summary} ({period_key})"
+    else:
+        summary = f"{summary} ({now_iso[:10]})"
+    return summary + "."
+
+
 def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> Dict[str, Any]:
     # No text. Deterministic abstract cover.
     try:
@@ -479,6 +515,15 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
             _write_text(pth, text.strip() + "\n")
             post_paths.append(_rel_to_out(pth))
 
+        hashtags = _marketing_hashtags(context, schedule)
+        hashtags_text = " ".join([f"#{t}" for t in hashtags]).strip()
+        hashtags_path = out_dir / "hashtags.txt"
+        _write_text(hashtags_path, (hashtags_text + "\n") if hashtags_text else "")
+
+        summary_text = _marketing_summary(context, schedule, period_key, now_iso)
+        summary_path = out_dir / "summary.txt"
+        _write_text(summary_path, summary_text + "\n")
+
         plan = {
             "ok": True,
             "cmd": "agents.marketing.plan",
@@ -494,9 +539,14 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
                 "plan": _rel_to_out(plan_path),
                 "receipts": _rel_to_out(receipts_path),
                 "posts": post_paths,
+                "hashtags": _rel_to_out(hashtags_path),
+                "summary": _rel_to_out(summary_path),
             },
             "teaser": teaser_info,
             "cover": cover_info,
+            "hashtags": hashtags,
+            "hashtags_text": hashtags_text,
+            "summary": summary_text,
         }
 
         _write_text(plan_path, _stable_json_dumps(plan) + "\n")

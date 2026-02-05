@@ -716,6 +716,39 @@ def _marketing_cover_svg(seed: int, size_px: int = 1024) -> str:
         + "</svg>"
     )
 
+def _marketing_hashtag_slug(s: str) -> str:
+    out = []
+    for ch in (s or "").lower():
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+def _marketing_hashtags(context: str, schedule: str) -> List[str]:
+    tags = ["mgc", "newmusic", "music"]
+    if context:
+        tags.append(context)
+        tags.append(f"{context}music")
+    if schedule:
+        tags.append(schedule)
+    seen = set()
+    out: List[str] = []
+    for t in tags:
+        slug = _marketing_hashtag_slug(t)
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(slug)
+    return out
+
+
+def _marketing_summary(context: str, schedule: str, period_key: str) -> str:
+    label = " ".join([p for p in (context, schedule) if p]).strip()
+    summary = f"New {label} drop" if label else "New drop"
+    if period_key:
+        summary = f"{summary} ({period_key})"
+    return summary + "."
+
 
 def _marketing_teaser_wav(
     *,
@@ -986,6 +1019,16 @@ def _agents_marketing_plan(
         p.write_text(txt + "\n", encoding="utf-8")
         post_paths.append(_relpath_from_out_dir(out_dir, str(p)))
 
+    # hashtags + summary
+    hashtags = _marketing_hashtags(context, schedule)
+    hashtags_text = " ".join([f"#{t}" for t in hashtags]).strip()
+    hashtags_path = out_dir / "hashtags.txt"
+    hashtags_path.write_text((hashtags_text + "\n") if hashtags_text else "", encoding="utf-8")
+
+    summary_text = _marketing_summary(context, schedule, period_key)
+    summary_path = out_dir / "summary.txt"
+    summary_path.write_text(summary_text + "\n", encoding="utf-8")
+
     # Also emit publish payloads with media pointers (for live publish)
     publish_dir = out_dir / "publish"
     publish_dir.mkdir(parents=True, exist_ok=True)
@@ -1010,6 +1053,8 @@ def _agents_marketing_plan(
             "video_url": media_url,
             "note": media_note,
         },
+        "hashtags": hashtags,
+        "summary": summary_text,
         "paths": {
             "out_dir": ".",
             "playlist": _relpath_from_out_dir(out_dir, str(playlist_path)),
@@ -1018,6 +1063,8 @@ def _agents_marketing_plan(
             "teaser": _relpath_from_out_dir(out_dir, str(teaser_path)),
             "media": media_rel,
             "posts": post_paths,
+            "hashtags": _relpath_from_out_dir(out_dir, str(hashtags_path)),
+            "summary": _relpath_from_out_dir(out_dir, str(summary_path)),
             "receipts": _relpath_from_out_dir(out_dir, str(receipts)),
             "plan": _relpath_from_out_dir(out_dir, str(plan_path)),
         },
