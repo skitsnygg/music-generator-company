@@ -54,6 +54,7 @@ for ctx in focus sleep workout; do
     --context "$ctx" \
     --seed 1 \
     --deterministic \
+    --provider stub \
     --generate-count 1 \
     --out-dir "$OUT" \
     >/dev/null
@@ -68,6 +69,7 @@ log "run weekly (focus)"
   --period-key 2020-W01 \
   --seed 1 \
   --deterministic \
+  --provider stub \
   --out-dir "$OUT_WEEKLY" \
   >/dev/null
 
@@ -81,6 +83,7 @@ mkdir -p "$DROP_OUT"
   --context focus \
   --seed 1 \
   --deterministic \
+  --provider stub \
   --out-dir "$DROP_OUT" \
   > "$DROP_OUT/drop_stdout.json"
 
