@@ -467,6 +467,10 @@ source scripts/diffsinger_env.sh ai/DiffSinger/checkpoints/lj_ds_beta6_1213
 
 This helper also sets MGC_PLAYLIST_PROVIDER=any so daily/weekly playlists can mix providers.
 
+CLI overrides:
+- `run daily --provider <name>` / `run weekly --provider <name>`: overrides generation + playlist filter.
+- `--generate-provider <name>`: override generation only (playlist filter still follows env).
+
 ---
 
 ## Scheduling

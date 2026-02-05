@@ -3107,6 +3107,12 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
     seed_val = getattr(args, "seed", None)
     seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
+    provider_override = getattr(args, "provider", None)
+    if provider_override is not None:
+        provider_override = str(provider_override).strip() or None
+    provider_override = getattr(args, "provider", None)
+    if provider_override is not None:
+        provider_override = str(provider_override).strip() or None
 
     out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
     bundle_dir = out_dir / "drop_bundle"
@@ -3125,7 +3131,12 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
     # Optional: generate new tracks into the library before selecting today's playlist
     gen_count = int(getattr(args, "generate_count", 0) or 0)
-    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
+    gen_provider = (
+        getattr(args, "generate_provider", None)
+        or provider_override
+        or os.environ.get("MGC_PROVIDER")
+        or None
+    )
     gen_prompt = getattr(args, "prompt", None) or None
     if gen_count > 0:
         _agents_generate_and_ingest(
@@ -3151,7 +3162,12 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if lookback_playlists is None:
         lookback_playlists = int(os.environ.get("MGC_DAILY_LOOKBACK_PLAYLISTS") or "7")
 
-    playlist_provider = (os.environ.get("MGC_DAILY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
+    playlist_provider = (
+        provider_override
+        or os.environ.get("MGC_DAILY_PLAYLIST_PROVIDER")
+        or os.environ.get("MGC_PLAYLIST_PROVIDER")
+        or ""
+    ).strip()
     if not playlist_provider:
         playlist_provider = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip()
     if playlist_provider.lower() in ("", "any", "all", "*"):
@@ -5106,7 +5122,12 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     # Optional: generate new tracks into the library before building the weekly playlist
     gen_count = int(getattr(args, "generate_count", 0) or 0)
-    gen_provider = getattr(args, "generate_provider", None) or os.environ.get("MGC_PROVIDER") or None
+    gen_provider = (
+        getattr(args, "generate_provider", None)
+        or provider_override
+        or os.environ.get("MGC_PROVIDER")
+        or None
+    )
     gen_prompt = getattr(args, "prompt", None) or None
     if gen_count > 0:
         _agents_generate_and_ingest(
@@ -5132,7 +5153,12 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     if lookback_playlists is None:
         lookback_playlists = int(os.environ.get("MGC_WEEKLY_LOOKBACK_PLAYLISTS") or "3")
 
-    playlist_provider = (os.environ.get("MGC_WEEKLY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
+    playlist_provider = (
+        provider_override
+        or os.environ.get("MGC_WEEKLY_PLAYLIST_PROVIDER")
+        or os.environ.get("MGC_PLAYLIST_PROVIDER")
+        or ""
+    ).strip()
     if not playlist_provider:
         playlist_provider = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip()
     if playlist_provider.lower() in ("", "any", "all", "*"):
@@ -7060,6 +7086,11 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
         help="Seed for deterministic behavior",
     )
     daily.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to use for generation + playlist filter (default: MGC_PROVIDER or 'riffusion')",
+    )
+    daily.add_argument(
         "--out-dir",
         default=os.environ.get("MGC_EVIDENCE_DIR", "data/evidence"),
         help="Evidence output directory",
@@ -7183,6 +7214,11 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly = run_sub.add_parser("weekly", help="Build weekly drop bundle from DB playlist (no fresh generation)")
     weekly.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     weekly.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    weekly.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to use for generation + playlist filter (default: MGC_PROVIDER or 'riffusion')",
+    )
     weekly.add_argument("--period-key", default=None, help="Override ISO week label for this weekly run (e.g. 2020-W01)")
     weekly.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     weekly.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")

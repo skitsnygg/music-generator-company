@@ -119,7 +119,7 @@ run_one() {
   )
 
   if [[ -n "${PROVIDER}" ]]; then
-    args+=( --generate-provider "${PROVIDER}" )
+    args+=( --provider "${PROVIDER}" )
   fi
   if [[ -n "${PROMPT}" ]]; then
     args+=( --prompt "${PROMPT}" )
