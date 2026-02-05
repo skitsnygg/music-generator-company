@@ -2627,6 +2627,7 @@ def _stub_daily_run(
     ts: str,
     out_dir: Path,
     run_id: str,
+    provider_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Daily run implementation using provider abstraction.
@@ -2670,7 +2671,9 @@ def _stub_daily_run(
 
     prompt = build_prompt(context)
 
-    provider_name = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
+    provider_name = str(provider_name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
+    if not provider_name:
+        provider_name = "riffusion"
     provider = get_provider(provider_name)
 
     req_obj = GenerateRequest(
@@ -4107,6 +4110,9 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
 
     context = str(getattr(args, "context", None) or "focus")
     seed = str(getattr(args, "seed", None) or "1")
+    provider_name = getattr(args, "provider", None)
+    if provider_name is not None:
+        provider_name = str(provider_name).strip() or None
 
     allow_resume = not bool(getattr(args, "no_resume", False))
     dry_run = bool(getattr(args, "dry_run", False))
@@ -4172,6 +4178,7 @@ def cmd_run_drop(args: argparse.Namespace) -> int:
                 ts=ts,
                 out_dir=out_dir,
                 run_id=run_id,
+                provider_name=provider_name,
             )
             con.commit()
         finally:
@@ -7052,6 +7059,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     drop = run_sub.add_parser("drop", help="Run daily + publish-marketing + manifest and emit consolidated evidence")
     drop.add_argument("--context", default=os.environ.get("MGC_CONTEXT", "focus"), help="Context/mood")
     drop.add_argument("--seed", default=os.environ.get("MGC_SEED", "1"), help="Seed")
+    drop.add_argument("--provider", default=None, help="Provider to use for generation (default: MGC_PROVIDER or 'riffusion')")
     drop.add_argument("--limit", type=int, default=50, help="Max number of marketing drafts to publish")
     drop.add_argument("--dry-run", action="store_true", help="Do not update DB in publish step")
     drop.add_argument(

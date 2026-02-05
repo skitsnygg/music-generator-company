@@ -93,7 +93,7 @@ jobs:
           rm -rf "${DROP_DIR}"
           mkdir -p "${DROP_DIR}"
 
-          python -m mgc.main run drop             --context focus             --seed 1             --deterministic             --out-dir "${DROP_DIR}"             > "${DROP_DIR}/drop_stdout.json"
+          python -m mgc.main run drop             --provider stub             --context focus             --seed 1             --deterministic             --out-dir "${DROP_DIR}"             > "${DROP_DIR}/drop_stdout.json"
 
           python -m json.tool < "${DROP_DIR}/drop_stdout.json" >/dev/null
 
