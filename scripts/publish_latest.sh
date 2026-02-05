@@ -28,6 +28,7 @@ DB_PATH="data/db.sqlite"
 WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
 WEB_BUILD_ARGS="${MGC_WEB_BUILD_ARGS:-}"
 MARKETING_MEDIA_SRC=""
+MARKETING_MEDIA_COPIED="0"
 
 die() { echo "[publish_latest] ERROR: $*" >&2; exit 2; }
 log() { echo "[publish_latest] $*"; }
@@ -88,6 +89,51 @@ MARKETING_MEDIA_SRC="${SRC_OUT_DIR}/marketing/media"
 if [[ -d "${MARKETING_MEDIA_SRC}" ]]; then
   mkdir -p "${TMP_DIR}/marketing"
   cp -a "${MARKETING_MEDIA_SRC}" "${TMP_DIR}/marketing/"
+  MARKETING_MEDIA_COPIED="1"
+fi
+
+update_manifest_tree() {
+  local root_dir="$1"
+  local manifest_path="$2"
+  if [[ ! -s "${manifest_path}" ]]; then
+    log "WARN: web_manifest.json missing; skipping tree hash update"
+    return 0
+  fi
+  "${PY}" - "${root_dir}" "${manifest_path}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+
+items = []
+for p in sorted(root.rglob("*")):
+    if not p.is_file():
+        continue
+    rel = p.relative_to(root).as_posix()
+    if rel == "web_manifest.json":
+        continue
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    items.append((rel, h.hexdigest()))
+
+payload = json.dumps(items, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+tree_hash = hashlib.sha256(payload).hexdigest()
+
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+data["web_tree_sha256"] = tree_hash
+manifest_path.write_text(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+print(tree_hash)
+PY
+}
+
+if [[ "${MARKETING_MEDIA_COPIED}" == "1" ]]; then
+  log "updating web_manifest.json tree hash after marketing media copy"
+  update_manifest_tree "${TMP_DIR}" "${TMP_DIR}/web_manifest.json" >/dev/null
 fi
 
 # Atomic swap: DEST_DIR -> backup, TMP_DIR -> DEST_DIR
