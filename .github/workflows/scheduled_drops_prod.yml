@@ -268,6 +268,45 @@ jobs:
           rm -rf data/evidence tracks || true
           test -z "$(git status --porcelain)"
 
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          DIAG_DIR="/tmp/mgc_prod_artifacts/diagnostics"
+          mkdir -p "${DIAG_DIR}"
+
+          date -u > "${DIAG_DIR}/utc_now.txt"
+          uname -a > "${DIAG_DIR}/uname.txt" || true
+          df -h > "${DIAG_DIR}/df.txt" || true
+          free -m > "${DIAG_DIR}/free.txt" || true
+
+          {
+            echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
+            echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
+            echo "MGC_RIFFUSION_TIMEOUT=${MGC_RIFFUSION_TIMEOUT:-}"
+            echo "MGC_RIFFUSION_RETRIES=${MGC_RIFFUSION_RETRIES:-}"
+            echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
+            echo "MGC_FALLBACK_TO_STUB=${MGC_FALLBACK_TO_STUB:-}"
+            echo "MGC_RUN_AUTONOMOUS_RETRIES=${MGC_RUN_AUTONOMOUS_RETRIES:-}"
+            echo "MGC_RUN_AUTONOMOUS_RETRY_SLEEP=${MGC_RUN_AUTONOMOUS_RETRY_SLEEP:-}"
+            echo "MGC_PROD_RELEASES=${MGC_PROD_RELEASES:-}"
+          } > "${DIAG_DIR}/env.txt"
+
+          if command -v ip >/dev/null 2>&1; then
+            ip addr > "${DIAG_DIR}/ip_addr.txt" || true
+            ip route > "${DIAG_DIR}/ip_route.txt" || true
+          fi
+
+          if command -v curl >/dev/null 2>&1 && [ -n "${MGC_RIFFUSION_URL:-}" ]; then
+            base="${MGC_RIFFUSION_URL%/run_inference*}"
+            if [ -z "$base" ]; then
+              base="${MGC_RIFFUSION_URL}"
+            fi
+            curl -v --connect-timeout 5 --max-time 10 "${base}" > "${DIAG_DIR}/riffusion_curl.txt" 2>&1 || true
+          fi
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
