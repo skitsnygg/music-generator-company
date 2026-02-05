@@ -14,18 +14,18 @@
     "daily"
   ],
   "hashtags_text": "#mgc #newmusic #music #focus #focusmusic #daily",
-  "lead_track_id": "e24a907b-cf8c-4452-a557-4f249d981a09",
+  "lead_track_id": "21341b86-0411-48f6-b445-896c0302447b",
   "media": {
     "note": null,
-    "video_path": "media/e24a907b-cf8c-4452-a557-4f249d981a09.mp4",
+    "video_path": null,
     "video_url": null
   },
   "ok": true,
   "paths": {
     "cover": "cover.png",
     "hashtags": "hashtags.txt",
-    "lead_audio": "../../../../Users/admin/music-generator-company/tracks/e24a907b-cf8c-4452-a557-4f249d981a09.wav",
-    "media": "media/e24a907b-cf8c-4452-a557-4f249d981a09.mp4",
+    "lead_audio": "../drop_bundle/tracks/21341b86-0411-48f6-b445-896c0302447b.wav",
+    "media": null,
     "out_dir": ".",
     "plan": "marketing_plan.json",
     "playlist": "../drop_bundle/playlist.json",
@@ -39,12 +39,12 @@
     "teaser": "teaser.wav"
   },
   "seed": 1,
-  "summary": "New focus daily drop (2020-01-01).",
+  "summary": "New focus daily drop (2026-02-05).",
   "teaser": {
-    "lead_audio": "../../../../Users/admin/music-generator-company/tracks/e24a907b-cf8c-4452-a557-4f249d981a09.wav",
-    "reason": "",
+    "lead_audio": "../drop_bundle/tracks/21341b86-0411-48f6-b445-896c0302447b.wav",
+    "reason": "lead track is not a .wav or does not exist",
     "seconds": 15,
-    "skipped": false
+    "skipped": true
   },
-  "ts": "2020-01-01T00:00:00+00:00"
+  "ts": "2026-02-05T00:00:00+00:00"
 }

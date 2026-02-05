@@ -14,18 +14,18 @@
     "daily"
   ],
   "hashtags_text": "#mgc #newmusic #music #sleep #sleepmusic #daily",
-  "lead_track_id": "d58e6dbd-fbc6-4fb4-9571-331dd00e91b7",
+  "lead_track_id": "19e4a5cd-6580-4663-9efe-dbb8d614822f",
   "media": {
     "note": null,
-    "video_path": "media/d58e6dbd-fbc6-4fb4-9571-331dd00e91b7.mp4",
+    "video_path": null,
     "video_url": null
   },
   "ok": true,
   "paths": {
     "cover": "cover.png",
     "hashtags": "hashtags.txt",
-    "lead_audio": "../../../../Users/admin/music-generator-company/tracks/d58e6dbd-fbc6-4fb4-9571-331dd00e91b7.wav",
-    "media": "media/d58e6dbd-fbc6-4fb4-9571-331dd00e91b7.mp4",
+    "lead_audio": "../drop_bundle/tracks/19e4a5cd-6580-4663-9efe-dbb8d614822f.wav",
+    "media": null,
     "out_dir": ".",
     "plan": "marketing_plan.json",
     "playlist": "../drop_bundle/playlist.json",
@@ -39,12 +39,12 @@
     "teaser": "teaser.wav"
   },
   "seed": 1,
-  "summary": "New sleep daily drop (2020-01-01).",
+  "summary": "New sleep daily drop (2026-02-05).",
   "teaser": {
-    "lead_audio": "../../../../Users/admin/music-generator-company/tracks/d58e6dbd-fbc6-4fb4-9571-331dd00e91b7.wav",
-    "reason": "",
+    "lead_audio": "../drop_bundle/tracks/19e4a5cd-6580-4663-9efe-dbb8d614822f.wav",
+    "reason": "lead track is not a .wav or does not exist",
     "seconds": 15,
-    "skipped": false
+    "skipped": true
   },
-  "ts": "2020-01-01T00:00:00+00:00"
+  "ts": "2026-02-05T00:00:00+00:00"
 }

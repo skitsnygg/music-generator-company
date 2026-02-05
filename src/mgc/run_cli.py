@@ -3215,7 +3215,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         "context": context,
         "deterministic": bool(deterministic),
         "ts": now_iso,
-        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "filesystem"),
+        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "riffusion"),
         "schedule": "daily",
         "track": {"track_id": lead_track_id, "path": lead_rel_path},
         "sha256": {
