@@ -703,6 +703,8 @@ def _agents_generate_and_ingest(
                 )
             except ProviderError as e:
                 if _should_fallback_to_stub(provider_used, e):
+                    if not provider_fallback_from:
+                        eprint(f"[provider] fallback to stub from {provider_used}: {e}")
                     provider_fallback_from = provider_used
                     provider_used = "stub"
                     provider = get_provider(provider_used)
@@ -2795,6 +2797,8 @@ def _stub_daily_run(
         result = _generate_with_provider(provider)
     except ProviderError as e:
         if _should_fallback_to_stub(provider_used, e):
+            if not provider_fallback_from:
+                eprint(f"[provider] fallback to stub from {provider_used}: {e}")
             provider_fallback_from = provider_used
             provider_used = "stub"
             provider = get_provider(provider_used)
