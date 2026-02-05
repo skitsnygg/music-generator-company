@@ -333,6 +333,21 @@ _SUPPORTED_PROVIDERS: Dict[str, Dict[str, Any]] = {
             "Local wrapper can point at scripts/diffsinger_local.py (uses MGC_DIFFSINGER_SAMPLE_DIR).",
         ],
     },
+    "riffusion": {
+        "desc": "Riffusion provider (HTTP inference server).",
+        "env": [
+            "MGC_RIFFUSION_URL",
+            "MGC_RIFFUSION_TIMEOUT",
+            "MGC_RIFFUSION_CONNECT_TIMEOUT",
+            "MGC_RIFFUSION_READ_TIMEOUT",
+            "MGC_RIFFUSION_RETRIES",
+            "MGC_RIFFUSION_RETRY_SLEEP",
+        ],
+        "notes": [
+            "URL should end with /run_inference.",
+            "Timeouts are in seconds; defaults are tuned for local inference.",
+        ],
+    },
 }
 
 _AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff")
