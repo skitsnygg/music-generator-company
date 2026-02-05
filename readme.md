@@ -260,6 +260,22 @@ Artifacts and logs are emitted on every run for auditability:
 
 ---
 
+## Analytics
+
+The analytics CLI provides reporting over the SQLite DB:
+
+python -m mgc.main analytics overview  
+python -m mgc.main analytics tracks --top 5  
+python -m mgc.main analytics playlists --limit 5  
+python -m mgc.main analytics runs --limit 5  
+python -m mgc.main analytics marketing --limit 5  
+python -m mgc.main analytics stability  
+python -m mgc.main analytics reuse  
+python -m mgc.main analytics duration  
+python -m mgc.main analytics export overview --format json --out data/analytics/overview.json
+
+---
+
 ## Release Feed
 
 MGC exposes a structured release feed describing the latest published web artifacts.

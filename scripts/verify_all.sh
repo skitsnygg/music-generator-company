@@ -125,6 +125,18 @@ log "publish-marketing dry-run (file mode)"
 
 test -d "$DROP_OUT/marketing/receipts"
 
+log "analytics checks"
+"$PY" -m mgc.main analytics overview --db "$DB" >/dev/null
+"$PY" -m mgc.main analytics tracks --db "$DB" --top 3 >/dev/null
+"$PY" -m mgc.main analytics playlists --db "$DB" --limit 1 >/dev/null
+"$PY" -m mgc.main analytics runs --db "$DB" --limit 1 >/dev/null
+"$PY" -m mgc.main analytics marketing --db "$DB" --limit 1 >/dev/null
+"$PY" -m mgc.main analytics stability --db "$DB" >/dev/null
+"$PY" -m mgc.main analytics reuse --db "$DB" >/dev/null
+"$PY" -m mgc.main analytics duration --db "$DB" >/dev/null
+"$PY" -m mgc.main analytics export overview --db "$DB" --format json --out "$tmp_root/analytics_overview.json" >/dev/null
+test -s "$tmp_root/analytics_overview.json"
+
 log "submission build"
 "$PY" -m mgc.main submission build --bundle-dir "$BUNDLE_DIR" --out "$tmp_root/submission.zip" >/dev/null
 
