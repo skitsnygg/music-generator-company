@@ -456,6 +456,7 @@ export MGC_PROVIDER=stub
 Preflight behavior:
 - If riffusion is unreachable and `MGC_FALLBACK_TO_STUB=1`, we auto-fallback to stub and log it.
 - If fallback is not enabled, runs fail fast with a clear error.
+- This also applies to `run generate` (MusicAgent).
 
 **Optional: DiffSinger**  
 Use a local command wrapper or an HTTP endpoint.
@@ -474,6 +475,7 @@ This helper also sets MGC_PLAYLIST_PROVIDER=any so daily/weekly playlists can mi
 
 CLI overrides:
 - `run daily --provider <name>` / `run weekly --provider <name>`: overrides generation + playlist filter.
+- `run generate --provider <name>`: override provider for one-off generation (follows preflight fallback rules).
 - `--generate-provider <name>`: override generation only (playlist filter still follows env).
 
 ---
