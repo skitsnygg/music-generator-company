@@ -3110,16 +3110,6 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     provider_override = getattr(args, "provider", None)
     if provider_override is not None:
         provider_override = str(provider_override).strip() or None
-    provider_override = getattr(args, "provider", None)
-    if provider_override is not None:
-        provider_override = str(provider_override).strip() or None
-    provider_override = getattr(args, "provider", None)
-    if provider_override is not None:
-        provider_override = str(provider_override).strip() or None
-    provider_override = getattr(args, "provider", None)
-    if provider_override is not None:
-        provider_override = str(provider_override).strip() or None
-
     out_dir = Path(getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence").expanduser().resolve()
     bundle_dir = out_dir / "drop_bundle"
     bundle_tracks_dir = bundle_dir / "tracks"
@@ -5095,6 +5085,9 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     seed_val = getattr(args, "seed", None)
     seed = int(seed_val) if seed_val is not None else int(os.environ.get("MGC_SEED") or "1")
+    provider_override = getattr(args, "provider", None)
+    if provider_override is not None:
+        provider_override = str(provider_override).strip() or None
 
     out_dir = Path(
         getattr(args, "out_dir", None) or os.environ.get("MGC_EVIDENCE_DIR") or "data/evidence"
