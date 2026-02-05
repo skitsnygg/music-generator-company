@@ -266,6 +266,14 @@ If nginx is not serving `/releases/feed.json`, run:
 
 sudo -E scripts/setup_nginx.sh
 
+**Demo smoke (fast, single context):**
+
+scripts/demo_smoke.sh
+
+Defaults to stub provider and skips marketing. For a local, no-sudo run with a clean slate:
+
+MGC_DEMO_NO_SUDO=1 MGC_DEMO_CLEAN=1 scripts/demo_smoke.sh
+
 **Local demo check (no sudo / no nginx):**
 
 MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh

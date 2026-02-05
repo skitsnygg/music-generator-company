@@ -6,7 +6,13 @@ echo "[demo_check] starting full demo verification"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-0}"
+MGC_DEMO_CLEAN="${MGC_DEMO_CLEAN:-0}"
+MGC_SETUP_NGINX="${MGC_SETUP_NGINX:-1}"
 if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
+  if [[ "${MGC_DEMO_CLEAN}" == "1" ]]; then
+    echo "[demo_check] cleaning local demo outputs..."
+    rm -rf "${REPO_ROOT}/data/local_demo_evidence" "${REPO_ROOT}/data/releases" "${REPO_ROOT}/.tmp_publish"
+  fi
   export MGC_OUT_BASE="${MGC_OUT_BASE:-${REPO_ROOT}/data/local_demo_evidence}"
   export MGC_DB="${MGC_DB:-${REPO_ROOT}/data/local_demo_db.sqlite}"
   if [[ ! -f "${MGC_DB}" && -f "${REPO_ROOT}/data/db.sqlite" ]]; then
@@ -16,6 +22,8 @@ if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
   export MGC_RELEASE_ROOT="${MGC_RELEASE_ROOT:-${REPO_ROOT}/data/releases}"
   export MGC_RELEASE_FEED_OUT="${MGC_RELEASE_FEED_OUT:-${REPO_ROOT}/data/releases/feed.json}"
   export MGC_SKIP_NGINX="${MGC_SKIP_NGINX:-1}"
+elif [[ "${MGC_DEMO_CLEAN}" == "1" ]]; then
+  echo "[demo_check] WARN: MGC_DEMO_CLEAN only cleans local demo outputs (set MGC_DEMO_NO_SUDO=1)" >&2
 fi
 
 FEED_PATH="${MGC_FEED_PATH:-${MGC_RELEASE_FEED_OUT:-/var/lib/mgc/releases/feed.json}}"
@@ -45,6 +53,21 @@ echo "[demo_check] validating feed JSON..."
 python3 -m json.tool "$FEED_PATH" >/dev/null
 echo "[demo_check] feed json ok"
 
+setup_nginx() {
+  if [[ "${MGC_SETUP_NGINX}" != "1" ]]; then
+    return 1
+  fi
+  if [[ ! -x "${REPO_ROOT}/scripts/setup_nginx.sh" ]]; then
+    echo "[demo_check] WARN: scripts/setup_nginx.sh not found or not executable" >&2
+    return 1
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    "${REPO_ROOT}/scripts/setup_nginx.sh"
+  else
+    sudo -E "${REPO_ROOT}/scripts/setup_nginx.sh"
+  fi
+}
+
 # 4) Verify nginx serves the feed
 if [[ "${SKIP_NGINX}" == "1" ]]; then
   echo "[demo_check] skipping nginx check (MGC_SKIP_NGINX=1)"
@@ -53,11 +76,24 @@ else
   if curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null; then
     echo "[demo_check] nginx serving feed ok"
   else
-    if [[ "${REQUIRE_NGINX}" == "1" ]]; then
-      echo "[demo_check] nginx check failed (set MGC_SKIP_NGINX=1 to skip)" >&2
-      exit 2
+    if [[ "${MGC_SETUP_NGINX}" == "1" ]]; then
+      echo "[demo_check] nginx check failed; attempting setup_nginx.sh..."
+      if setup_nginx && curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null; then
+        echo "[demo_check] nginx serving feed ok (after setup)"
+      else
+        if [[ "${REQUIRE_NGINX}" == "1" ]]; then
+          echo "[demo_check] nginx check failed (set MGC_SKIP_NGINX=1 to skip)" >&2
+          exit 2
+        fi
+        echo "[demo_check] WARN: nginx check failed (continuing)"
+      fi
+    else
+      if [[ "${REQUIRE_NGINX}" == "1" ]]; then
+        echo "[demo_check] nginx check failed (set MGC_SKIP_NGINX=1 to skip)" >&2
+        exit 2
+      fi
+      echo "[demo_check] WARN: nginx check failed (continuing)"
     fi
-    echo "[demo_check] WARN: nginx check failed (continuing)"
   fi
 fi
 
