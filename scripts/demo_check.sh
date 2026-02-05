@@ -77,6 +77,9 @@ if [[ -z "${MGC_PROVIDER:-}" ]]; then
 fi
 
 DEMO_FALLBACK="${MGC_DEMO_FALLBACK_TO_STUB:-${MGC_FALLBACK_TO_STUB:-0}}"
+if [[ "${DEMO_FALLBACK}" == "1" ]]; then
+  export MGC_FALLBACK_TO_STUB=1
+fi
 
 if [[ "${MGC_PROVIDER}" == "riffusion" ]]; then
   if [[ -z "${MGC_RIFFUSION_URL:-}" ]]; then
