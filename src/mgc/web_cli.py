@@ -688,6 +688,62 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       border-radius: 8px;
     }
 
+    .inspector{
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+    .inspectorHead{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom: 10px;
+    }
+    .inspectGrid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap:10px;
+    }
+    @media (max-width: 720px){
+      .inspectGrid{ grid-template-columns: 1fr; }
+    }
+    .inspectItem{
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+      border-radius: 12px;
+      padding: 10px;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-height: 72px;
+    }
+    .inspectLabel{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--muted2);
+    }
+    .inspectValue{
+      font-size: 12px;
+      color: var(--text);
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .inspectActions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+    }
+    .inspectHint{
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--muted2);
+    }
+
     .toast{
       position: fixed;
       left: 16px;
@@ -827,6 +883,93 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
 
           <div class="hr"></div>
 
+          <div class="inspector" id="inspector">
+            <div class="inspectorHead">
+              <p class="cardTitle">Release Inspector</p>
+              <div class="row" style="gap:8px;">
+                <button class="btn small" id="btnCopyInspector" title="Copy all inspector fields">Copy all</button>
+              </div>
+            </div>
+
+            <div class="inspectGrid">
+              <div class="inspectItem">
+                <div class="inspectLabel">Feed content_sha256</div>
+                <div class="inspectValue mono" id="inspectFeedSha">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="feed_sha" data-label="Feed content_sha256">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Playlist context</div>
+                <div class="inspectValue mono" id="inspectPlaylist">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="playlist_context" data-label="Playlist context">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Playlist sha256</div>
+                <div class="inspectValue mono" id="inspectPlaylistSha">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="playlist_sha" data-label="Playlist sha256">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Web tree sha256</div>
+                <div class="inspectValue mono" id="inspectWebTreeSha">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="web_tree_sha" data-label="Web tree sha256">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Manifest URL</div>
+                <div class="inspectValue mono" id="inspectManifestUrl">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="manifest_url" data-label="Manifest URL">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Playlist URL</div>
+                <div class="inspectValue mono" id="inspectPlaylistUrl">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="playlist_url" data-label="Playlist URL">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Track relpath</div>
+                <div class="inspectValue mono" id="inspectTrackRel">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="track_relpath" data-label="Track relpath">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Track sha256</div>
+                <div class="inspectValue mono" id="inspectTrackSha">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="track_sha" data-label="Track sha256">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Track bytes</div>
+                <div class="inspectValue mono" id="inspectTrackBytes">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="track_bytes" data-label="Track bytes">Copy</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="inspectHint">Updates with the current track and selected playlist.</div>
+          </div>
+
+          <div class="hr"></div>
+
           <div class="row" style="margin-bottom:10px;">
             <input class="input" id="trSearch" placeholder="Filter tracks (title, playlist, path)..." />
           </div>
@@ -856,6 +999,18 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       el.classList.add("show");
       clearTimeout(toast._t);
       toast._t = setTimeout(() => el.classList.remove("show"), 2600);
+    }
+
+    function copyText(text, label){
+      const value = text ? String(text) : "";
+      if (!value){
+        toast("Nothing to copy", label ? (label + " is empty.") : "Value is empty.");
+        return Promise.resolve(false);
+      }
+      return navigator.clipboard.writeText(value).then(
+        () => { toast("Copied", label || value); return true; },
+        () => { toast("Copy failed", "Your browser blocked clipboard access."); return false; }
+      );
     }
 
     function fmtIso(iso){
@@ -934,6 +1089,75 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         "";
 
       return { title, path, raw: t };
+    }
+
+    function shortHash(s){
+      if (!s) return "—";
+      if (s.length <= 18) return s;
+      return s.slice(0, 10) + "..." + s.slice(-6);
+    }
+
+    function stripOrigin(u){
+      if (!u) return "";
+      try{
+        const origin = window.location.origin || "";
+        if (origin && u.startsWith(origin)) return u.slice(origin.length) || "/";
+      }catch{
+        return u;
+      }
+      return u;
+    }
+
+    function absoluteUrl(u){
+      if (!u) return "";
+      try{
+        return new URL(u, window.location.href).toString();
+      }catch{
+        return u;
+      }
+    }
+
+    function normalizeRelpath(p){
+      return String(p || "").replace(/^\.?\//, "");
+    }
+
+    function findManifestTrack(manifest, track){
+      if (!manifest || !track) return null;
+      const tracks = Array.isArray(manifest.tracks) ? manifest.tracks : [];
+      if (!tracks.length) return null;
+
+      const raw = track.raw || {};
+      const ids = [raw.track_id, raw.trackId, raw.id, track.track_id, track.id].filter(Boolean);
+      for (const id of ids){
+        const hit = tracks.find(t => t && t.track_id === id);
+        if (hit) return hit;
+      }
+
+      const path = track.path || "";
+      if (path){
+        const n = normalizeRelpath(path);
+        const hit = tracks.find(t => t && normalizeRelpath(t.relpath || "") === n);
+        if (hit) return hit;
+      }
+
+      const src = track.src || "";
+      if (src){
+        const hit = tracks.find(t => t && typeof t.relpath === "string" && src.endsWith(t.relpath));
+        if (hit) return hit;
+      }
+
+      const title = track.title || "";
+      if (title){
+        const hit = tracks.find(t => t && t.title === title);
+        if (hit) return hit;
+      }
+
+      if (Number.isFinite(track.playlist_idx)){
+        const hit = tracks.find(t => t && t.index === track.playlist_idx);
+        if (hit) return hit;
+      }
+
+      return null;
     }
 
     function normalizeBundleBase(ctx){
@@ -1121,6 +1345,72 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function setInspectorValue(id, value, opts){
+      const el = $(id);
+      if (!el) return;
+      const has = value !== undefined && value !== null && String(value).length;
+      if (!has){
+        el.textContent = "—";
+        el.title = "";
+        return;
+      }
+
+      const raw = String(value);
+      let display = raw;
+      if (opts && opts.shortHash) display = shortHash(raw);
+      if (opts && opts.shortUrl) display = stripOrigin(raw);
+      if (opts && opts.bytes) display = raw + " bytes";
+      el.textContent = display;
+      el.title = (display !== raw) ? raw : "";
+    }
+
+    function setInspector(state){
+      const cur = state.current || null;
+      const pl = cur ? findPlaylistByName(state, cur.playlist_context) : state.selected;
+      const manifest = pl && pl.manifest ? pl.manifest : null;
+      const mTrack = findManifestTrack(manifest, cur);
+
+      const values = {
+        feed_sha: state.feed && state.feed.content_sha256 ? state.feed.content_sha256 : "",
+        playlist_context: pl && pl.context ? pl.context : "",
+        playlist_sha: manifest && manifest.playlist_sha256 ? manifest.playlist_sha256 : "",
+        web_tree_sha: manifest && manifest.web_tree_sha256 ? manifest.web_tree_sha256 : "",
+        manifest_url: pl && pl.manifestUrl ? absoluteUrl(pl.manifestUrl) : "",
+        playlist_url: pl && pl.playlistUrl ? absoluteUrl(pl.playlistUrl) : "",
+        track_relpath: (mTrack && mTrack.relpath) || (cur && cur.path) || "",
+        track_sha: (mTrack && mTrack.sha256) || "",
+        track_bytes: (mTrack && mTrack.bytes != null) ? String(mTrack.bytes) : "",
+      };
+
+      state.inspector = values;
+
+      setInspectorValue("inspectFeedSha", values.feed_sha, { shortHash: true });
+      setInspectorValue("inspectPlaylist", values.playlist_context, {});
+      setInspectorValue("inspectPlaylistSha", values.playlist_sha, { shortHash: true });
+      setInspectorValue("inspectWebTreeSha", values.web_tree_sha, { shortHash: true });
+      setInspectorValue("inspectManifestUrl", values.manifest_url, { shortUrl: true });
+      setInspectorValue("inspectPlaylistUrl", values.playlist_url, { shortUrl: true });
+      setInspectorValue("inspectTrackRel", values.track_relpath, {});
+      setInspectorValue("inspectTrackSha", values.track_sha, { shortHash: true });
+      setInspectorValue("inspectTrackBytes", values.track_bytes, { bytes: true });
+    }
+
+    function inspectorSummary(state){
+      const v = state.inspector || {};
+      const pairs = [
+        ["feed_content_sha256", v.feed_sha],
+        ["playlist_context", v.playlist_context],
+        ["playlist_sha256", v.playlist_sha],
+        ["web_tree_sha256", v.web_tree_sha],
+        ["manifest_url", v.manifest_url],
+        ["playlist_url", v.playlist_url],
+        ["track_relpath", v.track_relpath],
+        ["track_sha256", v.track_sha],
+        ["track_bytes", v.track_bytes],
+      ];
+      return pairs.map((p) => p[0] + ": " + (p[1] || "—")).join("\n");
+    }
+
     function setNowPlaying(state){
       const t = state.current || null;
       if (!t){
@@ -1129,6 +1419,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         $("trackPath").textContent = "";
         $("nowMeta").textContent = "Pick a track from the list.";
         $("bundleFoot").textContent = "";
+        setInspector(state);
         return;
       }
 
@@ -1145,6 +1436,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       if (t.playlistUrl) footBits.push(`playlist: ${t.playlistUrl}`);
       if (t.manifestUrl) footBits.push(`manifest: ${t.manifestUrl}`);
       $("bundleFoot").textContent = footBits.join(" • ");
+      setInspector(state);
     }
 
     function setAudioSource(state){
@@ -1208,132 +1500,35 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadAllPlaylists(state){
-      // Primary mode: GitHub Pages feed (/releases/feed.json).
-      // Fallback mode: local bundle in the same directory as index.html (./playlist.json + ./web_manifest.json).
       const feedUrl = resolveFeedUrl();
       $("pillFeed").textContent = feedUrl.replace(window.location.origin, "");
+      const feed = await fetchJson(feedUrl);
+      state.feed = feed;
 
-      let feed = null;
-      let webCtxs = [];
-      try{
-        feed = await fetchJson(feedUrl);
-        state.feed = feed;
+      const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
+      const webCtxs = ctxs.filter(x => x.kind === "web");
 
-        const ctxs = (feed && feed.latest && Array.isArray(feed.latest.contexts)) ? feed.latest.contexts : [];
-        webCtxs = ctxs.filter(x => x.kind === "web");
-      }catch(e){
-        // Fallback to local bundle
-        state.feed = null;
-        const path = (window.location && window.location.pathname) ? window.location.pathname : "/";
-        const basePath = path.endsWith(".html") ? path.replace(/[^\/]+$/, "") : path;
-        const localUrl = basePath || "/";
-        $("pillFeed").textContent = "(local bundle)";
-        $("plMeta").textContent = "Feed unavailable. Loading local bundle…";
-
-        webCtxs = [{
-          context: "local",
-          kind: "web",
-          mtime: null,
-          track_count: null,
-          url: localUrl,
-        }];
-      }
-
-      if (!webCtxs.length){
-        $("plMeta").textContent = "No web playlists found in feed.";
-        state.playlists = [];
-        state.allTracks = [];
-        setCounts(state);
-        renderPlaylists(state);
-        renderTracks(state);
-        return;
-      }
-
-      $("plMeta").textContent = `Found ${webCtxs.length} playlist${webCtxs.length === 1 ? "" : "s"}. Loading bundles…`;
+      $("plMeta").textContent = webCtxs.length ? `Found ${webCtxs.length} playlists. Loading bundles…` : "No web playlists found in feed.";
 
       // Load each bundle with a small concurrency limit to avoid a burst
       const limit = 4;
       const q = webCtxs.slice();
       const out = [];
-      let active = 0;
+      let failed = 0;
 
       async function worker(){
         while (q.length){
           const ctx = q.shift();
-          if (!ctx) break;
-          active++;
           try{
-            const b = await loadBundle(ctx);
-            out.push({ ctx, ...b });
-          }catch(err){
-            console.warn("Failed to load bundle:", ctx, err);
-          }finally{
-            active--;
-          }
-        }
-      }
-
-      const workers = [];
-      for (let i=0; i<limit; i++) workers.push(worker());
-      await Promise.all(workers);
-
-      // Sort stable: by context then url
-      out.sort((a,b) => {
-        const ac = (a.ctx && a.ctx.context) ? String(a.ctx.context) : "";
-        const bc = (b.ctx && b.ctx.context) ? String(b.ctx.context) : "";
-        if (ac !== bc) return ac < bc ? -1 : 1;
-        const au = (a.ctx && a.ctx.url) ? String(a.ctx.url) : "";
-        const bu = (b.ctx && b.ctx.url) ? String(b.ctx.url) : "";
-        return au < bu ? -1 : (au > bu ? 1 : 0);
-      });
-
-      // Normalize playlists to a consistent shape for rendering
-      state.playlists = out.map(o => {
-        const name = (o.playlist && (o.playlist.title || o.playlist.name)) ? (o.playlist.title || o.playlist.name) : (o.ctx.context || "playlist");
-        return {
-          name,
-          context: o.ctx.context || name,
-          bundleBase: o.bundleBase,
-          playlistUrl: o.playlistUrl,
-          manifestUrl: o.manifestUrl,
-          playlist: o.playlist,
-          manifest: o.manifest,
-        };
-      });
-
-      // Flatten tracks
-      state.allTracks = [];
-      for (const pl of state.playlists){
-        const pts = playlistTracks(pl.playlist);
-        for (const t of pts){
-          const webPath = t.web_path || t.path || t.url || "";
-          if (!isAudioPath(webPath)) continue;
-          const src = computeTrackSrc(pl.bundleBase, webPath);
-          state.allTracks.push({
-            ...t,
-            _playlist: pl,
-            _src: src,
-            web_path: webPath,
-          });
-        }
-      }
-
-      // Stable order: by playlist name then track display
-      state.allTracks.sort((a,b) => {
-        const ap = (a._playlist && a._playlist.name) ? String(a._playlist.name) : "";
-        const bp = (b._playlist && b._playlist.name) ? String(b._playlist.name) : "";
-        if (ap !== bp) return ap < bp ? -1 : 1;
-        const ad = trackDisplay(a);
-        const bd = trackDisplay(b);
-        return ad < bd ? -1 : (ad > bd ? 1 : 0);
-      });
-
-      setCounts(state);
-      renderPlaylists(state);
-      renderTracks(state);
-
-      $("plMeta").textContent = `Loaded ${state.playlists.length} playlist${state.playlists.length === 1 ? "" : "s"} • ${state.allTracks.length} track${state.allTracks.length === 1 ? "" : "s"}.`;
-    };
+            const bundle = await loadBundle(ctx);
+            const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
+              const d = trackDisplay(t, i);
+              return {
+                title: d.title,
+                path: d.path,
+                raw: d.raw,
+                src: computeTrackSrc(bundle.bundleBase, d.path),
+              };
             });
 
             out.push({
@@ -1448,6 +1643,7 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         allTracks: [],
         selected: null, // null = All
         current: null,
+        inspector: {},
       };
 
       setModeLabel();
@@ -1546,14 +1742,22 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       $("audio").addEventListener("pause", () => { $("btnPlay").textContent = "Play"; });
       $("audio").addEventListener("ended", () => { nextPrev(state, +1); });
 
-      $("btnCopyLink").addEventListener("click", async () => {
-        try{
-          const u = currentShareUrl(state);
-          await navigator.clipboard.writeText(u);
-          toast("Copied link", u);
-        }catch{
-          toast("Copy failed", "Your browser blocked clipboard access.");
-        }
+      $("btnCopyLink").addEventListener("click", () => {
+        const u = currentShareUrl(state);
+        copyText(u, "Share link");
+      });
+
+      $("btnCopyInspector").addEventListener("click", () => {
+        copyText(inspectorSummary(state), "Inspector summary");
+      });
+
+      $("inspector").addEventListener("click", (ev) => {
+        const btn = ev.target.closest("button[data-copy]");
+        if (!btn) return;
+        const key = btn.dataset.copy || "";
+        const label = btn.dataset.label || key;
+        const val = state.inspector && state.inspector[key] ? state.inspector[key] : "";
+        copyText(val, label);
       });
 
       $("btnOpenBundle").addEventListener("click", () => {
