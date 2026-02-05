@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-0}"
 MGC_DEMO_CLEAN="${MGC_DEMO_CLEAN:-0}"
 MGC_SETUP_NGINX="${MGC_SETUP_NGINX:-1}"
+MGC_PYTHON="${MGC_PYTHON:-}"
 
 if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
   if [[ "${MGC_DEMO_CLEAN}" == "1" ]]; then
@@ -34,8 +35,23 @@ REQUIRE_NGINX="${MGC_REQUIRE_NGINX:-1}"
 PUBLISH_FEED="${MGC_PUBLISH_FEED:-1}"
 PUBLISH_LATEST="${MGC_PUBLISH_LATEST:-1}"
 DEMO_VALIDATE_AUDIO="${MGC_DEMO_VALIDATE_AUDIO:-1}"
+DEMO_VALIDATE_WEB="${MGC_DEMO_VALIDATE_WEB:-1}"
 
 cd "$REPO_ROOT"
+
+if [[ -z "${MGC_PYTHON}" ]]; then
+  if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    MGC_PYTHON="${REPO_ROOT}/.venv/bin/python"
+  else
+    MGC_PYTHON="$(command -v python3 || command -v python || true)"
+  fi
+fi
+
+if [[ -z "${MGC_PYTHON}" ]]; then
+  echo "[demo_smoke] ERROR: python not found (set MGC_PYTHON)" >&2
+  exit 2
+fi
+export PYTHON="${MGC_PYTHON}"
 
 if [[ -z "${MGC_PROVIDER:-}" ]]; then
   export MGC_PROVIDER="stub"
@@ -61,7 +77,7 @@ CONTEXTS=(${MGC_CONTEXTS:-focus})
 for ctx in "${CONTEXTS[@]}"; do
   PLAYLIST="${OUT_BASE}/${ctx}/drop_bundle/playlist.json"
   test -s "$PLAYLIST"
-  python3 scripts/check_playlist_tracks.py "$PLAYLIST" "${OUT_BASE}/${ctx}"
+  "${MGC_PYTHON}" scripts/check_playlist_tracks.py "$PLAYLIST" "${OUT_BASE}/${ctx}"
 done
 
 if [[ "${PUBLISH_LATEST}" == "1" ]]; then
@@ -74,6 +90,9 @@ if [[ "${PUBLISH_LATEST}" == "1" ]]; then
       AUDIO_COUNT="$(find "${WEB_DIR}" -maxdepth 8 -type f \( -name '*.mp3' -o -name '*.wav' \) | wc -l | tr -d ' ')"
       test "${AUDIO_COUNT}" != "0"
     fi
+    if [[ "${DEMO_VALIDATE_WEB}" == "1" ]]; then
+      "${MGC_PYTHON}" -m mgc.main web validate --out-dir "${WEB_DIR}"
+    fi
   done
 else
   echo "[demo_smoke] skipping web bundle checks (MGC_PUBLISH_LATEST=0)"
@@ -82,7 +101,7 @@ fi
 if [[ "${PUBLISH_FEED}" == "1" ]]; then
   echo "[demo_smoke] checking feed on disk..."
   test -s "$FEED_PATH"
-  python3 -m json.tool "$FEED_PATH" >/dev/null
+  "${MGC_PYTHON}" -m json.tool "$FEED_PATH" >/dev/null
   echo "[demo_smoke] feed json ok"
 else
   echo "[demo_smoke] skipping feed checks (MGC_PUBLISH_FEED=0)"
@@ -114,12 +133,12 @@ elif [[ "${SKIP_NGINX}" == "1" ]]; then
   echo "[demo_smoke] skipping nginx check (MGC_SKIP_NGINX=1)"
 elif command -v curl >/dev/null 2>&1; then
   echo "[demo_smoke] fetching feed via nginx..."
-  if curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null; then
+  if curl -fsS "$FEED_URL" | "${MGC_PYTHON}" -m json.tool >/dev/null; then
     echo "[demo_smoke] nginx serving feed ok"
   else
     if [[ "${MGC_SETUP_NGINX}" == "1" ]]; then
       echo "[demo_smoke] nginx check failed; attempting setup_nginx.sh..."
-      if setup_nginx && curl -fsS "$FEED_URL" | python3 -m json.tool >/dev/null; then
+      if setup_nginx && curl -fsS "$FEED_URL" | "${MGC_PYTHON}" -m json.tool >/dev/null; then
         echo "[demo_smoke] nginx serving feed ok (after setup)"
       else
         if [[ "${REQUIRE_NGINX}" == "1" ]]; then
