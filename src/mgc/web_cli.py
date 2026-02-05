@@ -339,11 +339,12 @@ def _build_web_manifest(
     tracks_payload: List[Dict[str, Any]],
     deterministic: bool,
     bundle_audio: bool,
+    marketing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     playlist_sha = _sha256_hex_str(_stable_json_dumps(playlist_obj))
     web_tree = _tree_hash(out_dir)
 
-    return {
+    out = {
         "schema": WEB_MANIFEST_SCHEMA,
         "version": WEB_MANIFEST_VERSION,
         "generated_at": _manifest_generated_at(playlist_obj, deterministic),
@@ -352,6 +353,9 @@ def _build_web_manifest(
         "web_tree_sha256": web_tree,
         "tracks": tracks_payload,
     }
+    if marketing:
+        out["marketing"] = marketing
+    return out
 
 
 def _validate_web_manifest(out_dir: Path, manifest: Dict[str, Any]) -> None:
@@ -963,6 +967,30 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
                   <button class="btn small" data-copy="track_bytes" data-label="Track bytes">Copy</button>
                 </div>
               </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Marketing summary</div>
+                <div class="inspectValue" id="inspectMarketingSummary">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="marketing_summary" data-label="Marketing summary">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Hashtags</div>
+                <div class="inspectValue mono" id="inspectMarketingHashtags">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="marketing_hashtags" data-label="Hashtags">Copy</button>
+                </div>
+              </div>
+
+              <div class="inspectItem">
+                <div class="inspectLabel">Marketing media URL</div>
+                <div class="inspectValue mono" id="inspectMarketingMedia">—</div>
+                <div class="inspectActions">
+                  <button class="btn small" data-copy="marketing_media_url" data-label="Marketing media URL">Copy</button>
+                </div>
+              </div>
             </div>
 
             <div class="inspectHint">Updates with the current track and selected playlist.</div>
@@ -1369,6 +1397,24 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       const pl = cur ? findPlaylistByName(state, cur.playlist_context) : state.selected;
       const manifest = pl && pl.manifest ? pl.manifest : null;
       const mTrack = findManifestTrack(manifest, cur);
+      const marketing = manifest && manifest.marketing ? manifest.marketing : null;
+      let hashtagsText = "";
+      if (marketing){
+        if (marketing.hashtags_text) hashtagsText = String(marketing.hashtags_text || "").trim();
+        else if (Array.isArray(marketing.hashtags)){
+          hashtagsText = marketing.hashtags.map(t => "#" + String(t || "").trim()).join(" ").trim();
+        }
+      }
+      let marketingMediaUrl = "";
+      if (marketing){
+        if (marketing.media_url){
+          marketingMediaUrl = String(marketing.media_url || "").trim();
+        }else if (marketing.marketing_media_path){
+          marketingMediaUrl = computeTrackSrc(pl ? pl.bundleBase : "", String(marketing.marketing_media_path || "").trim());
+        }else if (marketing.media_path){
+          marketingMediaUrl = computeTrackSrc(pl ? pl.bundleBase : "", "marketing/" + String(marketing.media_path || "").replace(/^\/+/, ""));
+        }
+      }
 
       const values = {
         feed_sha: state.feed && state.feed.content_sha256 ? state.feed.content_sha256 : "",
@@ -1380,6 +1426,9 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         track_relpath: (mTrack && mTrack.relpath) || (cur && cur.path) || "",
         track_sha: (mTrack && mTrack.sha256) || "",
         track_bytes: (mTrack && mTrack.bytes != null) ? String(mTrack.bytes) : "",
+        marketing_summary: marketing && marketing.summary ? String(marketing.summary) : "",
+        marketing_hashtags: hashtagsText,
+        marketing_media_url: marketingMediaUrl,
       };
 
       state.inspector = values;
@@ -1393,6 +1442,9 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
       setInspectorValue("inspectTrackRel", values.track_relpath, {});
       setInspectorValue("inspectTrackSha", values.track_sha, { shortHash: true });
       setInspectorValue("inspectTrackBytes", values.track_bytes, { bytes: true });
+      setInspectorValue("inspectMarketingSummary", values.marketing_summary, {});
+      setInspectorValue("inspectMarketingHashtags", values.marketing_hashtags, {});
+      setInspectorValue("inspectMarketingMedia", values.marketing_media_url, { shortUrl: true });
     }
 
     function inspectorSummary(state){
@@ -1407,6 +1459,9 @@ _EMBEDDED_INDEX_HTML = r"""<!doctype html>
         ["track_relpath", v.track_relpath],
         ["track_sha256", v.track_sha],
         ["track_bytes", v.track_bytes],
+        ["marketing_summary", v.marketing_summary],
+        ["marketing_hashtags", v.marketing_hashtags],
+        ["marketing_media_url", v.marketing_media_url],
       ];
       return pairs.map((p) => p[0] + ": " + (p[1] || "—")).join("\n");
     }
@@ -1816,6 +1871,64 @@ def _normalize_playlist_path_arg(p: Path) -> Path:
             return cand2
     return p
 
+
+def _load_marketing_plan_for_playlist(playlist_path: Path) -> Optional[Dict[str, Any]]:
+    playlist_dir = playlist_path.parent
+    candidates = [
+        playlist_dir / "marketing" / "marketing_plan.json",
+        playlist_dir.parent / "marketing" / "marketing_plan.json",
+    ]
+    for cand in candidates:
+        if not cand.exists():
+            continue
+        try:
+            obj = json.loads(cand.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _marketing_meta_from_plan(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(plan, dict):
+        return None
+
+    hashtags = plan.get("hashtags") if isinstance(plan.get("hashtags"), list) else None
+    hashtags_text = str(plan.get("hashtags_text") or "").strip()
+    if not hashtags_text and isinstance(hashtags, list):
+        tags = [str(t).strip() for t in hashtags if str(t).strip()]
+        hashtags_text = " ".join([f"#{t}" for t in tags]).strip()
+
+    summary = str(plan.get("summary") or "").strip()
+
+    media_obj = plan.get("media") if isinstance(plan.get("media"), dict) else None
+    media_path = ""
+    media_url = ""
+    if isinstance(media_obj, dict):
+        media_path = str(media_obj.get("video_path") or media_obj.get("media_path") or "").strip()
+        media_url = str(media_obj.get("video_url") or media_obj.get("media_url") or "").strip()
+
+    marketing_media_path = ""
+    if media_path:
+        posix_path = Path(media_path).as_posix().lstrip("/")
+        marketing_media_path = posix_path if posix_path.startswith("marketing/") else f"marketing/{posix_path}"
+
+    out: Dict[str, Any] = {}
+    if summary:
+        out["summary"] = summary
+    if isinstance(hashtags, list) and hashtags:
+        out["hashtags"] = [str(t).strip() for t in hashtags if str(t).strip()]
+    if hashtags_text:
+        out["hashtags_text"] = hashtags_text
+    if media_path:
+        out["media_path"] = media_path
+    if media_url:
+        out["media_url"] = media_url
+    if marketing_media_path:
+        out["marketing_media_path"] = marketing_media_path
+    return out if out else None
+
 def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_path = Path(str(getattr(args, "playlist"))).expanduser().resolve()
     playlist_path = _normalize_playlist_path_arg(playlist_path)
@@ -1834,6 +1947,8 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     playlist_dir = playlist_path.parent
 
     playlist_obj = json.loads(playlist_path.read_text(encoding="utf-8"))
+    marketing_plan = _load_marketing_plan_for_playlist(playlist_path)
+    marketing_meta = _marketing_meta_from_plan(marketing_plan) if marketing_plan else None
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
     fail_if_empty = bool(getattr(args, "fail_if_empty", False))
@@ -2071,6 +2186,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         tracks_payload=tracks_payload,
         deterministic=deterministic,
         bundle_audio=bundle_audio,
+        marketing=marketing_meta,
     )
     (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
 

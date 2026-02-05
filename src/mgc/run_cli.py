@@ -1054,6 +1054,7 @@ def _agents_marketing_plan(
             "note": media_note,
         },
         "hashtags": hashtags,
+        "hashtags_text": hashtags_text,
         "summary": summary_text,
         "paths": {
             "out_dir": ".",
@@ -1103,10 +1104,25 @@ def _emit_marketing_publish_posts(
     cta: str,
     media_path: Optional[str] = None,
     media_url: Optional[str] = None,
+    hashtags: Optional[Sequence[str]] = None,
+    hashtags_text: Optional[str] = None,
+    summary: Optional[str] = None,
 ) -> List[str]:
     marketing_dir = out_dir / "marketing"
     publish_dir = marketing_dir / "publish"
     publish_dir.mkdir(parents=True, exist_ok=True)
+
+    tags_list: List[str] = []
+    if hashtags:
+        for t in hashtags:
+            tt = str(t).strip()
+            if not tt:
+                continue
+            tags_list.append(tt)
+    if hashtags_text is None:
+        hashtags_text = " ".join([f"#{t}" for t in tags_list]).strip()
+    if summary is None:
+        summary = ""
 
     post_ids: List[str] = []
     for platform in _marketing_platforms_from_env():
@@ -1127,6 +1143,9 @@ def _emit_marketing_publish_posts(
             "hook": hook,
             "cta": cta,
             "context": context,
+            "summary": summary,
+            "hashtags": tags_list,
+            "hashtags_text": hashtags_text,
             "video_path": media_path,
             "video_url": media_url,
         }
@@ -3091,11 +3110,25 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
     media_rel = None
     media_url = None
+    hashtags = None
+    hashtags_text = None
+    summary = None
     if isinstance(marketing_obj, dict):
         media_obj = marketing_obj.get("media") if isinstance(marketing_obj.get("media"), dict) else None
         if isinstance(media_obj, dict):
             media_rel = media_obj.get("video_path") or media_obj.get("media_path")
             media_url = media_obj.get("video_url") or media_obj.get("media_url")
+        if isinstance(marketing_obj.get("hashtags"), list):
+            hashtags = marketing_obj.get("hashtags")
+        hashtags_text = marketing_obj.get("hashtags_text") or None
+        summary = marketing_obj.get("summary") or None
+
+    if not hashtags:
+        hashtags = _marketing_hashtags(context, "daily")
+    if not hashtags_text:
+        hashtags_text = " ".join([f"#{t}" for t in hashtags]).strip()
+    if not summary:
+        summary = _marketing_summary(context, "daily", period_key)
 
     post_ids = _emit_marketing_publish_posts(
         out_dir=out_dir,
@@ -3111,6 +3144,9 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         cta="Listen now.",
         media_path=media_rel,
         media_url=media_url,
+        hashtags=hashtags,
+        hashtags_text=hashtags_text,
+        summary=summary,
     )
 
     lead_rel_path = copied[0]["path"]
@@ -5072,11 +5108,25 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     media_rel = None
     media_url = None
+    hashtags = None
+    hashtags_text = None
+    summary = None
     if isinstance(marketing_obj, dict):
         media_obj = marketing_obj.get("media") if isinstance(marketing_obj.get("media"), dict) else None
         if isinstance(media_obj, dict):
             media_rel = media_obj.get("video_path") or media_obj.get("media_path")
             media_url = media_obj.get("video_url") or media_obj.get("media_url")
+        if isinstance(marketing_obj.get("hashtags"), list):
+            hashtags = marketing_obj.get("hashtags")
+        hashtags_text = marketing_obj.get("hashtags_text") or None
+        summary = marketing_obj.get("summary") or None
+
+    if not hashtags:
+        hashtags = _marketing_hashtags(context, "weekly")
+    if not hashtags_text:
+        hashtags_text = " ".join([f"#{t}" for t in hashtags]).strip()
+    if not summary:
+        summary = _marketing_summary(context, "weekly", period_key)
 
     _emit_marketing_publish_posts(
         out_dir=out_dir,
@@ -5092,6 +5142,9 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         cta="Listen now.",
         media_path=media_rel,
         media_url=media_url,
+        hashtags=hashtags,
+        hashtags_text=hashtags_text,
+        summary=summary,
     )
 
     # Compute deterministic repo manifest alongside playlist (helps CI provenance)

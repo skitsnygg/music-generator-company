@@ -52,6 +52,21 @@ PLAYLIST_BUNDLE="${SRC_OUT_DIR}/drop_bundle/playlist.json"
 
 DEST_DIR="${WEB_ROOT}/${CONTEXT}"
 
+check_root_owned() {
+  local base="$1"
+  [[ -d "${base}" ]] || return 0
+  local hit=""
+  hit="$(find "${base}" -type f -user root -print -quit 2>/dev/null || true)"
+  if [[ -n "${hit}" ]]; then
+    die "Found root-owned files under ${base}. Fix with: sudo chown -R \"${USER}:$(id -gn)\" \"${base}\""
+  fi
+}
+
+if [[ "${MGC_SKIP_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+  check_root_owned "${SRC_OUT_DIR}"
+  check_root_owned "${WEB_ROOT}"
+fi
+
 # Build into a temp dir then swap to DEST_DIR atomically.
 TMP_BASE="${ROOT}/.tmp_publish"
 mkdir -p "${TMP_BASE}"

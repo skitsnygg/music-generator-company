@@ -62,6 +62,20 @@ log "Publish latest web: ${PUBLISH_LATEST}"
 log "Publish release feed: ${PUBLISH_FEED} (require=${REQUIRE_FEED})"
 "${PY}" -V
 
+check_root_owned() {
+  local base="$1"
+  [[ -d "${base}" ]] || return 0
+  local hit=""
+  hit="$(find "${base}" -type f -user root -print -quit 2>/dev/null || true)"
+  if [[ -n "${hit}" ]]; then
+    die "Found root-owned files under ${base}. Fix with: sudo chown -R \"${USER}:$(id -gn)\" \"${base}\""
+  fi
+}
+
+if [[ "${MGC_SKIP_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+  check_root_owned "${OUT_BASE}"
+fi
+
 run_one() {
   local ctx="$1"
   local out_dir="${OUT_BASE}/${PERIOD_KEY}/${ctx}"
