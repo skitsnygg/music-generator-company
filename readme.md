@@ -282,6 +282,13 @@ MGC_DEMO_FAST=1 scripts/demo_smoke.sh
 
 scripts/demo_report.sh
 
+**Demo cleanup (safe, prompt-based):**
+
+scripts/demo_clean.sh
+
+For local cleanup only:
+
+MGC_DEMO_NO_SUDO=1 scripts/demo_clean.sh
 **Local demo check (no sudo / no nginx):**
 
 MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh
