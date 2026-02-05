@@ -2733,7 +2733,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
     bundle_data = {
         "playlist": playlist_obj,
-        "manifest": None,
         "marketing_plan": marketing_plan,
         "marketing_preview": marketing_preview,
     }
@@ -2751,11 +2750,6 @@ def cmd_web_build(args: argparse.Namespace) -> int:
         marketing=marketing_meta,
     )
     (out_dir / "web_manifest.json").write_text(_stable_json_dumps(manifest) + "\n", encoding="utf-8")
-    # Update embedded bundle data with manifest now that it's available.
-    bundle_data["manifest"] = manifest
-    (out_dir / "bundle_data.js").write_text(
-        "window.__MGC_BUNDLE__ = " + _stable_json_dumps(bundle_data) + ";\n", encoding="utf-8"
-    )
 
     # Validate (emit JSON on failure rather than a silent SystemExit)
     try:
