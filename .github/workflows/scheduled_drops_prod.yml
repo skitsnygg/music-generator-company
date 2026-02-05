@@ -45,13 +45,20 @@ jobs:
         run: |
           set -euxo pipefail
 
+          if [ -z "${MGC_PROVIDER:-}" ]; then
+            echo "WARN: MGC_PROVIDER is empty; defaulting to riffusion"
+            echo "MGC_PROVIDER=riffusion" >> "$GITHUB_ENV"
+            export MGC_PROVIDER="riffusion"
+          fi
+
+          if [ "${MGC_PROVIDER:-}" = "riffusion" ] && [ -z "${MGC_RIFFUSION_URL:-}" ]; then
+            echo "WARN: MGC_RIFFUSION_URL is empty; defaulting to http://127.0.0.1:3013/run_inference"
+            echo "MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference" >> "$GITHUB_ENV"
+            export MGC_RIFFUSION_URL="http://127.0.0.1:3013/run_inference"
+          fi
+
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
           echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
-
-          if [ -z "${MGC_PROVIDER:-}" ]; then
-            echo "ERROR: MGC_PROVIDER is empty"
-            exit 2
-          fi
 
           # Prod must always use the system DB
           test -s /var/lib/mgc/db.sqlite
