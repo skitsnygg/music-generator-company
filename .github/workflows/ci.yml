@@ -21,6 +21,8 @@ jobs:
       # Deterministic migrations
       MGC_MIGRATE_NOW: "2020-01-01T00:00:00Z"
       PYTHON: python
+      # Avoid hard dependency on local riffusion during CI runs.
+      MGC_FALLBACK_TO_STUB: "1"
 
     steps:
       - name: Checkout repo
