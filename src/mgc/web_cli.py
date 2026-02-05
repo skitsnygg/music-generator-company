@@ -2773,6 +2773,9 @@ def cmd_web_build(args: argparse.Namespace) -> int:
             shutil.copy2(src_path, dst)
             sha = _sha256_file(dst)
             size = dst.stat().st_size
+            track_obj = e.get("track_obj")
+            if isinstance(track_obj, dict):
+                track_obj["web_path"] = relpath
             bundled.append({
                 "index": i,
                 "track_id": effective_track_id,

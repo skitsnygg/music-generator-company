@@ -1662,6 +1662,15 @@
               const bundle = await loadBundle(ctx);
               const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
                 const d = trackDisplay(t, i);
+                const m = findManifestTrack(bundle.manifest, {
+                  path: d.path,
+                  raw: d.raw,
+                  track_id: d.raw && (d.raw.track_id || d.raw.id),
+                  id: d.raw && d.raw.id,
+                  title: d.title,
+                  playlist_idx: i,
+                });
+                if (m && m.relpath) d.path = m.relpath;
                 return {
                   title: d.title,
                   path: d.path,
@@ -1709,6 +1718,15 @@
         const ctxName = playlist.context || playlist.name || "local";
         const rawTracks = playlistTracks(bundle.playlist).map((t, i) => {
           const d = trackDisplay(t, i);
+          const m = findManifestTrack(bundle.manifest, {
+            path: d.path,
+            raw: d.raw,
+            track_id: d.raw && (d.raw.track_id || d.raw.id),
+            id: d.raw && d.raw.id,
+            title: d.title,
+            playlist_idx: i,
+          });
+          if (m && m.relpath) d.path = m.relpath;
           return {
             title: d.title,
             path: d.path,
