@@ -105,7 +105,7 @@ echo "[release] regenerate feed.json"
 
 echo
 echo "[release] verify feed has releases"
-python - <<'PY'
+"${PY}" - <<'PY'
 import json
 from pathlib import Path
 p = Path("docs/releases/feed.json")
