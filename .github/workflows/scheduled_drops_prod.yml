@@ -131,6 +131,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          . .venv/bin/activate
 
           WEB_DIR="${{ steps.run_auto.outputs.web_dir }}"
 
