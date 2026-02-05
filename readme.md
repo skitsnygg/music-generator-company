@@ -289,6 +289,14 @@ scripts/demo_clean.sh
 For local cleanup only:
 
 MGC_DEMO_NO_SUDO=1 scripts/demo_clean.sh
+
+**Demo run (one command):**
+
+scripts/demo_run.sh
+
+Defaults to smoke + report. For a full check:
+
+MGC_DEMO_FULL=1 scripts/demo_run.sh
 **Local demo check (no sudo / no nginx):**
 
 MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh
