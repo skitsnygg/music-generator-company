@@ -4,7 +4,21 @@ set -euo pipefail
 echo "[demo_check] starting full demo verification"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FEED_PATH="${MGC_FEED_PATH:-/var/lib/mgc/releases/feed.json}"
+
+MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-0}"
+if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
+  export MGC_OUT_BASE="${MGC_OUT_BASE:-${REPO_ROOT}/data/local_demo_evidence}"
+  export MGC_DB="${MGC_DB:-${REPO_ROOT}/data/local_demo_db.sqlite}"
+  if [[ ! -f "${MGC_DB}" && -f "${REPO_ROOT}/data/db.sqlite" ]]; then
+    cp -f "${REPO_ROOT}/data/db.sqlite" "${MGC_DB}"
+  fi
+  export MGC_WEB_LATEST_ROOT="${MGC_WEB_LATEST_ROOT:-${REPO_ROOT}/data/releases/latest/web}"
+  export MGC_RELEASE_ROOT="${MGC_RELEASE_ROOT:-${REPO_ROOT}/data/releases}"
+  export MGC_RELEASE_FEED_OUT="${MGC_RELEASE_FEED_OUT:-${REPO_ROOT}/data/releases/feed.json}"
+  export MGC_SKIP_NGINX="${MGC_SKIP_NGINX:-1}"
+fi
+
+FEED_PATH="${MGC_FEED_PATH:-${MGC_RELEASE_FEED_OUT:-/var/lib/mgc/releases/feed.json}}"
 FEED_URL="${MGC_FEED_URL:-http://127.0.0.1/releases/feed.json}"
 SKIP_NGINX="${MGC_SKIP_NGINX:-0}"
 REQUIRE_NGINX="${MGC_REQUIRE_NGINX:-1}"
@@ -15,7 +29,11 @@ echo "[demo_check] repo: $REPO_ROOT"
 
 # 1) Run daily pipeline (this regenerates latest + feed)
 echo "[demo_check] running daily pipeline..."
-sudo -E scripts/run_daily.sh
+RUN_DAILY_CMD=(sudo -E scripts/run_daily.sh)
+if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
+  RUN_DAILY_CMD=(scripts/run_daily.sh)
+fi
+"${RUN_DAILY_CMD[@]}"
 
 # 2) Verify feed exists on disk
 echo "[demo_check] checking feed on disk..."
@@ -45,9 +63,10 @@ fi
 
 # 5) Verify contexts are filtered (no .bak, no run)
 echo "[demo_check] verifying context filtering..."
-python3 - <<'PY'
+FEED_PATH="${FEED_PATH}" python3 - <<'PY'
 import json
-p="/var/lib/mgc/releases/feed.json"
+import os
+p=os.environ["FEED_PATH"]
 o=json.load(open(p,"r",encoding="utf-8"))
 names=[c["context"] for c in o["latest"]["contexts"]]
 print("[demo_check] latest contexts:", names)
@@ -58,33 +77,36 @@ PY
 
 # 6) Determinism proof: regenerate feed and compare content hash
 echo "[demo_check] verifying content determinism..."
-python3 - <<'PY'
-import json, hashlib, subprocess, time
+content_hash() {
+  FEED_PATH="${FEED_PATH}" python3 - <<'PY'
+import hashlib
+import json
+import os
 from pathlib import Path
 
-p=Path("/var/lib/mgc/releases/feed.json")
-
-def content_hash(obj):
-    o=dict(obj)
-    o.pop("generated_at", None)
-    o.pop("content_sha256", None)
-    canon=json.dumps(o, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(canon).hexdigest()
-
-a=json.loads(p.read_text(encoding="utf-8"))
-h1=content_hash(a)
-
-# regenerate feed (per-context, matches prod usage)
-for c in ("focus","sleep","workout"):
-    subprocess.check_call(["sudo","-E","scripts/publish_release_feed.sh","--context",c])
-
-b=json.loads(p.read_text(encoding="utf-8"))
-h2=content_hash(b)
-
-print("[demo_check] content_sha256_1:", h1)
-print("[demo_check] content_sha256_2:", h2)
-assert h1 == h2, "content hash changed"
-print("[demo_check] determinism ok")
+p = Path(os.environ["FEED_PATH"])
+o = json.loads(p.read_text(encoding="utf-8"))
+o.pop("generated_at", None)
+o.pop("content_sha256", None)
+canon = json.dumps(o, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(canon).hexdigest())
 PY
+}
+
+h1="$(content_hash)"
+
+PUBLISH_FEED_CMD=(sudo -E scripts/publish_release_feed.sh)
+if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
+  PUBLISH_FEED_CMD=(scripts/publish_release_feed.sh)
+fi
+for c in focus sleep workout; do
+  "${PUBLISH_FEED_CMD[@]}" --context "${c}"
+done
+
+h2="$(content_hash)"
+echo "[demo_check] content_sha256_1: ${h1}"
+echo "[demo_check] content_sha256_2: ${h2}"
+[[ "${h1}" == "${h2}" ]] || { echo "[demo_check] content hash changed" >&2; exit 2; }
+echo "[demo_check] determinism ok"
 
 echo "[demo_check] ALL CHECKS PASSED"

@@ -20,8 +20,42 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if (( ${#args[@]} )); then
-  exec "${PY}" "${ROOT}/scripts/release_feed.py" "${args[@]}"
-else
-  exec "${PY}" "${ROOT}/scripts/release_feed.py"
+has_arg() {
+  local needle="$1"
+  local arg
+  if (( ${#args[@]} == 0 )); then
+    return 1
+  fi
+  for arg in "${args[@]}"; do
+    if [[ "${arg}" == "${needle}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+RELEASE_ROOT="${MGC_RELEASE_ROOT:-/var/lib/mgc/releases}"
+RELEASE_OUT="${MGC_RELEASE_FEED_OUT:-${RELEASE_ROOT}/feed.json}"
+RELEASE_BASE_URL="${MGC_RELEASE_BASE_URL:-}"
+RELEASE_MAX_ITEMS="${MGC_RELEASE_MAX_ITEMS:-}"
+
+if ! has_arg "--root-dir"; then
+  args+=(--root-dir "${RELEASE_ROOT}")
 fi
+if ! has_arg "--out"; then
+  args+=(--out "${RELEASE_OUT}")
+fi
+if [[ -n "${RELEASE_BASE_URL}" ]] && ! has_arg "--base-url"; then
+  args+=(--base-url "${RELEASE_BASE_URL}")
+fi
+if [[ -n "${RELEASE_MAX_ITEMS}" ]] && ! has_arg "--max-items"; then
+  args+=(--max-items "${RELEASE_MAX_ITEMS}")
+fi
+if [[ "${MGC_RELEASE_INCLUDE_BACKUPS:-0}" == "1" ]] && ! has_arg "--include-backups"; then
+  args+=(--include-backups)
+fi
+if [[ "${MGC_RELEASE_STABLE:-0}" == "1" ]] && ! has_arg "--stable"; then
+  args+=(--stable)
+fi
+
+exec "${PY}" "${ROOT}/scripts/release_feed.py" "${args[@]}"
