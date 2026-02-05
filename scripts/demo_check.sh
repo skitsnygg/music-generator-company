@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 MGC_DEMO_NO_SUDO="${MGC_DEMO_NO_SUDO:-0}"
 MGC_DEMO_CLEAN="${MGC_DEMO_CLEAN:-0}"
+MGC_DEMO_FAST="${MGC_DEMO_FAST:-0}"
 MGC_SETUP_NGINX="${MGC_SETUP_NGINX:-1}"
 MGC_PYTHON="${MGC_PYTHON:-}"
 if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
@@ -64,18 +65,47 @@ export PYTHON="${MGC_PYTHON}"
 
 echo "[demo_check] repo: $REPO_ROOT"
 
+OUT_BASE="${MGC_OUT_BASE:-data/evidence}"
+WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
+CONTEXTS=(${MGC_CONTEXTS:-focus workout sleep})
+
+FAST_READY="0"
+if [[ "${MGC_DEMO_FAST}" == "1" ]]; then
+  FAST_READY="1"
+  for ctx in "${CONTEXTS[@]}"; do
+    if [[ ! -s "${OUT_BASE}/${ctx}/drop_bundle/playlist.json" ]]; then
+      FAST_READY="0"
+      break
+    fi
+    if [[ "${PUBLISH_LATEST}" == "1" ]] && [[ ! -s "${WEB_ROOT}/${ctx}/web_manifest.json" ]]; then
+      FAST_READY="0"
+      break
+    fi
+  done
+  if [[ "${PUBLISH_FEED}" == "1" ]] && [[ ! -s "${FEED_PATH}" ]]; then
+    FAST_READY="0"
+  fi
+  if [[ "${FAST_READY}" == "1" ]]; then
+    echo "[demo_check] fast mode: reusing existing outputs"
+  else
+    echo "[demo_check] fast mode: outputs missing; running daily pipeline"
+  fi
+fi
+
 # 1) Run daily pipeline (this regenerates latest + feed)
-echo "[demo_check] running daily pipeline..."
 RUN_DAILY_CMD=(sudo -E scripts/run_daily.sh)
 if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
   RUN_DAILY_CMD=(scripts/run_daily.sh)
 fi
-"${RUN_DAILY_CMD[@]}"
+if [[ "${MGC_DEMO_FAST}" == "1" && "${FAST_READY}" == "1" ]]; then
+  echo "[demo_check] skipping daily pipeline (MGC_DEMO_FAST=1)"
+else
+  echo "[demo_check] running daily pipeline..."
+  "${RUN_DAILY_CMD[@]}"
+fi
 
 # 2) Verify playlist track files exist
 echo "[demo_check] verifying playlist track files..."
-OUT_BASE="${MGC_OUT_BASE:-data/evidence}"
-CONTEXTS=(${MGC_CONTEXTS:-focus workout sleep})
 for ctx in "${CONTEXTS[@]}"; do
   PLAYLIST="${OUT_BASE}/${ctx}/drop_bundle/playlist.json"
   test -s "$PLAYLIST"
@@ -85,7 +115,6 @@ done
 # 3) Verify latest web bundle exists + audio files
 if [[ "${PUBLISH_LATEST}" == "1" ]]; then
   echo "[demo_check] verifying latest web bundles..."
-  WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
   for ctx in "${CONTEXTS[@]}"; do
     WEB_DIR="${WEB_ROOT}/${ctx}"
     test -s "${WEB_DIR}/web_manifest.json"

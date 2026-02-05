@@ -274,6 +274,10 @@ Defaults to stub provider and skips marketing. For a local, no-sudo run with a c
 
 MGC_DEMO_NO_SUDO=1 MGC_DEMO_CLEAN=1 scripts/demo_smoke.sh
 
+Speed tip: reuse existing outputs when nothing changed:
+
+MGC_DEMO_FAST=1 scripts/demo_smoke.sh
+
 **Demo report (summary of feed + web bundle state):**
 
 scripts/demo_report.sh
