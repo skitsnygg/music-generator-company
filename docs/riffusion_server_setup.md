@@ -2,7 +2,7 @@
 
 This repo does not vend the riffusion server code. The local server lives in:
 
-- /Users/admin/riffusion-hobby
+- $HOME/riffusion-hobby
 
 The file `docs/riffusion_hobby_local.patch` captures local modifications made to get
 riffusion running reliably with MGC. This keeps the changes reproducible without
@@ -13,15 +13,15 @@ requiring a fork or push to the upstream repo.
 From the riffusion repo root:
 
 ```
-cd /Users/admin/riffusion-hobby
-patch -p1 < /Users/admin/music-generator-company/docs/riffusion_hobby_local.patch
+cd "$HOME/riffusion-hobby"
+patch -p1 < "$HOME/music-generator-company/docs/riffusion_hobby_local.patch"
 ```
 
 To revert:
 
 ```
-cd /Users/admin/riffusion-hobby
-patch -p1 -R < /Users/admin/music-generator-company/docs/riffusion_hobby_local.patch
+cd "$HOME/riffusion-hobby"
+patch -p1 -R < "$HOME/music-generator-company/docs/riffusion_hobby_local.patch"
 ```
 
 ## What the patch does (high level)
