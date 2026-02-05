@@ -1,4 +1,4 @@
-name: scheduled_drops_prod
+name: scheduled_drops_weekly
 
 on:
   workflow_dispatch:
