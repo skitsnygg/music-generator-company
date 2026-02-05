@@ -320,13 +320,7 @@ def _write_teaser_wav(src_wav: Path, dst_wav: Path, seconds: float) -> Dict[str,
     }
 
 
-def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> Dict[str, Any]:
-    # No text. Deterministic abstract cover.
-    try:
-        from PIL import Image, ImageDraw
-    except Exception as e:
-        raise RuntimeError(f"Pillow not available: {e}")
-
+def _cover_rng(seed_material: str):
     # Deterministic RNG from uuid5
     u = uuid.uuid5(uuid.NAMESPACE_URL, seed_material)
     seed_int = u.int & ((1 << 32) - 1)
@@ -336,6 +330,17 @@ def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> 
         seed_int = (1664525 * seed_int + 1013904223) & 0xFFFFFFFF
         return seed_int
 
+    return rnd
+
+
+def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> Dict[str, Any]:
+    # No text. Deterministic abstract cover.
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        raise RuntimeError(f"Pillow not available: {e}")
+
+    rnd = _cover_rng(seed_material)
     img = Image.new("RGB", (size_px, size_px), (rnd() % 256, rnd() % 256, rnd() % 256))
     d = ImageDraw.Draw(img)
 
@@ -354,7 +359,35 @@ def _write_cover_png(dst_png: Path, seed_material: str, size_px: int = 1024) -> 
     dst_png.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(dst_png), format="PNG", optimize=True)
 
-    return {"dst": str(dst_png), "size_px": size_px}
+    return {"dst": str(dst_png), "size_px": size_px, "format": "png"}
+
+
+def _write_cover_svg(dst_svg: Path, seed_material: str, size_px: int = 1024, note: str = "") -> Dict[str, Any]:
+    rnd = _cover_rng(seed_material)
+    bg = f"#{rnd() % 256:02x}{rnd() % 256:02x}{rnd() % 256:02x}"
+    rects: List[str] = []
+    for _ in range(36):
+        x = rnd() % size_px
+        y = rnd() % size_px
+        w = 20 + (rnd() % max(1, size_px // 2))
+        h = 20 + (rnd() % max(1, size_px // 2))
+        col = f"#{rnd() % 256:02x}{rnd() % 256:02x}{rnd() % 256:02x}"
+        op = 0.2 + (rnd() % 60) / 100.0
+        rects.append(
+            f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{col}" fill-opacity="{op:.2f}" />'
+        )
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size_px}" height="{size_px}" viewBox="0 0 {size_px} {size_px}">'
+        f'<rect width="{size_px}" height="{size_px}" fill="{bg}" />'
+        + "".join(rects)
+        + "</svg>"
+    )
+    _write_text(dst_svg, svg)
+
+    info: Dict[str, Any] = {"dst": str(dst_svg), "size_px": size_px, "format": "svg"}
+    if note:
+        info["note"] = note
+    return info
 
 
 def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
@@ -401,7 +434,8 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
         audio_path = _resolve_audio_path(repo_root, lead_track)
 
         teaser_path = out_dir / "teaser.wav"
-        cover_path = out_dir / "cover.png"
+        cover_path_png = out_dir / "cover.png"
+        cover_path_svg = out_dir / "cover.svg"
 
         teaser_info: Optional[Dict[str, Any]] = None
         if audio_path.suffix.lower() == ".wav" and audio_path.exists():
@@ -417,7 +451,13 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
             }
 
         # cover should be deterministic across different out_dir paths
-        cover_info = _write_cover_png(cover_path, seed_material=f"{lead_track_id}|{now_iso}|seed={seed}")
+        seed_material = f"{lead_track_id}|{now_iso}|seed={seed}"
+        try:
+            cover_info = _write_cover_png(cover_path_png, seed_material=seed_material)
+            cover_path = cover_path_png
+        except Exception as e:
+            cover_info = _write_cover_svg(cover_path_svg, seed_material=seed_material, note=str(e))
+            cover_path = cover_path_svg
         cover_info["dst"] = _rel_to_out(Path(cover_info["dst"]))
 
         # Copy variants (no emojis)
