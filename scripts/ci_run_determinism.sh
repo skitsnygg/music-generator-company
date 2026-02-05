@@ -16,6 +16,10 @@ PYTHON="${PYTHON:-python}"
 
 export MGC_DETERMINISTIC=1
 export MGC_FIXED_TIME="${MGC_FIXED_TIME:-2020-01-01T00:00:00Z}"
+# CI should not depend on external providers unless explicitly overridden.
+if [[ -z "${MGC_PROVIDER:-}" ]]; then
+  export MGC_PROVIDER="stub"
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -27,6 +31,7 @@ mkdir -p "$tmp"
 echo "[ci_run_determinism] repo_root=$repo_root"
 echo "[ci_run_determinism] MGC_DB=$MGC_DB"
 echo "[ci_run_determinism] MGC_FIXED_TIME=$MGC_FIXED_TIME"
+echo "[ci_run_determinism] MGC_PROVIDER=${MGC_PROVIDER}"
 
 OUT_DIR="$tmp/out"
 
