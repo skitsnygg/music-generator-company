@@ -103,14 +103,25 @@ if [[ "${PUBLISH_FEED}" == "1" ]]; then
   test -s "$FEED_PATH"
   "${MGC_PYTHON}" -m json.tool "$FEED_PATH" >/dev/null
   echo "[demo_smoke] feed json ok"
+  echo "[demo_smoke] verifying feed contexts..."
+  CONTEXTS_STR="${CONTEXTS[*]}"
+  FEED_PATH="${FEED_PATH}" CONTEXTS="${CONTEXTS_STR}" "${MGC_PYTHON}" - <<'PY'
+import json
+import os
+
+p = os.environ["FEED_PATH"]
+want = [c for c in os.environ.get("CONTEXTS", "").split() if c]
+o = json.load(open(p, "r", encoding="utf-8"))
+names = [c["context"] for c in o.get("latest", {}).get("contexts", []) if isinstance(c, dict)]
+print("[demo_smoke] latest contexts:", names)
+missing = [c for c in want if c not in names]
+if missing:
+    raise SystemExit(f"feed missing contexts: {missing}")
+print("[demo_smoke] feed contexts ok")
+PY
 else
   echo "[demo_smoke] skipping feed checks (MGC_PUBLISH_FEED=0)"
 fi
-
-WEB_ROOT="${MGC_WEB_LATEST_ROOT:-data/web/latest}"
-for ctx in ${MGC_CONTEXTS}; do
-  test -s "${WEB_ROOT}/${ctx}/web_manifest.json"
-done
 
 setup_nginx() {
   if [[ "${MGC_SETUP_NGINX}" != "1" ]]; then

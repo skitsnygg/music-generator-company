@@ -151,24 +151,30 @@ if [[ "${PUBLISH_FEED}" == "1" ]]; then
 fi
 
 if [[ "${PUBLISH_FEED}" == "1" ]]; then
-  # 6) Verify contexts are filtered (no .bak, no run)
-  echo "[demo_check] verifying context filtering..."
-  FEED_PATH="${FEED_PATH}" python3 - <<'PY'
+  # 6) Verify feed contexts and filtering (no .bak, no run)
+  echo "[demo_check] verifying feed contexts..."
+  CONTEXTS_STR="${CONTEXTS[*]}"
+  FEED_PATH="${FEED_PATH}" CONTEXTS="${CONTEXTS_STR}" "${MGC_PYTHON}" - <<'PY'
 import json
 import os
-p=os.environ["FEED_PATH"]
-o=json.load(open(p,"r",encoding="utf-8"))
-names=[c["context"] for c in o["latest"]["contexts"]]
+
+p = os.environ["FEED_PATH"]
+want = [c for c in os.environ.get("CONTEXTS", "").split() if c]
+o = json.load(open(p, "r", encoding="utf-8"))
+names = [c["context"] for c in o.get("latest", {}).get("contexts", []) if isinstance(c, dict)]
 print("[demo_check] latest contexts:", names)
+missing = [c for c in want if c not in names]
+if missing:
+    raise SystemExit(f"feed missing contexts: {missing}")
 assert all(".bak." not in n for n in names), "backup contexts present"
 assert "run" not in names, "run context present"
-print("[demo_check] context filtering ok")
+print("[demo_check] feed contexts ok")
 PY
 
   # 7) Determinism proof: regenerate feed and compare content hash
   echo "[demo_check] verifying content determinism..."
   content_hash() {
-    FEED_PATH="${FEED_PATH}" python3 - <<'PY'
+    FEED_PATH="${FEED_PATH}" "${MGC_PYTHON}" - <<'PY'
 import hashlib
 import json
 import os
@@ -189,7 +195,7 @@ PY
   if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
     PUBLISH_FEED_CMD=(scripts/publish_release_feed.sh)
   fi
-  for c in focus sleep workout; do
+  for c in "${CONTEXTS[@]}"; do
     "${PUBLISH_FEED_CMD[@]}" --context "${c}"
   done
 
