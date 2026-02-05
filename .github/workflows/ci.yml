@@ -283,6 +283,14 @@ jobs:
           set -euxo pipefail
           bash scripts/ci_run_determinism.sh
 
+      - name: Provider fallback smoke (riffusion -> stub)
+        shell: bash
+        env:
+          MGC_DB: ${{ env.MGC_DB }}
+        run: |
+          set -euxo pipefail
+          bash scripts/ci_provider_fallback_smoke.sh
+
       - name: Publish-marketing determinism (weekly; file mode; dry-run)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
