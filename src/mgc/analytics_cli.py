@@ -30,6 +30,7 @@ Wire into mgc.main:
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import json
 import sqlite3
@@ -51,18 +52,33 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return con
 
 
+def _is_missing_schema_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return ("no such table" in msg) or ("no such column" in msg)
+
+
 def _fetch_all(con: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
-    cur = con.execute(sql, params)
-    rows = cur.fetchall()
-    cur.close()
-    return rows
+    try:
+        cur = con.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    except sqlite3.OperationalError as e:
+        if _is_missing_schema_error(e):
+            return []
+        raise
 
 
 def _fetch_one(con: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
-    cur = con.execute(sql, params)
-    row = cur.fetchone()
-    cur.close()
-    return row
+    try:
+        cur = con.execute(sql, params)
+        row = cur.fetchone()
+        cur.close()
+        return row
+    except sqlite3.OperationalError as e:
+        if _is_missing_schema_error(e):
+            return None
+        raise
 
 
 # ----------------------------
@@ -991,18 +1007,13 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
     ap = subparsers.add_parser("analytics", help="Analytics and reporting")
     aps = ap.add_subparsers(dest="analytics_cmd", required=True)
 
-    def add_db_arg(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--db", default="data/db.sqlite", help="Path to SQLite DB")
-
     # overview
     ov = aps.add_parser("overview", help="High-level system metrics")
-    add_db_arg(ov)
     ov.add_argument("--top", type=int, default=10, help="Top-N for breakdown tables")
     ov.set_defaults(func=analytics_overview_cmd)
 
     # tracks
     tr = aps.add_parser("tracks", help="Track analytics (list or aggregates)")
-    add_db_arg(tr)
     tr.add_argument("--top", type=int, default=20, help="Row limit / Top-N")
     tr.add_argument("--mood", default=None)
     tr.add_argument("--genre", default=None)
@@ -1013,7 +1024,6 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # playlists
     pl = aps.add_parser("playlists", help="Playlist analytics")
-    add_db_arg(pl)
     pl.add_argument("--limit", type=int, default=20)
     pl.add_argument("--slug", default=None)
     pl.add_argument("--context", default=None)
@@ -1021,7 +1031,6 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # runs
     rn = aps.add_parser("runs", help="Playlist run analytics")
-    add_db_arg(rn)
     rn.add_argument("--limit", type=int, default=50)
     rn.add_argument("--slug", default=None, help="Filter by playlist slug")
     rn.add_argument("--playlist-id", default=None, help="Filter by playlist id")
@@ -1029,7 +1038,6 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # marketing
     mk = aps.add_parser("marketing", help="Marketing post analytics")
-    add_db_arg(mk)
     mk.add_argument("--limit", type=int, default=50)
     mk.add_argument("--platform", default=None)
     mk.add_argument("--status", default=None)
@@ -1037,7 +1045,6 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # stability (NEW)
     st = aps.add_parser("stability", help="Run-to-run stability by slug (Jaccard similarity)")
-    add_db_arg(st)
     st.add_argument("--per-slug-runs", type=int, default=10, help="How many most-recent runs per slug to include")
     st.add_argument("--verbose", action="store_true", help="Show per-pair comparisons")
     st.add_argument("--pairs-limit", type=int, default=50, help="Max pairs to show in verbose mode")
@@ -1045,7 +1052,6 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # reuse (NEW)
     ru = aps.add_parser("reuse", help="Track reuse across playlists or runs")
-    add_db_arg(ru)
     ru.add_argument("--source", choices=["playlists", "runs"], default="playlists",
                     help="Reuse source: playlist_items or playlist_runs")
     ru.add_argument("--top", type=int, default=50)
@@ -1053,13 +1059,11 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
     # duration (NEW)
     du = aps.add_parser("duration", help="Target vs produced duration accuracy")
-    add_db_arg(du)
     du.add_argument("--top", type=int, default=50, help="Top-N slugs by worst avg abs error")
     du.set_defaults(func=analytics_duration_cmd)
 
     # export
     ex = aps.add_parser("export", help="Export analytics datasets (json/csv)")
-    add_db_arg(ex)
     ex.add_argument(
         "dataset",
         choices=[
@@ -1099,6 +1103,7 @@ def register_analytics_subcommand(subparsers: argparse._SubParsersAction) -> Non
 
 def _standalone_main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="mgc-analytics")
+    parser.add_argument("--db", default=os.environ.get("MGC_DB", "data/db.sqlite"), help="Path to SQLite DB")
     sub = parser.add_subparsers(dest="cmd", required=True)
     register_analytics_subcommand(sub)
 

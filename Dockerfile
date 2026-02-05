@@ -13,7 +13,8 @@ RUN apt-get update \
 WORKDIR /app
 
 # Copy minimal project files
-COPY pyproject.toml readme.md ./README.md
+COPY pyproject.toml ./
+COPY readme.md ./README.md
 COPY src ./src
 COPY scripts ./scripts
 COPY fixtures ./fixtures

@@ -1,0 +1,4 @@
+-- Normalize legacy fixture schema to canonical columns/tables for:
+--   marketing_posts, playlist_runs, playlist_items
+--
+-- NOTE: Conditional logic is implemented in scripts/migrate_db.py for safety.
