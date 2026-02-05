@@ -19,6 +19,7 @@ import uuid
 import math
 import wave
 import struct
+from urllib.parse import urlparse
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -227,6 +228,48 @@ def _should_fallback_to_stub(provider_name: str, err: Exception) -> bool:
     if not _fallback_to_stub_enabled():
         return False
     return _is_riffusion_unreachable(err)
+
+
+def _riffusion_url_from_env() -> str:
+    url = (
+        os.environ.get("MGC_RIFFUSION_URL")
+        or os.environ.get("RIFFUSION_URL")
+        or "http://127.0.0.1:3013/run_inference/"
+    )
+    url = (url or "").strip()
+    return url or "http://127.0.0.1:3013/run_inference/"
+
+
+def _riffusion_reachable(url: str, timeout_s: float = 1.5) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
+def _preflight_riffusion(provider_name: str) -> str:
+    """Return provider_fallback_from if we should preflight-fallback to stub."""
+    if provider_name != "riffusion":
+        return ""
+    url = _riffusion_url_from_env()
+    try:
+        timeout_s = float(os.environ.get("MGC_RIFFUSION_PREFLIGHT_TIMEOUT") or "1.5")
+    except Exception:
+        timeout_s = 1.5
+    if _riffusion_reachable(url, timeout_s=timeout_s):
+        return ""
+    if _fallback_to_stub_enabled():
+        eprint(f"[provider] riffusion unreachable at {url}; preflight fallback to stub")
+        return "riffusion"
+    raise ProviderError(
+        f"riffusion not reachable at {url} (set MGC_FALLBACK_TO_STUB=1 to continue)"
+    )
 
 
 def deterministic_now_iso(deterministic: bool) -> str:
@@ -669,8 +712,10 @@ def _agents_generate_and_ingest(
 
     pname = (provider_name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
     provider_used = pname
+    provider_fallback_from = _preflight_riffusion(provider_used)
+    if provider_fallback_from:
+        provider_used = "stub"
     provider = get_provider(provider_used)
-    provider_fallback_from = ""
 
     tracks_dir = (repo_root / "tracks").resolve()
     tracks_dir.mkdir(parents=True, exist_ok=True)
@@ -2735,7 +2780,9 @@ def _stub_daily_run(
     if not provider_name:
         provider_name = "riffusion"
     provider_used = provider_name
-    provider_fallback_from = ""
+    provider_fallback_from = _preflight_riffusion(provider_used)
+    if provider_fallback_from:
+        provider_used = "stub"
     provider = get_provider(provider_used)
 
     req_obj = GenerateRequest(
