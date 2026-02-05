@@ -38,6 +38,13 @@ if [[ -z "${MGC_RELEASE_FEED_OUT:-}" ]]; then
   export MGC_RELEASE_FEED_OUT="${MGC_RELEASE_ROOT}/feed.json"
 fi
 
+if [[ "${EUID}" -eq 0 && "${MGC_DEMO_NO_SUDO}" != "1" ]]; then
+  if [[ -z "${MGC_OUT_BASE:-}" ]]; then
+    export MGC_OUT_BASE="/var/lib/mgc/evidence"
+  fi
+  export MGC_SKIP_OWNERSHIP_CHECK="${MGC_SKIP_OWNERSHIP_CHECK:-1}"
+fi
+
 FEED_PATH="${MGC_FEED_PATH:-${MGC_RELEASE_FEED_OUT:-/var/lib/mgc/releases/feed.json}}"
 FEED_URL="${MGC_FEED_URL:-http://127.0.0.1/releases/feed.json}"
 SKIP_NGINX="${MGC_SKIP_NGINX:-0}"
@@ -130,6 +137,8 @@ fi
 # 1) Run daily pipeline (this regenerates latest + feed)
 RUN_DAILY_CMD=(sudo -E scripts/run_daily.sh)
 if [[ "${MGC_DEMO_NO_SUDO}" == "1" ]]; then
+  RUN_DAILY_CMD=(scripts/run_daily.sh)
+elif [[ "${EUID}" -eq 0 ]]; then
   RUN_DAILY_CMD=(scripts/run_daily.sh)
 fi
 if [[ "${MGC_DEMO_FAST}" == "1" && "${FAST_READY}" == "1" ]]; then

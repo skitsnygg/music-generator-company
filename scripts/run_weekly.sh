@@ -64,12 +64,26 @@ log "Publish release feed: ${PUBLISH_FEED} (require=${REQUIRE_FEED})"
 
 _owner_fix_hint() {
   local base="$1"
-  local target_user="${SUDO_USER:-${USER}}"
+  local target_user=""
+  if [[ -n "${SUDO_UID:-}" ]]; then
+    target_user="$(id -nu "${SUDO_UID}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${target_user}" && -n "${SUDO_USER:-}" ]]; then
+    target_user="${SUDO_USER}"
+  fi
+  if [[ -z "${target_user}" ]]; then
+    target_user="${USER}"
+  fi
   if ! id "${target_user}" >/dev/null 2>&1; then
     target_user="${USER}"
   fi
-  local target_group
-  target_group="$(id -gn "${target_user}" 2>/dev/null || id -gn)"
+  local target_group=""
+  if [[ -n "${SUDO_GID:-}" ]]; then
+    target_group="$(id -ng "${SUDO_GID}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${target_group}" ]]; then
+    target_group="$(id -gn "${target_user}" 2>/dev/null || id -gn)"
+  fi
   printf 'sudo chown -R "%s:%s" "%s"' "${target_user}" "${target_group}" "${base}"
 }
 
