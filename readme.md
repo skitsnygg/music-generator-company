@@ -85,7 +85,7 @@ CI fails if a contract fails.
 ### Determinism
 
 Determinism is enforced across:
-- Audio generation (stub provider)
+- Audio generation (stub provider for deterministic CI; riffusion default for local inference)
 - JSON manifests
 - Web bundles
 - Submission archives
@@ -125,8 +125,8 @@ Publishing never rebuilds or mutates artifacts.
 - JSON-first outputs
 
 **Music Generation**
-- Stub provider (default, deterministic)
-- Optional Riffusion provider (local service)
+- Riffusion provider (default, local service)
+- Stub provider (deterministic, CI-friendly)
 - Suno (scaffolded) + DiffSinger provider (HTTP or local command wrapper)
 
 **Playlist Builder**
@@ -175,7 +175,7 @@ source .venv/bin/activate
 pip install -U pip  
 pip install -e .
 
-No API keys are required for the default stub provider.
+No API keys are required for the default riffusion provider, but it requires a local inference server.
 
 ### Docker (Optional)
 
@@ -270,7 +270,7 @@ sudo -E scripts/setup_nginx.sh
 
 scripts/demo_smoke.sh
 
-Defaults to stub provider and skips marketing. For a local, no-sudo run with a clean slate:
+Defaults to riffusion provider and skips marketing. For a local, no-sudo run with a clean slate:
 
 MGC_DEMO_NO_SUDO=1 MGC_DEMO_CLEAN=1 scripts/demo_smoke.sh
 
@@ -441,16 +441,16 @@ Everything is reviewable directly from GitHub.
 
 ## Providers
 
-**Stub Provider (Default)**  
-Fully deterministic, offline, CI-safe.
-
-export MGC_PROVIDER=stub
-
-**Optional: Riffusion**  
+**Riffusion Provider (Default)**  
 Requires a local inference server.
 
 export MGC_PROVIDER=riffusion  
 export MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference
+
+**Optional: Stub Provider (Deterministic/CI)**  
+Fully deterministic, offline, CI-safe.
+
+export MGC_PROVIDER=stub
 
 **Optional: DiffSinger**  
 Use a local command wrapper or an HTTP endpoint.

@@ -21,6 +21,16 @@ if [[ -z "${REL_ID}" ]]; then
   exit 2
 fi
 
+# Default to riffusion unless explicitly overridden.
+if [[ -z "${MGC_PROVIDER:-}" ]]; then
+  export MGC_PROVIDER="riffusion"
+fi
+
+# Deterministic runs default to 2020-01-01; pin the fixed time to REL_ID for sane dates.
+if [[ -z "${MGC_FIXED_TIME:-}" ]]; then
+  export MGC_FIXED_TIME="${REL_ID}T00:00:00Z"
+fi
+
 if [[ "$#" -gt 0 ]]; then
   CONTEXTS=("$@")
 else

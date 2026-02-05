@@ -121,6 +121,21 @@ def _utc_now_iso() -> str:
 
 
 def _deterministic_now_iso() -> str:
+    fixed = (os.environ.get("MGC_FIXED_TIME") or "").strip()
+    if fixed:
+        try:
+            if fixed.isdigit():
+                dt = datetime.fromtimestamp(int(fixed), tz=timezone.utc)
+                return dt.isoformat(timespec="seconds")
+        except Exception:
+            pass
+        try:
+            dt = datetime.fromisoformat(fixed.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except Exception:
+            pass
     return datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat(timespec="seconds")
 
 

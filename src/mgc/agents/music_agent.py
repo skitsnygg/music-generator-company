@@ -161,18 +161,18 @@ class TrackArtifact:
 
 @dataclass
 class MusicAgentConfig:
-    provider: str = "stub"
+    provider: str = "riffusion"
     strict_provider: bool = False
 
 
 class MusicAgent:
     def __init__(self, provider: Optional[str] = None, *, strict_provider: Optional[bool] = None):
-        p = (provider or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+        p = (provider or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
         strict = _env_bool("MGC_STRICT_PROVIDER", False) if strict_provider is None else bool(strict_provider)
         self.cfg = MusicAgentConfig(provider=p, strict_provider=strict)
 
     def _resolve_provider_name(self) -> str:
-        return (self.cfg.provider or "stub").strip().lower()
+        return (self.cfg.provider or "riffusion").strip().lower()
 
     def _resolve_provider(self):
         name = self._resolve_provider_name()

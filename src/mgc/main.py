@@ -354,7 +354,7 @@ _AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".ai
 
 
 def _provider_from_env() -> str:
-    return (os.environ.get("MGC_PROVIDER") or "stub").strip().lower() or "stub"
+    return (os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower() or "riffusion"
 
 
 def _scan_audio_files(root: Path) -> List[Path]:

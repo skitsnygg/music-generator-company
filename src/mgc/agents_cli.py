@@ -132,7 +132,7 @@ def _normalize_provider_result(res: Any) -> Tuple[bytes, str, str, Dict[str, Any
 def cmd_agents_music_generate(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
 
-    provider_name = str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    provider_name = str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
     provider = get_provider(provider_name)
 
     context = str(getattr(args, "context", "focus"))
@@ -606,7 +606,7 @@ def register_agents_subcommand(subparsers: argparse._SubParsersAction) -> None:
     gen.add_argument("--out-dir", default="artifacts/run/agents/music", help="Output directory")
     gen.add_argument("--now", default=None, help="Override timestamp ISO (supports Z)")
     gen.add_argument("--deterministic", action="store_true", help="Deterministic IDs + fail-fast")
-    gen.add_argument("--provider", default=None, help="Override provider name (default: MGC_PROVIDER or stub)")
+    gen.add_argument("--provider", default=None, help="Override provider name (default: MGC_PROVIDER or riffusion)")
     gen.set_defaults(func=cmd_agents_music_generate)
 
     # marketing

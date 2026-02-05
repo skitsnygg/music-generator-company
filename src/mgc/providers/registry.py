@@ -20,7 +20,7 @@ def list_providers() -> List[str]:
 
 
 def get_provider(name: str | None = None) -> Provider:
-    n = (name or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    n = (name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
 
     if n == "stub":
         from .stub import StubProvider

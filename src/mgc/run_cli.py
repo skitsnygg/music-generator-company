@@ -639,7 +639,7 @@ def _agents_generate_and_ingest(
     if count <= 0:
         return []
 
-    pname = (provider_name or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    pname = (provider_name or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
     provider = get_provider(pname)
 
     tracks_dir = (repo_root / "tracks").resolve()
@@ -1433,7 +1433,7 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
         return _stable_int_from_key(stable_key, 15, 180)
 
     if name == "provider":
-        return str(row_data.get("provider") or "stub")
+        return str(row_data.get("provider") or "riffusion")
     if name in ("kind", "event_kind", "type"):
         return str(row_data.get("kind") or "unknown")
     if name in ("actor", "source"):
@@ -2670,7 +2670,7 @@ def _stub_daily_run(
 
     prompt = build_prompt(context)
 
-    provider_name = str(os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    provider_name = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
     provider = get_provider(provider_name)
 
     req_obj = GenerateRequest(
@@ -3068,7 +3068,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
     playlist_provider = (os.environ.get("MGC_DAILY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
     if not playlist_provider:
-        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "").strip()
+        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip()
     if playlist_provider.lower() in ("", "any", "all", "*"):
         playlist_provider = ""
 
@@ -4733,7 +4733,7 @@ def cmd_run_generate(args: argparse.Namespace) -> int:
     else:
         run_id = str(uuid.uuid4())
 
-    provider_name = str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub").strip().lower()
+    provider_name = str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "riffusion").strip().lower()
 
     from mgc.agents.music_agent import MusicAgent
 
@@ -5045,7 +5045,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
 
     playlist_provider = (os.environ.get("MGC_WEEKLY_PLAYLIST_PROVIDER") or os.environ.get("MGC_PLAYLIST_PROVIDER") or "").strip()
     if not playlist_provider:
-        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "").strip()
+        playlist_provider = str(os.environ.get("MGC_PROVIDER") or "riffusion").strip()
     if playlist_provider.lower() in ("", "any", "all", "*"):
         playlist_provider = ""
 
@@ -5137,7 +5137,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         "context": context,
         "deterministic": bool(deterministic),
         "ts": now_iso,
-        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "stub"),
+        "provider": str(getattr(args, "provider", None) or os.environ.get("MGC_PROVIDER") or "riffusion"),
         "schedule": "weekly",
         "track": {"track_id": lead_track_id, "path": lead_path},
         "sha256": {
@@ -6997,7 +6997,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     daily.add_argument(
         "--generate-provider",
         default=os.environ.get("MGC_PROVIDER") or None,
-        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'stub')",
+        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'riffusion')",
     )
     daily.add_argument(
         "--prompt",
@@ -7133,7 +7133,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     weekly.add_argument(
         "--generate-provider",
         default=os.environ.get("MGC_PROVIDER") or None,
-        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'stub')",
+        help="Provider to use for generation when --generate-count > 0 (default: MGC_PROVIDER or 'riffusion')",
     )
     weekly.add_argument(
         "--prompt",
@@ -7165,7 +7165,7 @@ def register_run_subcommand(subparsers: argparse._SubParsersAction) -> None:
     gen = run_sub.add_parser("generate", help="Generate a new track into the library and register it in DB")
     gen.add_argument("--context", default="focus", help="Context/mood (focus/workout/sleep)")
     gen.add_argument("--seed", type=int, default=None, help="Seed for deterministic behavior")
-    gen.add_argument("--provider", default=None, help="Provider to use (default: MGC_PROVIDER or 'stub')")
+    gen.add_argument("--provider", default=None, help="Provider to use (default: MGC_PROVIDER or 'riffusion')")
     gen.add_argument("--track-id", dest="track_id", default=None, help="Optional explicit track_id")
     gen.add_argument("--repo-root", default=".", help="Repository root (for relative paths)")
     gen.add_argument("--store-dir", default=None, help="Override track storage dir (default: <repo_root>/data/tracks)")

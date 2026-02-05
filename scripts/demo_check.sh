@@ -73,7 +73,7 @@ export PYTHON="${MGC_PYTHON}"
 echo "[demo_check] repo: $REPO_ROOT"
 
 if [[ -z "${MGC_PROVIDER:-}" ]]; then
-  export MGC_PROVIDER="stub"
+  export MGC_PROVIDER="riffusion"
 fi
 
 DEMO_FALLBACK="${MGC_DEMO_FALLBACK_TO_STUB:-${MGC_FALLBACK_TO_STUB:-0}}"

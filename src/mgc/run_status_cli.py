@@ -275,7 +275,7 @@ def _infer_required_value(col: ColumnInfo, row_data: Dict[str, Any]) -> Any:
         return _stable_int_from_key(stable_key, 15, 180)
 
     if name == "provider":
-        return str(row_data.get("provider") or "stub")
+        return str(row_data.get("provider") or "riffusion")
     if name in ("kind", "event_kind", "type"):
         return str(row_data.get("kind") or "unknown")
     if name in ("actor", "source"):
