@@ -29,6 +29,21 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+PY="${MGC_PYTHON:-}"
+if [[ -z "${PY}" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    PY="${ROOT_DIR}/.venv/bin/python"
+  else
+    PY="$(command -v python3 || command -v python || true)"
+  fi
+fi
+if [[ -z "${PY}" ]]; then
+  echo "error: python not found (set MGC_PYTHON)" >&2
+  exit 2
+fi
+
+DB_PATH="${MGC_DB:-${ROOT_DIR}/data/db.sqlite}"
+
 echo "[release] repo_root=${ROOT_DIR}"
 echo "[release] rel_id=${REL_ID}"
 echo "[release] contexts=${CONTEXTS[*]}"
@@ -46,13 +61,20 @@ for ctx in "${CONTEXTS[@]}"; do
   echo "[release] run pipeline ctx=${ctx} out=${OUT}"
 
   rm -rf "${OUT}"
-  python -m mgc.main run pipeline \
+  "${PY}" -m mgc.main --db "${DB_PATH}" run pipeline \
     --schedule daily \
     --context "${ctx}" \
     --seed 1 \
     --out-dir "${OUT}" \
-    --deterministic \
-    --web
+    --deterministic
+
+  echo "[release] rebuild web bundle (marketing assets)"
+  "${PY}" -m mgc.main --db "${DB_PATH}" web build \
+    --playlist "${OUT}/playlist.json" \
+    --out-dir "${OUT}/web" \
+    --clean \
+    --fail-if-empty \
+    --deterministic
 
   # Sanity checks (fail fast)
   test -s "${OUT}/web/index.html"
@@ -76,7 +98,7 @@ done
 
 echo
 echo "[release] regenerate feed.json"
-python "${ROOT_DIR}/scripts/release_feed.py" \
+"${PY}" "${ROOT_DIR}/scripts/release_feed.py" \
   --root-dir "${ROOT_DIR}/docs/releases" \
   --out "${ROOT_DIR}/docs/releases/feed.json" \
   --stable
