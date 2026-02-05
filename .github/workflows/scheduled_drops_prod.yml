@@ -24,6 +24,7 @@ jobs:
       MGC_RIFFUSION_TIMEOUT: "${{ vars.MGC_RIFFUSION_TIMEOUT || '180' }}"
       MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
+      MGC_MIN_FREE_MB: "${{ vars.MGC_MIN_FREE_MB || '1024' }}"
 
       # Force all temp output off the repo checkout
       MGC_ARTIFACTS_DIR: "/tmp/mgc_prod_artifacts"
@@ -47,6 +48,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          . .venv/bin/activate
 
           if [ -z "${MGC_PROVIDER:-}" ]; then
             echo "WARN: MGC_PROVIDER is empty; defaulting to riffusion"
@@ -65,14 +67,56 @@ jobs:
           echo "MGC_RIFFUSION_TIMEOUT=${MGC_RIFFUSION_TIMEOUT:-}"
           echo "MGC_RIFFUSION_RETRIES=${MGC_RIFFUSION_RETRIES:-}"
           echo "MGC_RIFFUSION_RETRY_SLEEP=${MGC_RIFFUSION_RETRY_SLEEP:-}"
+          echo "MGC_MIN_FREE_MB=${MGC_MIN_FREE_MB:-}"
+
+          # Validate provider selection (fast, no network calls).
+          python -m mgc.main providers check
+
+          # Ensure required dirs exist and are writable.
+          mkdir -p "${MGC_PROD_RELEASES}" "${MGC_ARTIFACTS_DIR}" "${MGC_EVIDENCE_DIR}" "${MGC_TRACKS_DIR}"
+          test -w "${MGC_PROD_RELEASES}"
+          test -w "${MGC_ARTIFACTS_DIR}"
+          test -w "${MGC_EVIDENCE_DIR}"
+          test -w "${MGC_TRACKS_DIR}"
+
+          # Disk space guardrails.
+          need_mb="${MGC_MIN_FREE_MB:-1024}"
+          check_free_mb() {
+            local path="$1"
+            local avail_kb
+            avail_kb="$(df -Pk "$path" | awk 'NR==2 {print $4}')"
+            local avail_mb=$((avail_kb / 1024))
+            echo "free_mb(${path})=${avail_mb}"
+            if [ "$avail_mb" -lt "$need_mb" ]; then
+              echo "ERROR: low disk space on ${path}: ${avail_mb}MB < ${need_mb}MB"
+              exit 2
+            fi
+          }
+          check_free_mb "${MGC_PROD_RELEASES}"
+          check_free_mb "/tmp"
 
           # Prod must always use the system DB
           test -s /var/lib/mgc/db.sqlite
+          python -m mgc.main --db /var/lib/mgc/db.sqlite db status || exit 2
 
           if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
             if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
               echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
               exit 2
+            fi
+            if command -v curl >/dev/null 2>&1; then
+              base="${MGC_RIFFUSION_URL%/run_inference*}"
+              if [ -z "$base" ]; then
+                base="${MGC_RIFFUSION_URL}"
+              fi
+              code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 "$base" || true)"
+              if [ "$code" = "000" ]; then
+                echo "ERROR: riffusion not reachable at ${base}"
+                exit 2
+              fi
+              echo "riffusion_base_http_code=${code}"
+            else
+              echo "WARN: curl not found; skipping riffusion reachability check"
             fi
           fi
 
