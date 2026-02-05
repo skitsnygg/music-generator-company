@@ -487,7 +487,14 @@ def cmd_agents_marketing_plan(args: argparse.Namespace) -> int:
             }
 
         # cover should be deterministic across different out_dir paths
-        seed_material = f"{lead_track_id}|{now_iso}|seed={seed}"
+        seed_hint = lead_track_id or str(
+            lead_track.get("id")
+            or lead_track.get("path")
+            or lead_track.get("artifact_path")
+            or lead_track.get("title")
+            or playlist_path.name
+        )
+        seed_material = f"{seed_hint}|{now_iso}|seed={seed}"
         try:
             cover_info = _write_cover_png(cover_path_png, seed_material=seed_material)
             cover_path = cover_path_png

@@ -487,6 +487,54 @@ def _bundle_track_to_dir(out_dir: Path, track_id: str, src_pick: Path) -> tuple[
     return rel, dst
 
 
+def _coerce_int(val: Any) -> Optional[int]:
+    try:
+        if val is None:
+            return None
+        return int(float(val))
+    except Exception:
+        return None
+
+
+def _coerce_float(val: Any) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _playlist_track_entry(
+    item: Dict[str, Any],
+    *,
+    track_id: str,
+    relpath: str,
+    context: str,
+) -> Dict[str, Any]:
+    title = str(item.get("title") or item.get("name") or "").strip() or track_id
+    mood = str(item.get("mood") or item.get("context") or "").strip() or context
+    genre = str(item.get("genre") or "").strip() or (mood or "unknown")
+    bpm = _coerce_int(item.get("bpm"))
+    duration_sec = _coerce_float(item.get("duration_sec") or item.get("duration_s") or item.get("duration"))
+    created_at = str(item.get("created_at") or item.get("ts") or "").strip()
+
+    out: Dict[str, Any] = {
+        "track_id": track_id,
+        "path": relpath,
+        "title": title,
+        "mood": mood,
+        "genre": genre,
+    }
+    if bpm is not None:
+        out["bpm"] = bpm
+    if duration_sec is not None:
+        out["duration_sec"] = duration_sec
+    if created_at:
+        out["created_at"] = created_at
+    return out
+
+
 def _scrub_absolute_paths(obj: object, *, out_dir: Path, repo_root: Path) -> object:
     """Recursively scrub absolute filesystem paths from a JSON-serializable object."""
 
@@ -959,8 +1007,10 @@ def _agents_marketing_plan(
     wrote, reason = _marketing_teaser_wav(lead_audio=lead_audio, out_path=teaser_path, teaser_seconds=int(teaser_seconds))
 
     # cover
+    cover_seed_material = f"{lead_track_id}|{context}|{schedule}|{period_key}|seed={seed}|ts={ts}"
+    cover_seed = _stable_int_from_key(cover_seed_material, 1, 2_000_000_000)
     cover_path_png = out_dir / "cover.png"
-    png_bytes, png_err = _marketing_cover_bytes_png(int(seed), 1024)
+    png_bytes, png_err = _marketing_cover_bytes_png(int(cover_seed), 1024)
     cover_path: Path
     cover_obj: Dict[str, Any]
     if png_bytes is not None:
@@ -969,7 +1019,7 @@ def _agents_marketing_plan(
         cover_obj = {"dst": _relpath_from_out_dir(out_dir, str(cover_path)), "size_px": 1024}
     else:
         cover_path_svg = out_dir / "cover.svg"
-        cover_path_svg.write_text(_marketing_cover_svg(int(seed), 1024), encoding="utf-8")
+        cover_path_svg.write_text(_marketing_cover_svg(int(cover_seed), 1024), encoding="utf-8")
         cover_path = cover_path_svg
         cover_obj = {
             "dst": _relpath_from_out_dir(out_dir, str(cover_path)),
@@ -3037,7 +3087,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         raise SystemExit("daily playlist builder produced no items")
 
     # Copy available tracks into bundle (daily playlist can be multi-track)
-    copied: List[Dict[str, str]] = []
+    copied: List[Dict[str, Any]] = []
     missing: List[str] = []
     seen: set[str] = set()
 
@@ -3061,8 +3111,15 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
 
         # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
         src_pick = _pick_preferred_audio_source(src_pick)
-        _rel, dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
-        copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
+        rel, _dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
+        copied.append(
+            _playlist_track_entry(
+                it,
+                track_id=track_id,
+                relpath=rel.as_posix(),
+                context=context,
+            )
+        )
 
     if not copied:
         hint = ", ".join(missing[:5]) if missing else "<none>"
@@ -5028,8 +5085,15 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
         # Prefer MP3 if it exists, otherwise WAV (deterministic selection).
         src_pick = _pick_preferred_audio_source(src_pick)
 
-        _rel, dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
-        copied.append({"track_id": track_id, "path": f"tracks/{dst.name}"})
+        rel, _dst = _bundle_track_to_dir(bundle_dir, track_id, src_pick)
+        copied.append(
+            _playlist_track_entry(
+                it,
+                track_id=track_id,
+                relpath=rel.as_posix(),
+                context=context,
+            )
+        )
 
     if not copied:
         hint = ", ".join(missing[:5]) if missing else "<none>"

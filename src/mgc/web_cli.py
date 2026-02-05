@@ -2458,6 +2458,23 @@ def _load_marketing_plan_for_playlist(playlist_path: Path) -> Optional[Tuple[Dic
     return None
 
 
+def _copy_marketing_assets(plan_dir: Optional[Path], out_dir: Path) -> None:
+    if not plan_dir or not plan_dir.exists() or not plan_dir.is_dir():
+        return
+    dest = out_dir / "marketing"
+    try:
+        if plan_dir.resolve() == dest.resolve():
+            return
+    except Exception:
+        pass
+    try:
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(plan_dir, dest)
+    except Exception:
+        pass
+
+
 def _marketing_meta_from_plan(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(plan, dict):
         return None
@@ -2584,6 +2601,7 @@ def cmd_web_build(args: argparse.Namespace) -> int:
     marketing_meta = _marketing_meta_from_plan(marketing_plan) if marketing_plan else None
     if marketing_plan and marketing_plan_dir:
         marketing_preview = _marketing_preview_from_plan(marketing_plan, marketing_plan_dir)
+        _copy_marketing_assets(marketing_plan_dir, out_dir)
 
     prefer_mp3 = bool(getattr(args, "prefer_mp3", False))
     fail_if_empty = bool(getattr(args, "fail_if_empty", False))
