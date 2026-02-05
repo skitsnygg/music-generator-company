@@ -278,6 +278,10 @@ Speed tip: reuse existing outputs when nothing changed:
 
 MGC_DEMO_FAST=1 scripts/demo_smoke.sh
 
+If riffusion is selected but unreachable, allow auto-fallback to stub:
+
+MGC_PROVIDER=riffusion MGC_DEMO_FALLBACK_TO_STUB=1 scripts/demo_smoke.sh
+
 **Demo report (summary of feed + web bundle state):**
 
 scripts/demo_report.sh
@@ -297,6 +301,7 @@ scripts/demo_run.sh
 Defaults to smoke + report. For a full check:
 
 MGC_DEMO_FULL=1 scripts/demo_run.sh
+
 **Local demo check (no sudo / no nginx):**
 
 MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh

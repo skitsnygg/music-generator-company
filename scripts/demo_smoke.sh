@@ -68,6 +68,37 @@ if [[ -z "${MGC_PROVIDER:-}" ]]; then
   export MGC_PROVIDER="stub"
 fi
 
+DEMO_FALLBACK="${MGC_DEMO_FALLBACK_TO_STUB:-${MGC_FALLBACK_TO_STUB:-0}}"
+
+if [[ "${MGC_PROVIDER}" == "riffusion" ]]; then
+  if [[ -z "${MGC_RIFFUSION_URL:-}" ]]; then
+    export MGC_RIFFUSION_URL="http://127.0.0.1:3013/run_inference"
+    echo "[demo_smoke] WARN: MGC_RIFFUSION_URL not set; defaulting to ${MGC_RIFFUSION_URL}"
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    base="${MGC_RIFFUSION_URL%/run_inference*}"
+    if [[ -z "${base}" ]]; then
+      base="${MGC_RIFFUSION_URL}"
+    fi
+    code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 5 "${base}" || true)"
+    if [[ "${code}" == "000" ]]; then
+      if [[ "${DEMO_FALLBACK}" == "1" ]]; then
+        echo "[demo_smoke] WARN: riffusion not reachable at ${base}; falling back to stub"
+        export MGC_PROVIDER="stub"
+        export MGC_PROVIDER_FALLBACK_FROM="riffusion"
+      else
+        echo "[demo_smoke] ERROR: riffusion not reachable at ${base} (set MGC_DEMO_FALLBACK_TO_STUB=1 to continue)" >&2
+        exit 2
+      fi
+    else
+      echo "[demo_smoke] riffusion reachability: ${base} (http ${code})"
+    fi
+  else
+    echo "[demo_smoke] WARN: curl not found; skipping riffusion reachability check"
+  fi
+fi
+
 export MGC_CONTEXTS="${MGC_CONTEXTS:-focus}"
 export MGC_MARKETING="${MGC_MARKETING:-0}"
 export MGC_PUBLISH_MARKETING="${MGC_PUBLISH_MARKETING:-0}"
