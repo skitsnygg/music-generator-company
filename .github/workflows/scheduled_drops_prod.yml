@@ -100,8 +100,7 @@ jobs:
               --context "$CONTEXT" \
               --out-dir "$OUT" \
               --deterministic \
-              --with-web \
-              --submission
+              --with-web
 
           test -s "$OUT/drop_bundle/playlist.json"
           test -s "$OUT/web/web_manifest.json"
