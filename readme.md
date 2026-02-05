@@ -262,6 +262,12 @@ This command:
 - Ensures backup contexts are filtered
 - Proves deterministic content via stable hashing
 
+**Local demo check (no sudo / no nginx):**
+
+MGC_DEMO_NO_SUDO=1 MGC_SKIP_NGINX=1 scripts/demo_check.sh
+
+This writes outputs under `data/local_demo_evidence/` and `data/releases/` and validates the feed on disk.
+
 If either script exits successfully, the end-to-end flow is valid for that environment.
 
 ---
