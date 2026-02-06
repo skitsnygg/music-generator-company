@@ -221,6 +221,47 @@ def _probe_duration_seconds(path: Path) -> float:
         return 0.0
 
 
+def _find_mp3_frame_start(b: bytes) -> int | None:
+    if not b:
+        return None
+    for j in range(len(b) - 1):
+        if b[j] == 0xFF and (b[j + 1] & 0xE0) == 0xE0:
+            return j
+    return None
+
+
+def _concat_mp3_segments(segments: list[Path]) -> bytes:
+    out = bytearray()
+    for i, seg in enumerate(segments):
+        b = seg.read_bytes()
+        if i > 0:
+            start = _find_mp3_frame_start(b)
+            if start is not None and start > 0:
+                b = b[start:]
+        out.extend(b)
+    return bytes(out)
+
+
+def _concat_wav_segments(segments: list[Path], out_wav: Path) -> None:
+    import wave
+
+    params = None
+    with wave.open(str(out_wav), "wb") as wf_out:
+        for seg in segments:
+            with wave.open(str(seg), "rb") as wf_in:
+                if params is None:
+                    params = wf_in.getparams()
+                    wf_out.setparams(params)
+                else:
+                    if (
+                        wf_in.getnchannels() != params.nchannels
+                        or wf_in.getsampwidth() != params.sampwidth
+                        or wf_in.getframerate() != params.framerate
+                    ):
+                        raise ProviderError("riffusion wav segments have mismatched audio params")
+                wf_out.writeframes(wf_in.readframes(wf_in.getnframes()))
+
+
 def _stitch_segments_with_crossfade(
     segments: list[Path],
     out_mp3: Path,
@@ -353,20 +394,20 @@ class RiffusionAdapter:
         is_focus = ctx == "focus"
 
         if is_workout:
-            target_seconds_default = 180.0
-            segment_seconds_default = 12.0
-            crossfade_seconds_default = 1.0
-            max_segments_default = 48.0
-        elif is_focus:
-            target_seconds_default = 180.0
-            segment_seconds_default = 12.0
-            crossfade_seconds_default = 1.5
-            max_segments_default = 48.0
-        else:
-            target_seconds_default = 120.0
+            target_seconds_default = 60.0
             segment_seconds_default = 8.0
-            crossfade_seconds_default = 1.5
-            max_segments_default = 32.0
+            crossfade_seconds_default = 1.0
+            max_segments_default = 12.0
+        elif is_focus:
+            target_seconds_default = 60.0
+            segment_seconds_default = 8.0
+            crossfade_seconds_default = 1.0
+            max_segments_default = 12.0
+        else:
+            target_seconds_default = 45.0
+            segment_seconds_default = 8.0
+            crossfade_seconds_default = 1.0
+            max_segments_default = 10.0
 
         target_seconds = _env_float("MGC_RIFFUSION_TARGET_SECONDS", target_seconds_default)
         segment_seconds = _env_float("MGC_RIFFUSION_SEGMENT_SECONDS", segment_seconds_default)
@@ -431,14 +472,26 @@ class RiffusionAdapter:
         #   320: CBR 320kbps
         mp3_quality = (_env_str("MGC_MP3_QUALITY", "v0") or "v0").lower()
         mode, _, mp3_quality_norm = _parse_mp3_quality(mp3_quality)
+        ffmpeg_available = bool(_which("ffmpeg"))
+        encoder_available = ffmpeg_available or bool(_which("lame"))
         want_reencode = mode != "server"
+        if want_reencode and not encoder_available:
+            mp3_quality = "server"
+            mode, _, mp3_quality_norm = _parse_mp3_quality(mp3_quality)
+            want_reencode = False
+        if not ffmpeg_available:
+            crossfade_seconds = 0.0
+            if max_segments > 8:
+                max_segments = 8
 
-        mp3_bytes: bytes
+        audio_bytes: bytes
         preview_bytes: Optional[bytes] = None
         enc_meta: Dict[str, Any] = {}
         duration_sec = 0.0
         segment_count = 1
         xfade_used = 0.0
+        audio_ext = ".mp3"
+        audio_mime = "audio/mpeg"
 
         with tempfile.TemporaryDirectory(prefix="mgc_riffusion_") as td:
             td_path = Path(td)
@@ -478,7 +531,8 @@ class RiffusionAdapter:
                     timeout_s=timeout_s,
                 )
 
-                if _has_kw(prov.generate, "out_wav") and (want_reencode or longform):
+                want_wav = want_reencode or not encoder_available
+                if _has_kw(prov.generate, "out_wav") and want_wav:
                     call_kwargs["out_wav"] = seg_wav
 
                 try:
@@ -523,34 +577,95 @@ class RiffusionAdapter:
 
             segment_count = len(segments)
             if len(segments) > 1:
-                min_seg = min(seg_durations) if seg_durations else float(segment_seconds)
-                xfade = max(0.1, min(float(crossfade_seconds), max(0.1, min_seg * 0.5)))
-                xfade_used = float(xfade)
-                trim_target = float(target_seconds) if total_seconds >= target_seconds else 0.0
-                enc_meta = _stitch_segments_with_crossfade(
-                    segments,
-                    out_mp3,
-                    crossfade_s=xfade,
-                    target_s=trim_target,
-                    mp3_quality=mp3_quality,
-                )
-                if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
-                    raise ProviderError("riffusion crossfade output missing or empty.")
-                mp3_bytes = out_mp3.read_bytes()
-                duration_sec = _probe_duration_seconds(out_mp3) or (trim_target or total_seconds)
+                if ffmpeg_available and crossfade_seconds > 0:
+                    min_seg = min(seg_durations) if seg_durations else float(segment_seconds)
+                    xfade = max(0.1, min(float(crossfade_seconds), max(0.1, min_seg * 0.5)))
+                    xfade_used = float(xfade)
+                    trim_target = float(target_seconds) if total_seconds >= target_seconds else 0.0
+                    enc_meta = _stitch_segments_with_crossfade(
+                        segments,
+                        out_mp3,
+                        crossfade_s=xfade,
+                        target_s=trim_target,
+                        mp3_quality=mp3_quality,
+                    )
+                    if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
+                        raise ProviderError("riffusion crossfade output missing or empty.")
+                    audio_bytes = out_mp3.read_bytes()
+                    audio_ext = ".mp3"
+                    audio_mime = "audio/mpeg"
+                    duration_sec = _probe_duration_seconds(out_mp3) or (trim_target or total_seconds)
+                else:
+                    all_wav = all(p.suffix.lower() == ".wav" for p in segments)
+                    all_mp3 = all(p.suffix.lower() == ".mp3" for p in segments)
+                    if all_wav:
+                        out_wav = td_path / f"{req.track_id}_concat.wav"
+                        _concat_wav_segments(segments, out_wav)
+                        audio_bytes = out_wav.read_bytes()
+                        audio_ext = ".wav"
+                        audio_mime = "audio/wav"
+                        duration_sec = _probe_duration_seconds(out_wav) or total_seconds
+                        enc_meta = {
+                            "mp3_encoder": "wav_concat",
+                            "mp3_quality": "wav",
+                            "segment_count": int(len(segments)),
+                            "crossfade_seconds": 0.0,
+                            "mp3_note": "no_ffmpeg_no_crossfade",
+                        }
+                    elif all_mp3:
+                        audio_bytes = _concat_mp3_segments(segments)
+                        out_mp3.write_bytes(audio_bytes)
+                        audio_ext = ".mp3"
+                        audio_mime = "audio/mpeg"
+                        duration_sec = _probe_duration_seconds(out_mp3) or total_seconds
+                        enc_meta = {
+                            "mp3_encoder": "concat",
+                            "mp3_quality": "server",
+                            "segment_count": int(len(segments)),
+                            "crossfade_seconds": 0.0,
+                            "mp3_note": "no_ffmpeg_no_crossfade",
+                        }
+                    else:
+                        seg = segments[0]
+                        audio_bytes = seg.read_bytes()
+                        audio_ext = seg.suffix.lower() or ".mp3"
+                        audio_mime = "audio/wav" if audio_ext == ".wav" else "audio/mpeg"
+                        duration_sec = _probe_duration_seconds(seg)
+                        enc_meta = {
+                            "mp3_encoder": "single",
+                            "mp3_quality": "server",
+                            "segment_count": int(len(segments)),
+                            "crossfade_seconds": 0.0,
+                            "mp3_note": "mixed_segments_no_ffmpeg",
+                        }
             else:
                 seg = segments[0]
                 if seg.suffix.lower() == ".wav":
-                    try:
-                        enc_meta = _encode_mp3(seg, out_mp3, quality=mp3_quality)
-                    except Exception as e:
-                        raise ProviderError(f"riffusion mp3 re-encode failed: {e}") from e
-                    if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
-                        raise ProviderError("riffusion mp3 encode output missing or empty.")
-                    mp3_bytes = out_mp3.read_bytes()
-                    duration_sec = _probe_duration_seconds(out_mp3)
+                    if want_reencode:
+                        try:
+                            enc_meta = _encode_mp3(seg, out_mp3, quality=mp3_quality)
+                        except Exception as e:
+                            raise ProviderError(f"riffusion mp3 re-encode failed: {e}") from e
+                        if not out_mp3.exists() or out_mp3.stat().st_size <= 0:
+                            raise ProviderError("riffusion mp3 encode output missing or empty.")
+                        audio_bytes = out_mp3.read_bytes()
+                        audio_ext = ".mp3"
+                        audio_mime = "audio/mpeg"
+                        duration_sec = _probe_duration_seconds(out_mp3)
+                    else:
+                        audio_bytes = seg.read_bytes()
+                        audio_ext = ".wav"
+                        audio_mime = "audio/wav"
+                        duration_sec = _probe_duration_seconds(seg)
+                        enc_meta = {
+                            "mp3_encoder": "wav",
+                            "mp3_quality": "wav",
+                            "mp3_note": "no_encoder_available",
+                        }
                 else:
-                    mp3_bytes = seg.read_bytes()
+                    audio_bytes = seg.read_bytes()
+                    audio_ext = ".mp3"
+                    audio_mime = "audio/mpeg"
                     duration_sec = _probe_duration_seconds(seg)
                     if want_reencode:
                         enc_meta = {
@@ -577,10 +692,10 @@ class RiffusionAdapter:
             "context": str(req.context),
             "schedule": str(req.schedule),
             "period_key": str(req.period_key),
-            "ext": ".mp3",
-            "mime": "audio/mpeg",
-            "sha256": sha256_bytes(mp3_bytes),
-            "bytes": len(mp3_bytes),
+            "ext": audio_ext,
+            "mime": audio_mime,
+            "sha256": sha256_bytes(audio_bytes),
+            "bytes": len(audio_bytes),
             "mp3_quality": enc_meta.get("mp3_quality") or mp3_quality_norm,
             "duration_sec": float(duration_sec),
             "riffusion_target_seconds": float(target_seconds) if target_seconds > 0 else 0.0,
@@ -594,9 +709,9 @@ class RiffusionAdapter:
         out: Dict[str, Any] = {
             "provider": self.name,
             "track_id": str(req.track_id),
-            "artifact_bytes": mp3_bytes,
-            "ext": ".mp3",
-            "mime": "audio/mpeg",
+            "artifact_bytes": audio_bytes,
+            "ext": audio_ext,
+            "mime": audio_mime,
             "sha256": meta["sha256"],
             "title": meta["title"],
             "mood": meta["mood"],
