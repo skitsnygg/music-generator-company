@@ -365,7 +365,8 @@ jobs:
           fi
 
       - name: Upload artifacts
-        if: always()
+        if: always() && !cancelled()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: scheduled_drops_prod_${{ github.run_id }}_${{ github.run_attempt }}
