@@ -205,6 +205,15 @@ def _env_truthy(name: str) -> bool:
 def _fallback_to_stub_enabled() -> bool:
     return _env_truthy("MGC_FALLBACK_TO_STUB") or _env_truthy("MGC_DEMO_FALLBACK_TO_STUB")
 
+def _allow_stub_on_missing(deterministic: bool) -> bool:
+    if _env_truthy("MGC_ALLOW_STUB_ON_MISSING"):
+        return True
+    if _fallback_to_stub_enabled():
+        return True
+    if deterministic and (_env_truthy("CI") or _env_truthy("GITHUB_ACTIONS")):
+        return True
+    return False
+
 
 def _is_riffusion_unreachable(err: Exception) -> bool:
     msg = str(err).lower()
@@ -626,6 +635,77 @@ def _playlist_track_entry(
     if created_at:
         out["created_at"] = created_at
     return out
+
+
+def _stub_seconds_for_item(item: Dict[str, Any]) -> float:
+    max_s = _coerce_float(os.environ.get("MGC_STUB_MAX_SECONDS")) or 30.0
+    fallback_s = _coerce_float(os.environ.get("MGC_STUB_SECONDS")) or 10.0
+    if max_s <= 0:
+        max_s = 30.0
+    if fallback_s <= 0:
+        fallback_s = 10.0
+    dur = _coerce_float(item.get("duration_sec") or item.get("duration_s") or item.get("duration"))
+    if dur and dur > 0:
+        return float(min(dur, max_s))
+    return float(fallback_s)
+
+
+def _stub_bundle_tracks(
+    *,
+    items: List[Dict[str, Any]],
+    bundle_dir: Path,
+    context: str,
+    seed: int,
+    deterministic: bool,
+    schedule: str,
+    period_key: str,
+    now_iso: str,
+) -> List[Dict[str, Any]]:
+    provider = get_provider("stub")
+    copied: List[Dict[str, Any]] = []
+
+    for idx, it in enumerate(items):
+        track_id = str(it.get("track_id") or "").strip()
+        if not track_id:
+            track_id = stable_uuid5(f"stub:{schedule}:{period_key}:{context}:{seed}:i={idx}")
+
+        seconds = _stub_seconds_for_item(it)
+
+        res = provider.generate(
+            track_id=track_id,
+            context=context,
+            seed=int(seed),
+            deterministic=bool(deterministic),
+            schedule=schedule,
+            period_key=period_key,
+            ts=now_iso,
+            out_dir=str(bundle_dir),
+            out_rel=None,
+            run_id=None,
+            seconds=float(seconds),
+            sample_rate=44100,
+            channels=2,
+        )
+        audio_bytes, ext, _mime, _meta = _normalize_provider_result(res)
+        ext = ext or "wav"
+
+        rel = Path("tracks") / f"{track_id}.{ext}"
+        dst = (bundle_dir / rel).resolve()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(audio_bytes)
+
+        item_stub = dict(it)
+        item_stub["duration_sec"] = float(seconds)
+        copied.append(
+            _playlist_track_entry(
+                item_stub,
+                track_id=track_id,
+                relpath=rel.as_posix(),
+                context=context,
+            )
+        )
+
+    return copied
 
 
 def _scrub_absolute_paths(obj: object, *, out_dir: Path, repo_root: Path) -> object:
@@ -3307,6 +3387,23 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         )
 
     if not copied:
+        if _allow_stub_on_missing(deterministic):
+            eprint(
+                f"[run.daily] WARN: no usable track files found; stubbing {len(items)} track(s) "
+                f"for context={context}"
+            )
+            copied = _stub_bundle_tracks(
+                items=items,
+                bundle_dir=bundle_dir,
+                context=context,
+                seed=int(seed),
+                deterministic=bool(deterministic),
+                schedule="daily",
+                period_key=period_key,
+                now_iso=now_iso,
+            )
+
+    if not copied:
         hint = ", ".join(missing[:5]) if missing else "<none>"
         raise SystemExit(f"[run.daily] no usable track files found for context={context}; missing={hint}")
 
@@ -5296,6 +5393,23 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
                 context=context,
             )
         )
+
+    if not copied:
+        if _allow_stub_on_missing(deterministic):
+            eprint(
+                f"[run.weekly] WARN: no usable track files found; stubbing {len(items)} track(s) "
+                f"for context={context}"
+            )
+            copied = _stub_bundle_tracks(
+                items=items,
+                bundle_dir=bundle_dir,
+                context=context,
+                seed=int(seed),
+                deterministic=bool(deterministic),
+                schedule="weekly",
+                period_key=period_key,
+                now_iso=now_iso,
+            )
 
     if not copied:
         hint = ", ".join(missing[:5]) if missing else "<none>"
