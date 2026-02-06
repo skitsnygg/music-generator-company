@@ -18,10 +18,14 @@ class ContextSpec:
 _CONTEXTS: Dict[str, ContextSpec] = {
     "focus": ContextSpec(
         name="focus",
-        prompt="Ambient, minimal, steady, non-distracting. Soft textures, gentle motion. No vocals.",
-        tags=["ambient", "minimal", "calm", "study", "focus"],
-        bpm_min=60,
-        bpm_max=90,
+        prompt=(
+            "Mid-tempo, moody indie electro with a steady 4/4 groove, clean bassline, "
+            "melodic synth hook, and clear song sections (intro/build/drop/breakdown/outro). "
+            "Avoid glitch, stutter edits, or harsh artifacts. No vocals."
+        ),
+        tags=["indie", "electro", "synth", "moody", "driving", "focus"],
+        bpm_min=118,
+        bpm_max=128,
         mood="focus",
         genre="ambient",
     ),

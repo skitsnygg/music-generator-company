@@ -63,7 +63,7 @@ class DailyResult:
 
 
 PLAYLIST_PRESETS = {
-    "focus": {"mood": "focus", "bpm_window": (80, 125), "name": "Focus Radio"},
+    "focus": {"mood": "focus", "bpm_window": (118, 128), "name": "Focus Radio"},
     "workout": {"mood": "workout", "bpm_window": (126, 135), "name": "Workout Radio"},
     "sleep": {"mood": "sleep", "bpm_window": (50, 90), "name": "Sleep Radio"},
 }

@@ -350,11 +350,23 @@ class RiffusionAdapter:
 
         ctx = str(req.context or "").strip().lower()
         is_workout = ctx == "workout"
+        is_focus = ctx == "focus"
 
-        target_seconds_default = 180.0 if is_workout else 120.0
-        segment_seconds_default = 12.0 if is_workout else 8.0
-        crossfade_seconds_default = 1.0 if is_workout else 1.5
-        max_segments_default = 48.0 if is_workout else 32.0
+        if is_workout:
+            target_seconds_default = 180.0
+            segment_seconds_default = 12.0
+            crossfade_seconds_default = 1.0
+            max_segments_default = 48.0
+        elif is_focus:
+            target_seconds_default = 180.0
+            segment_seconds_default = 12.0
+            crossfade_seconds_default = 1.5
+            max_segments_default = 48.0
+        else:
+            target_seconds_default = 120.0
+            segment_seconds_default = 8.0
+            crossfade_seconds_default = 1.5
+            max_segments_default = 32.0
 
         target_seconds = _env_float("MGC_RIFFUSION_TARGET_SECONDS", target_seconds_default)
         segment_seconds = _env_float("MGC_RIFFUSION_SEGMENT_SECONDS", segment_seconds_default)
@@ -389,6 +401,8 @@ class RiffusionAdapter:
             num_steps = int(steps_env)
         elif is_workout:
             num_steps = 60
+        elif is_focus:
+            num_steps = 55
         else:
             num_steps = None
 
@@ -396,6 +410,8 @@ class RiffusionAdapter:
             guidance = float(guidance_env)
         elif is_workout:
             guidance = 5.5
+        elif is_focus:
+            guidance = 5.0
         else:
             guidance = None
 
@@ -403,6 +419,8 @@ class RiffusionAdapter:
             denoise = float(denoise_env)
         elif is_workout:
             denoise = 0.45
+        elif is_focus:
+            denoise = 0.4
         else:
             denoise = None
         timeout_s = int(timeout_env) if timeout_env else None
