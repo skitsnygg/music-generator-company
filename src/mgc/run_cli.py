@@ -206,11 +206,15 @@ def _fallback_to_stub_enabled() -> bool:
     return _env_truthy("MGC_FALLBACK_TO_STUB") or _env_truthy("MGC_DEMO_FALLBACK_TO_STUB")
 
 def _allow_stub_on_missing(deterministic: bool) -> bool:
+    if _env_truthy("MGC_DISALLOW_STUB_ON_MISSING"):
+        return False
     if _env_truthy("MGC_ALLOW_STUB_ON_MISSING"):
         return True
     if _fallback_to_stub_enabled():
         return True
-    if deterministic and (_env_truthy("CI") or _env_truthy("GITHUB_ACTIONS")):
+    if deterministic:
+        return True
+    if _env_truthy("CI") or _env_truthy("GITHUB_ACTIONS"):
         return True
     return False
 
@@ -434,10 +438,40 @@ def _pick_preferred_audio_source(p: Path) -> Path:
     return p
 
 
-def _resolve_track_source(full_path: str, repo_root: Path) -> Path:
+def _resolve_track_source(full_path: str, repo_root: Path, track_id: str = "") -> Path:
     p = Path(str(full_path))
     if not p.is_absolute():
         p = (repo_root / p).resolve()
+    if p.exists():
+        return _pick_preferred_audio_source(p)
+
+    # Remap absolute paths from other checkouts if they include data/tracks.
+    try:
+        parts = p.parts
+        for i in range(len(parts) - 1):
+            if parts[i] == "data" and parts[i + 1] == "tracks":
+                suffix = Path(*parts[i + 2 :])
+                cand = (repo_root / "data" / "tracks" / suffix).resolve()
+                if cand.exists():
+                    return _pick_preferred_audio_source(cand)
+                break
+    except Exception:
+        pass
+
+    # Fall back to searching the local tracks library by track_id.
+    if track_id:
+        tracks_root = (repo_root / "data" / "tracks").resolve()
+        if tracks_root.exists():
+            exts = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac")
+            for ext in exts:
+                cand = tracks_root / f"{track_id}{ext}"
+                if cand.exists():
+                    return _pick_preferred_audio_source(cand)
+            for ext in exts:
+                found = next(tracks_root.rglob(f"{track_id}{ext}"), None)
+                if found:
+                    return _pick_preferred_audio_source(found)
+
     return _pick_preferred_audio_source(p)
 
 
@@ -3369,7 +3403,7 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
             missing.append(f"{track_id}:<missing_path>")
             continue
 
-        src_pick = _resolve_track_source(full_path, repo_root)
+        src_pick = _resolve_track_source(full_path, repo_root, track_id)
         if not src_pick.exists():
             missing.append(f"{track_id}:{src_pick}")
             continue
@@ -5376,7 +5410,7 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
             missing.append(f"{track_id}:<missing_path>")
             continue
 
-        src_pick = _resolve_track_source(full_path, repo_root)
+        src_pick = _resolve_track_source(full_path, repo_root, track_id)
         if not src_pick.exists():
             missing.append(f"{track_id}:{src_pick}")
             continue
@@ -5558,8 +5592,11 @@ def cmd_run_weekly(args: argparse.Namespace) -> int:
     playlist_path = bundle_playlist_path if bundle_playlist_path.exists() else fallback_playlist_path
 
     # Optional: build a web bundle (static player) under out_dir/web
+    want_web = bool(getattr(args, "web", False))
+    if not want_web and bool(getattr(args, "submission", False)):
+        want_web = True
     web_manifest_rel: Optional[str] = None
-    if bool(getattr(args, "web", False)):
+    if want_web:
         web_out = (out_dir / "web").resolve()
         web_cmd = [
             sys.executable,
