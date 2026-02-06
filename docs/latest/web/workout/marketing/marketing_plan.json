@@ -1,0 +1,50 @@
+{
+  "cmd": "agents.marketing.plan",
+  "cover": {
+    "dst": "cover.png",
+    "size_px": 1024
+  },
+  "drop_dir": "../drop_bundle",
+  "hashtags": [
+    "mgc",
+    "newmusic",
+    "music",
+    "workout",
+    "workoutmusic",
+    "daily"
+  ],
+  "hashtags_text": "#mgc #newmusic #music #workout #workoutmusic #daily",
+  "lead_track_id": "cf31b3df-9bd9-40ea-9b2c-5e1abd551819",
+  "media": {
+    "note": null,
+    "video_path": null,
+    "video_url": null
+  },
+  "ok": true,
+  "paths": {
+    "cover": "cover.png",
+    "hashtags": "hashtags.txt",
+    "lead_audio": "../drop_bundle/tracks/cf31b3df-9bd9-40ea-9b2c-5e1abd551819.wav",
+    "media": null,
+    "out_dir": ".",
+    "plan": "marketing_plan.json",
+    "playlist": "../drop_bundle/playlist.json",
+    "posts": [
+      "post_1.txt",
+      "post_2.txt",
+      "post_3.txt"
+    ],
+    "receipts": "receipts.jsonl",
+    "summary": "summary.txt",
+    "teaser": "teaser.wav"
+  },
+  "seed": 1,
+  "summary": "New workout daily drop (2026-02-05).",
+  "teaser": {
+    "lead_audio": "../drop_bundle/tracks/cf31b3df-9bd9-40ea-9b2c-5e1abd551819.wav",
+    "reason": "lead track is not a .wav or does not exist",
+    "seconds": 15,
+    "skipped": true
+  },
+  "ts": "2026-02-05T00:00:00+00:00"
+}
