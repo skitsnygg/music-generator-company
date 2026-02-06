@@ -348,10 +348,18 @@ class RiffusionAdapter:
 
         prompt = req.prompt or spec.prompt
 
-        target_seconds = _env_float("MGC_RIFFUSION_TARGET_SECONDS", 120.0)
-        segment_seconds = _env_float("MGC_RIFFUSION_SEGMENT_SECONDS", 8.0)
-        crossfade_seconds = _env_float("MGC_RIFFUSION_CROSSFADE_SECONDS", 1.5)
-        max_segments = int(_env_float("MGC_RIFFUSION_MAX_SEGMENTS", 32.0))
+        ctx = str(req.context or "").strip().lower()
+        is_workout = ctx == "workout"
+
+        target_seconds_default = 180.0 if is_workout else 120.0
+        segment_seconds_default = 12.0 if is_workout else 8.0
+        crossfade_seconds_default = 1.0 if is_workout else 1.5
+        max_segments_default = 48.0 if is_workout else 32.0
+
+        target_seconds = _env_float("MGC_RIFFUSION_TARGET_SECONDS", target_seconds_default)
+        segment_seconds = _env_float("MGC_RIFFUSION_SEGMENT_SECONDS", segment_seconds_default)
+        crossfade_seconds = _env_float("MGC_RIFFUSION_CROSSFADE_SECONDS", crossfade_seconds_default)
+        max_segments = int(_env_float("MGC_RIFFUSION_MAX_SEGMENTS", max_segments_default))
         if max_segments <= 0:
             max_segments = 1
 
@@ -377,9 +385,26 @@ class RiffusionAdapter:
         denoise_env = _env_str("RIFFUSION_DENOISE") or _env_str("MGC_RIFFUSION_DENOISE")
         timeout_env = _env_str("RIFFUSION_TIMEOUT") or _env_str("MGC_RIFFUSION_TIMEOUT")
 
-        num_steps = int(steps_env) if steps_env else None
-        guidance = float(guidance_env) if guidance_env else None
-        denoise = float(denoise_env) if denoise_env else None
+        if steps_env:
+            num_steps = int(steps_env)
+        elif is_workout:
+            num_steps = 60
+        else:
+            num_steps = None
+
+        if guidance_env:
+            guidance = float(guidance_env)
+        elif is_workout:
+            guidance = 5.5
+        else:
+            guidance = None
+
+        if denoise_env:
+            denoise = float(denoise_env)
+        elif is_workout:
+            denoise = 0.45
+        else:
+            denoise = None
         timeout_s = int(timeout_env) if timeout_env else None
 
         # MP3 quality selection:

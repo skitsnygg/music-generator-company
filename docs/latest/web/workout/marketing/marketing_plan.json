@@ -14,7 +14,7 @@
     "daily"
   ],
   "hashtags_text": "#mgc #newmusic #music #workout #workoutmusic #daily",
-  "lead_track_id": "763540bf-cccf-4318-b220-dcaec8ffd03a",
+  "lead_track_id": "8b305f81-44fb-40d8-880d-d6bc597850fa",
   "media": {
     "note": null,
     "video_path": null,
@@ -24,7 +24,7 @@
   "paths": {
     "cover": "cover.png",
     "hashtags": "hashtags.txt",
-    "lead_audio": "../drop_bundle/tracks/763540bf-cccf-4318-b220-dcaec8ffd03a.wav",
+    "lead_audio": "../drop_bundle/tracks/8b305f81-44fb-40d8-880d-d6bc597850fa.wav",
     "media": null,
     "out_dir": ".",
     "plan": "marketing_plan.json",
@@ -41,10 +41,10 @@
   "seed": 1,
   "summary": "New workout daily drop (2026-02-06).",
   "teaser": {
-    "lead_audio": "../drop_bundle/tracks/763540bf-cccf-4318-b220-dcaec8ffd03a.wav",
+    "lead_audio": "../drop_bundle/tracks/8b305f81-44fb-40d8-880d-d6bc597850fa.wav",
     "reason": "lead track is not a .wav or does not exist",
     "seconds": 15,
     "skipped": true
   },
-  "ts": "2026-02-06T03:07:55.232512+00:00"
+  "ts": "2026-02-06T10:24:40.517122+00:00"
 }

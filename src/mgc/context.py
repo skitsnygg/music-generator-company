@@ -27,10 +27,14 @@ _CONTEXTS: Dict[str, ContextSpec] = {
     ),
     "workout": ContextSpec(
         name="workout",
-        prompt="Energetic, driving rhythm, uplifting, punchy drums, motivating. No vocals.",
-        tags=["energetic", "driving", "uplifting", "workout", "electronic"],
-        bpm_min=120,
-        bpm_max=150,
+        prompt=(
+            "Dark, driving, song-like workout track. Steady 4/4 kick and bassline, melodic hook, "
+            "clear sections (intro/build/drop/breakdown/outro). Avoid glitch, stutter, random chops, "
+            "harsh artifacts. No vocals."
+        ),
+        tags=["dark", "driving", "melodic", "techno", "electro", "workout"],
+        bpm_min=126,
+        bpm_max=135,
         mood="workout",
         genre="electronic",
     ),

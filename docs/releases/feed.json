@@ -1,5 +1,5 @@
 {
-  "content_sha256": "6b2a782c3f5964f59a75009366dbdc7519a69e6604175af5f94bb4b98a3e1e07",
+  "content_sha256": "4d2a3e0c617900ec5d2032bc61cebddd4950ea55126f2d24281368299ffaa13c",
   "latest": {
     "contexts": [
       {
@@ -19,8 +19,8 @@
       {
         "context": "workout",
         "kind": "web",
-        "mtime": "2026-02-06T03:37:17Z",
-        "track_count": 3,
+        "mtime": "2026-02-06T10:49:12Z",
+        "track_count": 5,
         "url": "/latest/web/workout/"
       }
     ]
