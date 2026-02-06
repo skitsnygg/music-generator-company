@@ -2665,6 +2665,8 @@ def cmd_web_build(args: argparse.Namespace) -> int:
 
     db_map: Dict[str, Dict[str, str]] = {}
     db_raw = str(getattr(args, "db", "") or "").strip()
+    if not db_raw:
+        db_raw = str(os.environ.get("MGC_DB") or "").strip()
     if bundle_audio and db_raw:
         db_path = _resolve_input_path(db_raw, playlist_dir=playlist_dir, repo_root=repo_root)
         if db_path.exists():

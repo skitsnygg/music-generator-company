@@ -14,7 +14,7 @@
     "daily"
   ],
   "hashtags_text": "#mgc #newmusic #music #sleep #sleepmusic #daily",
-  "lead_track_id": "19e4a5cd-6580-4663-9efe-dbb8d614822f",
+  "lead_track_id": "4f1b61cb-fa46-4a5e-afc7-fd8519e764d8",
   "media": {
     "note": null,
     "video_path": null,
@@ -24,7 +24,7 @@
   "paths": {
     "cover": "cover.png",
     "hashtags": "hashtags.txt",
-    "lead_audio": "../drop_bundle/tracks/19e4a5cd-6580-4663-9efe-dbb8d614822f.wav",
+    "lead_audio": "../drop_bundle/tracks/4f1b61cb-fa46-4a5e-afc7-fd8519e764d8.wav",
     "media": null,
     "out_dir": ".",
     "plan": "marketing_plan.json",
@@ -39,12 +39,12 @@
     "teaser": "teaser.wav"
   },
   "seed": 1,
-  "summary": "New sleep daily drop (2026-02-05).",
+  "summary": "New sleep daily drop (2026-02-06).",
   "teaser": {
-    "lead_audio": "../drop_bundle/tracks/19e4a5cd-6580-4663-9efe-dbb8d614822f.wav",
+    "lead_audio": "../drop_bundle/tracks/4f1b61cb-fa46-4a5e-afc7-fd8519e764d8.wav",
     "reason": "lead track is not a .wav or does not exist",
     "seconds": 15,
     "skipped": true
   },
-  "ts": "2026-02-05T00:00:00+00:00"
+  "ts": "2026-02-06T03:17:46.896248+00:00"
 }

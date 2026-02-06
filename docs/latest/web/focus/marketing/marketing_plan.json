@@ -14,7 +14,7 @@
     "daily"
   ],
   "hashtags_text": "#mgc #newmusic #music #focus #focusmusic #daily",
-  "lead_track_id": "21341b86-0411-48f6-b445-896c0302447b",
+  "lead_track_id": "1fb849e2-33ce-4cd5-82fc-bcb1d646101d",
   "media": {
     "note": null,
     "video_path": null,
@@ -24,7 +24,7 @@
   "paths": {
     "cover": "cover.png",
     "hashtags": "hashtags.txt",
-    "lead_audio": "../drop_bundle/tracks/21341b86-0411-48f6-b445-896c0302447b.wav",
+    "lead_audio": "../drop_bundle/tracks/1fb849e2-33ce-4cd5-82fc-bcb1d646101d.wav",
     "media": null,
     "out_dir": ".",
     "plan": "marketing_plan.json",
@@ -39,12 +39,12 @@
     "teaser": "teaser.wav"
   },
   "seed": 1,
-  "summary": "New focus daily drop (2026-02-05).",
+  "summary": "New focus daily drop (2026-02-06).",
   "teaser": {
-    "lead_audio": "../drop_bundle/tracks/21341b86-0411-48f6-b445-896c0302447b.wav",
+    "lead_audio": "../drop_bundle/tracks/1fb849e2-33ce-4cd5-82fc-bcb1d646101d.wav",
     "reason": "lead track is not a .wav or does not exist",
     "seconds": 15,
     "skipped": true
   },
-  "ts": "2026-02-05T00:00:00+00:00"
+  "ts": "2026-02-06T02:44:51.886142+00:00"
 }
