@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
 import wave
 from dataclasses import dataclass
@@ -98,7 +99,10 @@ class StubProvider:
             schedule = req.schedule or str(kwargs.get("schedule") or "")
             period_key = req.period_key or str(kwargs.get("period_key") or "")
 
-            seconds = float(kwargs.get("seconds", 2.0))
+            seconds_raw = kwargs.get("seconds", None)
+            if seconds_raw is None:
+                seconds_raw = os.environ.get("MGC_STUB_SECONDS") or 2.0
+            seconds = float(seconds_raw)
             sample_rate = int(kwargs.get("sample_rate", 44100))
             channels = int(kwargs.get("channels", 1))
             amplitude = float(kwargs.get("amplitude", 0.20))

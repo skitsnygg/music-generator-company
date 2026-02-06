@@ -5,6 +5,20 @@ echo "[demo_run] starting"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Demo defaults: short clips + stub fallback when riffusion is unreachable.
+: "${MGC_DEMO_FALLBACK_TO_STUB:=1}"
+: "${MGC_RIFFUSION_TARGET_SECONDS:=5}"
+: "${MGC_RIFFUSION_SEGMENT_SECONDS:=5}"
+: "${MGC_RIFFUSION_MAX_SEGMENTS:=1}"
+: "${MGC_RIFFUSION_CROSSFADE_SECONDS:=0}"
+: "${MGC_STUB_SECONDS:=5}"
+export MGC_DEMO_FALLBACK_TO_STUB
+export MGC_RIFFUSION_TARGET_SECONDS
+export MGC_RIFFUSION_SEGMENT_SECONDS
+export MGC_RIFFUSION_MAX_SEGMENTS
+export MGC_RIFFUSION_CROSSFADE_SECONDS
+export MGC_STUB_SECONDS
+
 MODE="${MGC_DEMO_MODE:-smoke}"
 if [[ "${MGC_DEMO_FULL:-0}" == "1" ]]; then
   MODE="check"
