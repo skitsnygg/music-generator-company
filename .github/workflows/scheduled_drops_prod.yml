@@ -43,6 +43,9 @@ concurrency:
   group: scheduled_drops_prod
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   scheduled_drops_prod:
     runs-on: self-hosted
@@ -89,6 +92,8 @@ jobs:
           fi
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MGC_GH_PAT || github.token }}
 
       - name: Prepare venv
         shell: bash
