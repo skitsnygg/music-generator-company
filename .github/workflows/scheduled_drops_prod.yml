@@ -76,6 +76,17 @@ jobs:
       MGC_TRACKS_DIR: "/tmp/mgc_prod_tracks"
 
     steps:
+      - name: Clean Pages diag logs (self-hosted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUNNER_TEMP:-}" ]]; then
+            base_dir="$(dirname "$(dirname "${RUNNER_TEMP}")")"
+            diag_dir="${base_dir}/_diag/pages"
+            if [[ -d "${diag_dir}" ]]; then
+              rm -f "${diag_dir}"/*.log
+            fi
+          fi
       - name: Checkout
         uses: actions/checkout@v4
 
