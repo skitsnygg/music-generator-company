@@ -64,7 +64,7 @@ jobs:
 
       # Provider selection via inputs/variables.
       MGC_PROVIDER: "${{ github.event.inputs.provider || vars.MGC_PROVIDER || 'riffusion' }}"
-      MGC_RIFFUSION_URL: "${{ github.event.inputs.riffusion_url || vars.MGC_RIFFUSION_URL || 'http://127.0.0.1:3013/run_inference' }}"
+      MGC_RIFFUSION_URL: "${{ github.event.inputs.riffusion_url || vars.MGC_RIFFUSION_URL || 'http://192.168.0.2:3013/run_inference' }}"
       MGC_RIFFUSION_TIMEOUT: "${{ vars.MGC_RIFFUSION_TIMEOUT || '180' }}"
       MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
@@ -122,9 +122,9 @@ jobs:
           fi
 
           if [ "${MGC_PROVIDER:-}" = "riffusion" ] && [ -z "${MGC_RIFFUSION_URL:-}" ]; then
-            echo "WARN: MGC_RIFFUSION_URL is empty; defaulting to http://127.0.0.1:3013/run_inference"
-            echo "MGC_RIFFUSION_URL=http://127.0.0.1:3013/run_inference" >> "$GITHUB_ENV"
-            export MGC_RIFFUSION_URL="http://127.0.0.1:3013/run_inference"
+            echo "WARN: MGC_RIFFUSION_URL is empty; defaulting to http://192.168.0.2:3013/run_inference"
+            echo "MGC_RIFFUSION_URL=http://192.168.0.2:3013/run_inference" >> "$GITHUB_ENV"
+            export MGC_RIFFUSION_URL="http://192.168.0.2:3013/run_inference"
           fi
 
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
