@@ -55,6 +55,24 @@ def _has_kw(fn: Any, key: str) -> bool:
         return False
 
 
+def _filter_kwargs_for_fn(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return kwargs
+
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+
+    allowed = {
+        k
+        for k, p in params.items()
+        if p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    }
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
 def _which(cmd: str) -> Optional[str]:
     try:
         return shutil.which(cmd)
@@ -385,7 +403,6 @@ class RiffusionAdapter:
             or _env_str("RIFFUSION_URL")
             or "http://127.0.0.1:3013/run_inference/"
         )
-        prov = RiffusionProvider(server_url=server_url)
 
         prompt = req.prompt or spec.prompt
 
@@ -466,6 +483,20 @@ class RiffusionAdapter:
             denoise = None
         timeout_s = int(timeout_env) if timeout_env else None
 
+        try:
+            prov = RiffusionProvider(server_url=server_url)
+        except TypeError:
+            init_steps = int(num_steps) if num_steps is not None else 50
+            init_guidance = float(guidance) if guidance is not None else 5.0
+            init_denoise = float(denoise) if denoise is not None else 0.4
+            prov = RiffusionProvider(
+                url=server_url,
+                steps=init_steps,
+                guidance=init_guidance,
+                denoising=init_denoise,
+                timeout_s=timeout_s,
+            )
+
         # MP3 quality selection:
         #   server: trust server MP3
         #   v0: VBR V0 (default)
@@ -531,16 +562,29 @@ class RiffusionAdapter:
                     timeout_s=timeout_s,
                 )
 
+                if _has_kw(prov.generate, "out_mp3_path") and not _has_kw(prov.generate, "out_mp3"):
+                    call_kwargs["out_mp3_path"] = call_kwargs.pop("out_mp3")
+
                 want_wav = want_reencode or not encoder_available
                 if _has_kw(prov.generate, "out_wav") and want_wav:
                     call_kwargs["out_wav"] = seg_wav
 
+                call_kwargs = _filter_kwargs_for_fn(prov.generate, call_kwargs)
+
                 try:
                     prov.generate(**call_kwargs)
                 except TypeError:
-                    # Signature mismatch (older provider): retry with MP3-only
-                    call_kwargs.pop("out_wav", None)
-                    prov.generate(**call_kwargs)
+                    # Signature mismatch (older provider): retry minimal set
+                    minimal = {
+                        "prompt": prompt,
+                        "seed": seg_seed,
+                    }
+                    if _has_kw(prov.generate, "out_mp3_path"):
+                        minimal["out_mp3_path"] = seg_mp3
+                    else:
+                        minimal["out_mp3"] = seg_mp3
+                    minimal = _filter_kwargs_for_fn(prov.generate, minimal)
+                    prov.generate(**minimal)
                 except Exception as e:
                     raise ProviderError(f"riffusion.generate failed: {e}") from e
 

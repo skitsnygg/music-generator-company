@@ -148,15 +148,26 @@ class RiffusionProvider:
     IMPORTANT: Do not send extra keys like "bpm" — some servers will 500 on unexpected fields.
     """
 
-    def __init__(self, *, url: str, steps: int, guidance: float, denoising: float, timeout_s: Optional[float] = None):
+    def __init__(
+        self,
+        *,
+        url: Optional[str] = None,
+        server_url: Optional[str] = None,
+        steps: Optional[int] = None,
+        guidance: Optional[float] = None,
+        denoising: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+    ):
+        if url is None:
+            url = server_url or ""
         self.url = _normalize_run_inference_url(url)
-        self.steps = int(steps)
-        self.guidance = float(guidance)
-        self.denoising = float(denoising)
+        self.steps = int(steps) if steps is not None else None
+        self.guidance = float(guidance) if guidance is not None else None
+        self.denoising = float(denoising) if denoising is not None else None
         self.timeout_s = timeout_s
 
-    def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        t = _timeouts(self.timeout_s)
+    def _post_json(self, payload: Dict[str, Any], *, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        t = _timeouts(self.timeout_s if timeout_s is None else timeout_s)
         retries = _retries()
         sleep_s = _retry_sleep_s()
         last_err: Optional[Exception] = None
@@ -197,40 +208,61 @@ class RiffusionProvider:
         self,
         *,
         prompt: str,
-        seed: int,
-        out_mp3_path: str,
+        seed: Optional[int] = None,
+        out_mp3_path: Optional[str] = None,
+        out_mp3: Optional[str] = None,
         negative_prompt: Optional[str] = None,
+        num_inference_steps: Optional[int] = None,
+        guidance: Optional[float] = None,
+        denoising: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+        **_ignored: Any,
     ) -> Dict[str, Any]:
+        # Back-compat with older adapter call sites.
+        if out_mp3_path is None:
+            out_mp3_path = out_mp3
+        if not out_mp3_path:
+            raise ProviderError("riffusion provider requires out_mp3_path (or out_mp3)")
+
+        steps_val = num_inference_steps if num_inference_steps is not None else self.steps
+        guidance_val = guidance if guidance is not None else self.guidance
+        denoise_val = denoising if denoising is not None else self.denoising
+
         # Seed image id can be overridden externally by setting MGC_RIFFUSION_SEED_IMAGE_ID.
         seed_image_id = os.environ.get("MGC_RIFFUSION_SEED_IMAGE_ID") or "og_beat"
 
         # Classic riffusion interpolation form: start/end PromptInput + alpha.
+        start: Dict[str, Any] = {"prompt": prompt}
+        end: Dict[str, Any] = {"prompt": prompt}
+
+        if seed is not None:
+            start["seed"] = int(seed)
+            end["seed"] = int(seed)
+        if guidance_val is not None:
+            start["guidance"] = float(guidance_val)
+            end["guidance"] = float(guidance_val)
+        if denoise_val is not None:
+            start["denoising"] = float(denoise_val)
+            end["denoising"] = float(denoise_val)
+
         payload: Dict[str, Any] = {
             "alpha": 0.0,
-            "num_inference_steps": self.steps,
             "seed_image_id": seed_image_id,
-            "start": {
-                "prompt": prompt,
-                "seed": int(seed),
-                "denoising": self.denoising,
-                "guidance": self.guidance,
-            },
-            "end": {
-                "prompt": prompt,
-                "seed": int(seed),
-                "denoising": self.denoising,
-                "guidance": self.guidance,
-            },
+            "start": start,
+            "end": end,
         }
+        if steps_val is not None:
+            payload["num_inference_steps"] = int(steps_val)
 
         if negative_prompt:
             payload["start"]["negative_prompt"] = negative_prompt
             payload["end"]["negative_prompt"] = negative_prompt
 
-        obj = self._post_json(payload)
+        obj = self._post_json(payload, timeout_s=timeout_s)
         audio_bytes = _extract_audio_bytes(obj)
 
         # Write mp3 artifact
+        out_mp3_path = os.fspath(out_mp3_path)
         os.makedirs(os.path.dirname(out_mp3_path) or ".", exist_ok=True)
         with open(out_mp3_path, "wb") as f:
             f.write(audio_bytes)
@@ -242,9 +274,9 @@ class RiffusionProvider:
         meta: Dict[str, Any] = {
             "riffusion_url": self.url,
             "seed_image_id": seed_image_id,
-            "num_inference_steps": self.steps,
-            "guidance": self.guidance,
-            "denoising": self.denoising,
+            "num_inference_steps": steps_val,
+            "guidance": guidance_val,
+            "denoising": denoise_val,
         }
         # Pass through duration if server provides it
         if isinstance(obj.get("duration_s"), (int, float)):
