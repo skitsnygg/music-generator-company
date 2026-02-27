@@ -52,7 +52,7 @@ class RiffusionProvider:
         if denoising is not None:
             payload["denoising"] = denoising
 
-        url = f"{self.server_url}/run_inference"
+        url = f"{self.server_url}/run_inference/"
 
         try:
             resp = requests.post(
