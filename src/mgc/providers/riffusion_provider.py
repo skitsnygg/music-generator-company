@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -16,7 +15,7 @@ class ProviderError(RuntimeError):
 
 def _env_int(name: str, default: int = 0) -> int:
     v = os.environ.get(name)
-    if v is None or v == "":
+    if not v:
         return default
     try:
         return int(v)
@@ -26,7 +25,7 @@ def _env_int(name: str, default: int = 0) -> int:
 
 def _env_float(name: str, default: float = 0.0) -> float:
     v = os.environ.get(name)
-    if v is None or v == "":
+    if not v:
         return default
     try:
         return float(v)
@@ -35,33 +34,24 @@ def _env_float(name: str, default: float = 0.0) -> float:
 
 
 def _normalize_run_inference_url(url: str) -> str:
-    url = url.strip()
+    url = (url or "").strip()
     if not url:
         return "http://127.0.0.1:3013/run_inference/"
 
-    # Accept either ".../run_inference" or ".../run_inference/" or base URL.
     if "/run_inference" not in url:
-        url = url.rstrip("/") + "/run_inference/"
-    else:
-        # If it ends in /run_inference (no trailing slash), add slash (server accepts both but keep consistent)
-        if url.endswith("/run_inference"):
-            url = url + "/"
-        elif url.endswith("/run_inference/"):
-            pass
-        else:
-            # e.g. ".../run_inference/whatever" – keep it, user knows what they’re doing
-            pass
+        return url.rstrip("/") + "/run_inference/"
 
+    if url.endswith("/run_inference"):
+        return url + "/"
     return url
 
 
 def _timeouts(timeout_s: Optional[float]) -> Tuple[float, float]:
-    # split connect vs read so connect fails fast but generation can take longer
     connect_default = float(_env_int("MGC_RIFFUSION_CONNECT_TIMEOUT", 2))
     read_default = float(_env_int("MGC_RIFFUSION_READ_TIMEOUT", 120))
     if timeout_s is None:
         return (connect_default, read_default)
-    # treat adapter timeout as read timeout; keep connect default
+    # Adapter timeout should behave like read timeout; keep connect fast.
     return (connect_default, float(timeout_s))
 
 
@@ -74,17 +64,13 @@ def _retry_sleep_s() -> float:
 
 
 def _b64_strip_prefix(s: str) -> str:
-    # Accept data:audio/mpeg;base64,... etc.
-    if "," in s and s[:50].lower().startswith("data:"):
+    # Accept "data:audio/mpeg;base64,...."
+    if s.lower().startswith("data:") and "," in s:
         return s.split(",", 1)[1]
     return s
 
 
 def _extract_audio_bytes(obj: Dict[str, Any]) -> bytes:
-    """
-    Many riffusion server variants return audio in different keys.
-    Prefer "audio", then fall back to common alternatives.
-    """
     candidates = [
         "audio",
         "mp3",
@@ -121,35 +107,61 @@ def _extract_audio_bytes(obj: Dict[str, Any]) -> bytes:
     return raw
 
 
-@dataclass(frozen=True)
-class RiffusionProviderConfig:
-    url: str
-    steps: int
-    guidance: float
-    denoising: float
-    timeout_s: Optional[float] = None
-
-
 class RiffusionProvider:
     """
-    Minimal result surface expected by mgc.providers.riffusion_adapter.RiffusionAdapter
+    HTTP client for a riffusion.server instance.
 
-    This provider speaks to a riffusion.server that expects the classic InferenceInput JSON:
+    Adapter calls: RiffusionProvider(server_url=...)
+    Server expects the classic InferenceInput JSON shape:
+      - start/end PromptInput objects
+      - alpha
+      - num_inference_steps
+      - seed_image_id
+      - (optional) mask_image_id
 
-      {
-        "start": {"prompt": "...", "seed": 1, "denoising": 0.4, "guidance": 5.0, "negative_prompt": null},
-        "end":   {"prompt": "...", "seed": 1, "denoising": 0.4, "guidance": 5.0, "negative_prompt": null},
-        "alpha": 0.0,
-        "num_inference_steps": 10,
-        "seed_image_id": "og_beat",
-        "mask_image_id": null
-      }
-
-    IMPORTANT: Do not send extra keys like "bpm" — some servers will 500 on unexpected fields.
+    IMPORTANT: Do not send extra keys (e.g. bpm) — some server variants 500 on unexpected fields.
     """
 
-    def __init__(self, *, url: str, steps: int, guidance: float, denoising: float, timeout_s: Optional[float] = None):
-        self.url = _normalize_run_inference_url(url)
+    def __init__(
+        self,
+        *,
+        server_url: Optional[str] = None,
+        url: Optional[str] = None,  # allow alt name
+        steps: int = 50,
+        guidance: float = 7.0,
+        denoising: float = 0.75,
+        timeout_s: Optional[float] = None,
+    ):
+        u = server_url or url or ""
+        self.url = _normalize_run_inference_url(u)
+
+        # Allow env overrides if adapter doesn’t pass them
+        steps_env = os.environ.get("RIFFUSION_STEPS") or os.environ.get("MGC_RIFFUSION_STEPS")
+        guidance_env = os.environ.get("RIFFUSION_GUIDANCE") or os.environ.get("MGC_RIFFUSION_GUIDANCE")
+        denoise_env = os.environ.get("RIFFUSION_DENOISE") or os.environ.get("MGC_RIFFUSION_DENOISE")
+        timeout_env = os.environ.get("RIFFUSION_TIMEOUT") or os.environ.get("MGC_RIFFUSION_TIMEOUT")
+
+        if steps_env:
+            try:
+                steps = int(float(steps_env))
+            except ValueError:
+                pass
+        if guidance_env:
+            try:
+                guidance = float(guidance_env)
+            except ValueError:
+                pass
+        if denoise_env:
+            try:
+                denoising = float(denoise_env)
+            except ValueError:
+                pass
+        if timeout_env and timeout_s is None:
+            try:
+                timeout_s = float(timeout_env)
+            except ValueError:
+                pass
+
         self.steps = int(steps)
         self.guidance = float(guidance)
         self.denoising = float(denoising)
@@ -193,18 +205,9 @@ class RiffusionProvider:
 
         raise ProviderError(f"riffusion server request failed after {retries + 1} attempts: {last_err}") from last_err
 
-    def generate(
-        self,
-        *,
-        prompt: str,
-        seed: int,
-        out_mp3_path: str,
-        negative_prompt: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        # Seed image id can be overridden externally by setting MGC_RIFFUSION_SEED_IMAGE_ID.
+    def generate(self, *, prompt: str, seed: int, out_mp3_path: str, negative_prompt: Optional[str] = None) -> Dict[str, Any]:
         seed_image_id = os.environ.get("MGC_RIFFUSION_SEED_IMAGE_ID") or "og_beat"
 
-        # Classic riffusion interpolation form: start/end PromptInput + alpha.
         payload: Dict[str, Any] = {
             "alpha": 0.0,
             "num_inference_steps": self.steps,
@@ -230,7 +233,6 @@ class RiffusionProvider:
         obj = self._post_json(payload)
         audio_bytes = _extract_audio_bytes(obj)
 
-        # Write mp3 artifact
         os.makedirs(os.path.dirname(out_mp3_path) or ".", exist_ok=True)
         with open(out_mp3_path, "wb") as f:
             f.write(audio_bytes)
@@ -238,7 +240,6 @@ class RiffusionProvider:
         if os.path.getsize(out_mp3_path) <= 0:
             raise ProviderError("riffusion did not produce an mp3 artifact (missing or empty).")
 
-        # Optional metadata surface
         meta: Dict[str, Any] = {
             "riffusion_url": self.url,
             "seed_image_id": seed_image_id,
@@ -246,11 +247,8 @@ class RiffusionProvider:
             "guidance": self.guidance,
             "denoising": self.denoising,
         }
-        # Pass through duration if server provides it
         if isinstance(obj.get("duration_s"), (int, float)):
             meta["duration_s"] = float(obj["duration_s"])
-
-        # Pass through preview image if present
         if isinstance(obj.get("image"), str) and obj["image"]:
             meta["image"] = obj["image"]
 
