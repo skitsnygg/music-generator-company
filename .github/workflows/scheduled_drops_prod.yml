@@ -191,94 +191,94 @@ jobs:
 
           discover_riffusion_url() {
             python - <<'PY'
-import ipaddress
-import os
-import socket
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+          import ipaddress
+          import os
+          import socket
+          import subprocess
+          import sys
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
-PORT = 3013
-TIMEOUT = float(os.environ.get("MGC_RIFFUSION_SCAN_TIMEOUT", "0.35"))
-MAX_WORKERS = int(os.environ.get("MGC_RIFFUSION_SCAN_WORKERS", "64"))
+          PORT = 3013
+          TIMEOUT = float(os.environ.get("MGC_RIFFUSION_SCAN_TIMEOUT", "0.35"))
+          MAX_WORKERS = int(os.environ.get("MGC_RIFFUSION_SCAN_WORKERS", "64"))
 
-def local_ipv4s():
-    ips = []
-    try:
-        out = subprocess.check_output(
-            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
-            text=True,
-        )
-        for line in out.splitlines():
-            parts = line.split()
-            if "inet" in parts:
-                idx = parts.index("inet")
-                cidr = parts[idx + 1]
-                ip = cidr.split("/")[0]
-                ips.append(ip)
-    except Exception:
-        pass
-    if not ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("1.1.1.1", 80))
-            ips.append(s.getsockname()[0])
-            s.close()
-        except Exception:
-            pass
-    seen = set()
-    ordered = []
-    for ip in ips:
-        if ip not in seen:
-            seen.add(ip)
-            ordered.append(ip)
-    return ordered
+          def local_ipv4s():
+              ips = []
+              try:
+                  out = subprocess.check_output(
+                      ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                      text=True,
+                  )
+                  for line in out.splitlines():
+                      parts = line.split()
+                      if "inet" in parts:
+                          idx = parts.index("inet")
+                          cidr = parts[idx + 1]
+                          ip = cidr.split("/")[0]
+                          ips.append(ip)
+              except Exception:
+                  pass
+              if not ips:
+                  try:
+                      s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                      s.connect(("1.1.1.1", 80))
+                      ips.append(s.getsockname()[0])
+                      s.close()
+                  except Exception:
+                      pass
+              seen = set()
+              ordered = []
+              for ip in ips:
+                  if ip not in seen:
+                      seen.add(ip)
+                      ordered.append(ip)
+              return ordered
 
-def private_nets(ips):
-    nets = []
-    seen = set()
-    for ip in ips:
-        try:
-            addr = ipaddress.ip_address(ip)
-        except Exception:
-            continue
-        if not addr.is_private:
-            continue
-        net = ipaddress.ip_network(f"{ip}/24", strict=False)
-        key = str(net)
-        if key in seen:
-            continue
-        seen.add(key)
-        nets.append(net)
-    return nets
+          def private_nets(ips):
+              nets = []
+              seen = set()
+              for ip in ips:
+                  try:
+                      addr = ipaddress.ip_address(ip)
+                  except Exception:
+                      continue
+                  if not addr.is_private:
+                      continue
+                  net = ipaddress.ip_network(f"{ip}/24", strict=False)
+                  key = str(net)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  nets.append(net)
+              return nets
 
-def probe(host):
-    try:
-        with socket.create_connection((host, PORT), timeout=TIMEOUT):
-            return True
-    except Exception:
-        return False
+          def probe(host):
+              try:
+                  with socket.create_connection((host, PORT), timeout=TIMEOUT):
+                      return True
+              except Exception:
+                  return False
 
-def scan_net(net):
-    hosts = [str(h) for h in net.hosts()]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(probe, h): h for h in hosts}
-        for fut in as_completed(futures):
-            try:
-                if fut.result():
-                    return futures[fut]
-            except Exception:
-                pass
-    return ""
+          def scan_net(net):
+              hosts = [str(h) for h in net.hosts()]
+              with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                  futures = {ex.submit(probe, h): h for h in hosts}
+                  for fut in as_completed(futures):
+                      try:
+                          if fut.result():
+                              return futures[fut]
+                      except Exception:
+                          pass
+              return ""
 
-ips = local_ipv4s()
-for net in private_nets(ips):
-    host = scan_net(net)
-    if host:
-        print(f"http://{host}:{PORT}/run_inference")
-        sys.exit(0)
-sys.exit(0)
-PY
+          ips = local_ipv4s()
+          for net in private_nets(ips):
+              host = scan_net(net)
+              if host:
+                  print(f"http://{host}:{PORT}/run_inference")
+                  sys.exit(0)
+          sys.exit(0)
+          PY
           }
 
           resolve_riffusion_url() {
