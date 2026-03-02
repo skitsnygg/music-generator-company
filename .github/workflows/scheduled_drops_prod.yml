@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       riffusion_url:
-        description: "Riffusion URL override (http://host:3013/run_inference)"
+        description: "Riffusion URL override (http://host:3013/run_inference, default: auto-discover on :3013)"
         required: false
         default: ""
       seed:
@@ -64,7 +64,7 @@ jobs:
 
       # Provider selection via inputs/variables.
       MGC_PROVIDER: "${{ github.event.inputs.provider || vars.MGC_PROVIDER || 'riffusion' }}"
-      MGC_RIFFUSION_URL: "${{ github.event.inputs.riffusion_url || vars.MGC_RIFFUSION_URL || 'http://192.168.0.2:3013/run_inference' }}"
+      MGC_RIFFUSION_URL: "${{ github.event.inputs.riffusion_url || vars.MGC_RIFFUSION_URL || '' }}"
       MGC_RIFFUSION_TIMEOUT: "${{ vars.MGC_RIFFUSION_TIMEOUT || '180' }}"
       MGC_RIFFUSION_RETRIES: "${{ vars.MGC_RIFFUSION_RETRIES || '3' }}"
       MGC_RIFFUSION_RETRY_SLEEP: "${{ vars.MGC_RIFFUSION_RETRY_SLEEP || '1' }}"
@@ -121,12 +121,6 @@ jobs:
             export MGC_PROVIDER="riffusion"
           fi
 
-          if [ "${MGC_PROVIDER:-}" = "riffusion" ] && [ -z "${MGC_RIFFUSION_URL:-}" ]; then
-            echo "WARN: MGC_RIFFUSION_URL is empty; defaulting to http://192.168.0.2:3013/run_inference"
-            echo "MGC_RIFFUSION_URL=http://192.168.0.2:3013/run_inference" >> "$GITHUB_ENV"
-            export MGC_RIFFUSION_URL="http://192.168.0.2:3013/run_inference"
-          fi
-
           echo "MGC_PROVIDER=${MGC_PROVIDER:-}"
           echo "MGC_RIFFUSION_URL=${MGC_RIFFUSION_URL:-}"
           echo "MGC_RIFFUSION_TIMEOUT=${MGC_RIFFUSION_TIMEOUT:-}"
@@ -169,6 +163,148 @@ jobs:
           test -s /var/lib/mgc/db.sqlite
           python -m mgc.main --db /var/lib/mgc/db.sqlite db status || exit 2
 
+          riffusion_base_url() {
+            local url="$1"
+            local base="${url%/run_inference*}"
+            if [ -z "$base" ]; then
+              base="${url}"
+            fi
+            echo "$base"
+          }
+
+          riffusion_reachable() {
+            local url="$1"
+            if ! command -v curl >/dev/null 2>&1; then
+              echo "WARN: curl not found; skipping riffusion reachability check"
+              return 0
+            fi
+            local base
+            local code
+            base="$(riffusion_base_url "$url")"
+            code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 "$base" || true)"
+            if [ "$code" = "000" ]; then
+              return 1
+            fi
+            echo "riffusion_base_http_code=${code}"
+            return 0
+          }
+
+          discover_riffusion_url() {
+            python - <<'PY'
+import ipaddress
+import os
+import socket
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+PORT = 3013
+TIMEOUT = float(os.environ.get("MGC_RIFFUSION_SCAN_TIMEOUT", "0.35"))
+MAX_WORKERS = int(os.environ.get("MGC_RIFFUSION_SCAN_WORKERS", "64"))
+
+def local_ipv4s():
+    ips = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            text=True,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                idx = parts.index("inet")
+                cidr = parts[idx + 1]
+                ip = cidr.split("/")[0]
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("1.1.1.1", 80))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    seen = set()
+    ordered = []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
+
+def private_nets(ips):
+    nets = []
+    seen = set()
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except Exception:
+            continue
+        if not addr.is_private:
+            continue
+        net = ipaddress.ip_network(f"{ip}/24", strict=False)
+        key = str(net)
+        if key in seen:
+            continue
+        seen.add(key)
+        nets.append(net)
+    return nets
+
+def probe(host):
+    try:
+        with socket.create_connection((host, PORT), timeout=TIMEOUT):
+            return True
+    except Exception:
+        return False
+
+def scan_net(net):
+    hosts = [str(h) for h in net.hosts()]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(probe, h): h for h in hosts}
+        for fut in as_completed(futures):
+            try:
+                if fut.result():
+                    return futures[fut]
+            except Exception:
+                pass
+    return ""
+
+ips = local_ipv4s()
+for net in private_nets(ips):
+    host = scan_net(net)
+    if host:
+        print(f"http://{host}:{PORT}/run_inference")
+        sys.exit(0)
+sys.exit(0)
+PY
+          }
+
+          resolve_riffusion_url() {
+            local url="${MGC_RIFFUSION_URL:-}"
+            if [ -n "$url" ] && riffusion_reachable "$url"; then
+              return 0
+            fi
+            if [ -n "$url" ]; then
+              echo "WARN: riffusion not reachable at ${url}; attempting discovery on port 3013"
+            else
+              echo "WARN: MGC_RIFFUSION_URL is empty; attempting discovery on port 3013"
+            fi
+            local discovered
+            discovered="$(discover_riffusion_url || true)"
+            if [ -n "$discovered" ]; then
+              echo "INFO: discovered riffusion at ${discovered}"
+              echo "MGC_RIFFUSION_URL=${discovered}" >> "$GITHUB_ENV"
+              export MGC_RIFFUSION_URL="${discovered}"
+              if command -v curl >/dev/null 2>&1; then
+                riffusion_reachable "${discovered}" || true
+              fi
+              return 0
+            fi
+            return 1
+          }
+
           fallback_to_stub() {
             local reason="$1"
             if [ "${MGC_FALLBACK_TO_STUB:-0}" = "1" ]; then
@@ -183,27 +319,11 @@ jobs:
           }
 
           if [ "${MGC_PROVIDER:-}" = "riffusion" ]; then
-            if [ -z "${MGC_RIFFUSION_URL:-}" ]; then
-              if ! fallback_to_stub "riffusion selected but MGC_RIFFUSION_URL is empty"; then
-                echo "ERROR: riffusion selected but MGC_RIFFUSION_URL is empty"
+            if ! resolve_riffusion_url; then
+              if ! fallback_to_stub "riffusion not reachable and discovery failed"; then
+                echo "ERROR: riffusion not reachable and discovery failed"
                 exit 2
               fi
-            elif command -v curl >/dev/null 2>&1; then
-              base="${MGC_RIFFUSION_URL%/run_inference*}"
-              if [ -z "$base" ]; then
-                base="${MGC_RIFFUSION_URL}"
-              fi
-              code="$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 "$base" || true)"
-              if [ "$code" = "000" ]; then
-                if ! fallback_to_stub "riffusion not reachable at ${base}"; then
-                  echo "ERROR: riffusion not reachable at ${base}"
-                  exit 2
-                fi
-              else
-                echo "riffusion_base_http_code=${code}"
-              fi
-            else
-              echo "WARN: curl not found; skipping riffusion reachability check"
             fi
           fi
 
